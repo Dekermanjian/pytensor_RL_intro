@@ -1,0 +1,17 @@
+# Preface {.unnumbered}
+
+This book is a hands-on companion to Sutton & Barto's *Reinforcement Learning: An Introduction*. Chapter by chapter, we take the algorithms from the book — bandits, dynamic programming, temporal-difference learning, and beyond — and implement them from scratch in Python using [PyTensor](https://pytensor.readthedocs.io/).
+
+## Why PyTensor? {.unnumbered}
+
+Most reinforcement learning tutorials reach for plain NumPy loops or a deep learning framework. PyTensor sits in an interesting middle ground: you describe the agent–environment interaction *symbolically* — as a computation graph — then compile it once and run it fast. This turns out to be a natural fit for reinforcement learning:
+
+- **Shared variables** hold the agent's mutable state, such as value estimates and visit counts.
+- **Updates** express the book's "increment toward the target" learning rules directly, as declarative state transitions applied on every step.
+- **Vectorization** lets us run thousands of independent experiments in parallel — one compiled step advances them all at once, with no Python loops.
+
+Along the way, the symbolic style forces us to be explicit about what the agent knows, what it observes, and how its beliefs change.
+
+## Who this book is for {.unnumbered}
+
+The reader we have in mind has some Python and probability background and is working through (or has read) Sutton & Barto. This book is not a replacement for theirs: we state the key ideas and equations, but the emphasis here is on turning them into working, testable code and reproducing the classic figures and experiments.

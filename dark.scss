@@ -1,0 +1,22 @@
+/*-- scss:defaults --*/
+// Base document colors
+$body-bg: #181818;
+$body-color: white;
+$link-color: #75AADB;
+
+// Left navigation sidebar
+$sidebar-bg: #1f1f1f;
+$sidebar-fg: $body-color;
+
+// Code blocks
+$code-block-bg-alpha: -.8;
+
+// Inline code
+$code-color: #c792ea;
+
+// Code cell output
+$pre-color: $body-color;
+
+/*-- scss:rules --*/
+.dark-mode { display: block; }
+.light-mode { display: none; }

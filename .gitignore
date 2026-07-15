@@ -1,0 +1,18 @@
+# Quarto build artifacts
+/.quarto/
+/_book/
+/_site/
+/site_libs/
+_files/
+*_files/
+
+# Jupyter
+.jupyter_cache/
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store

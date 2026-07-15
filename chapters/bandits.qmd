@@ -1,0 +1,458 @@
+---
+jupyter: pymc6
+---
+
+# Bandit Algorithms
+
+A hands-on companion to **Chapter 2 of Sutton & Barto, *Reinforcement Learning: An Introduction***.
+
+We implement and compare three classic strategies for the multi-armed bandit problem:
+
+| Algorithm | Idea in one line |
+|---|---|
+| **ε-greedy** | Exploit the best-looking arm, but explore at random a fraction ε of the time |
+| **UCB** | Add an *optimism bonus* to under-explored arms |
+| **Thompson sampling** | Keep a *posterior* over each arm's value and act greedily on a sample from it |
+
+**Why PyTensor?** PyTensor lets us write the agent–environment
+interaction as a *symbolic graph* once, compile it, and then run it. We use two features throughout:
+
+- **Shared variables** hold mutable state (the action-value estimates `Q`, visit counts `N`, and the RNG).
+- **`updates`** describe how that state mutates on every call to a compiled function - the
+  "increment toward the target" update rules from the book.
+
+We also **vectorize across the 2000 independent runs** of the testbed. Instead of 2000 Python loops,
+every shared variable has shape `(n_runs, k)` and one compiled `step()` advances all runs at once.
+
+## The $k$-armed bandit problem
+
+At each time step $t$ you choose one of $k$ actions $A_t \in \{0,\dots,k-1\}$ and receive a reward
+$R_t$ drawn from a fixed-but-unknown distribution that depends only on the action you picked. The
+**true value** of an action is its expected reward,
+
+$$q_*(a) \;=\; \mathbb{E}[R_t \mid A_t = a].$$
+
+If you knew $q_*$ you would always pull $\arg\max_a q_*(a)$. However, You don't, so you must **estimate** it
+from experience while you act. That is the *exploration vs. exploitation* trade-off: pull the arm that
+looks best now (exploit), or pull a less-certain arm to learn more about it (explore)?
+
+We track an estimate $Q_t(a) \approx q_*(a)$. The workhorse is the **sample-average / incremental
+update**: after observing reward $R_t$ for the chosen action $A_t = a$,
+
+$$
+N_{t+1}(a) = N_t(a) + 1
+$$
+
+$$
+\qquad Q_{t+1}(a) = Q_t(a) + \frac{1}{N_{t+1}(a)}\bigl(R_t - Q_t(a)\bigr).
+$$
+
+Read it as **NewEstimate = OldEstimate + StepSize · (Target − OldEstimate)**
+
+This is what we encode as a PyTensor `update`.
+
+## The 10-armed testbed
+
+To compare algorithms fairly we use S&B's testbed setup:
+
+- $k = 10$ arms.
+- For each independent run, the true values $q_*(a)$ are drawn once from
+  $\mathcal{N}(0, 1)$.
+- A reward for pulling arm $a$ is then $R_t \sim \mathcal{N}\!\bigl(q_*(a),\, 1\bigr)$.
+- We average performance over 2000 runs to get smooth learning curves.
+
+We generate $q_*$ in NumPy and let the agent's perception of the environment, selecting an arm, sampling its noisy reward, and updating beliefs live inside the compiled PyTensor graph.
+
+
+```{python}
+import numpy as np
+import pytensor
+import pytensor.tensor as pt
+import plotly.io as pio
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from types import SimpleNamespace
+
+
+floatX = pytensor.config.floatX
+pio.renderers.default = 'notebook_connected'
+colors = px.colors.qualitative.Pastel
+
+# Experiment constants
+N_RUNS = 2000
+K = 10
+N_STEPS = 1000
+
+print(f"pytensor {pytensor.__version__}")
+```
+
+
+```{python}
+def make_testbed(n_runs: int, k: int, seed: int):
+    # Draw the true action values q_*(a) ~ N(0, 1) for each independent run.
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, 1.0, size=(n_runs, k)).astype(floatX)
+
+
+# the reward distribution of each arm is N(q_*(a), 1).
+demo = make_testbed(n_runs=1, k=K, seed=0)[0]
+samples = np.random.default_rng(1).normal(demo, 1.0, size=(N_RUNS, K))
+```
+
+
+```{python}
+#| classes: light-mode
+fig = go.Figure()
+
+for i in range(K):
+    fig.add_trace(
+        go.Violin(
+            y = samples[:, i],
+            showlegend=False,
+            name = f"Arm {i+1}",
+            box_visible=False,
+            meanline_visible=True,
+            marker_color=colors[0]
+        )
+    )
+
+fig.add_trace(
+    go.Scatter(
+        x = [f"Arm {i+1}" for i in np.arange(K)],
+        y = demo,
+        mode="markers",
+        marker=dict(color="black", size=8),
+        name=r'$\text{true value } q_*(a)$'
+    )
+)
+
+fig.update_layout(
+    title = r"$\text{" + f"Optimal arm for this task: Arm {demo.argmax() + 1} with " + "}" + f"q_* = {round(demo.max(), 3)}$",
+    xaxis=dict(title = "Action"),
+    yaxis=dict(title = "Reward distribution"),
+    template="plotly_white"
+)
+
+fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+fig = go.Figure()
+
+for i in range(K):
+    fig.add_trace(
+        go.Violin(
+            y = samples[:, i],
+            showlegend=False,
+            name = f"Arm {i+1}",
+            box_visible=False,
+            meanline_visible=True,
+            marker_color=colors[0]
+        )
+    )
+
+fig.add_trace(
+    go.Scatter(
+        x = [f"Arm {i+1}" for i in np.arange(K)],
+        y = demo,
+        mode="markers",
+        marker=dict(color="white", size=8),
+        name=r'$\text{true value } q_*(a)$'
+    )
+)
+
+fig.update_layout(
+    title = r"$\text{" + f"Optimal arm for this task: Arm {demo.argmax() + 1} with " + "}" + f"q_* = {round(demo.max(), 3)}$",
+    xaxis=dict(title = "Action"),
+    yaxis=dict(title = "Reward distribution"),
+    template="plotly_dark"
+)
+
+fig.show(config=dict(displayModeBar=False))
+```
+
+## ε-greedy
+
+The simplest balance of exploration and exploitation:
+
+$$
+A_t = \begin{cases}\arg\max_a Q_t(a) & \text{with probability } 1-\varepsilon \quad(\textbf{exploit})\\[2pt]
+\text{a uniformly random arm} & \text{with probability } \varepsilon \quad(\textbf{explore}).\end{cases}
+$$
+
+After acting we apply the incremental sample-average update.
+
+Two things worth explaining about **PyTensor mechanics** :
+
+| Mechanic | What it does | Why it matters |
+|---|---|---|
+| **Threading the RNG** | The random generator is a *shared variable* holding immutable state, so a random op can't mutate it in place. Instead each op takes the current state and returns a **pair**: `new_state, sample`. To draw three times in one step we chain the states `rng → rng1 → rng2 → rng3` and then hand the *final* state back with `updates={rng: rng3, ...}`. | That write is what makes the next `step()` call continue the stream instead of replaying the same "random" numbers. |
+| **Vectorized (advanced) indexing** | `rows` is `[0, 1, ..., N_RUNS-1]` and `a` is a length `N_RUNS` vector holding the arm each run chose. Pairing them, `Q[rows, a]` picks exactly one entry per run: run 0's chosen arm, run 1's chosen arm, and so on. | `Q[rows, a]` reads all 2000 runs' current estimates at once, and `set_subtensor(Q[rows, a], q_new)` writes all 2000 updates at once, with no Python loop over runs. |
+
+
+```{python}
+def _shared_state(n_runs: int, k: int):
+    Q = pytensor.shared(np.zeros((n_runs, k), floatX), name="Q") # value estimates
+    N = pytensor.shared(np.zeros((n_runs, k), floatX), name="N") # visit counts
+    q_star = pytensor.shared(np.zeros((n_runs, k), floatX), name="q*") # true values
+    return Q, N, q_star
+
+
+def build_epsilon_greedy(n_runs: int, k: int, epsilon: float, seed: int=0):
+    rng = pt.random.shared_rng(np.random.default_rng(seed))
+    Q, N, q_star = _shared_state(n_runs, k)
+    rows = pt.arange(n_runs)
+
+    # action selection: explore with prob epsilon
+    rng1, uni_samples = rng.uniform(size=(n_runs,))
+    explore = uni_samples < epsilon
+    rng2, rand_a = rng1.integers(0, k, size=(n_runs,))
+    greedy_a = pt.argmax(Q, axis=1)
+    a = pt.where(explore, rand_a, greedy_a)
+
+    # environment: reward ~ N(q_*(a), 1)
+    rng3, noise = rng2.normal(size=(n_runs,))
+    reward = q_star[rows, a] + noise
+
+    # incremental sample-average update
+    n_new = N[rows, a] + 1.0
+    q_old = Q[rows, a]
+    q_new = q_old + (reward - q_old) / n_new
+    N_upd = pt.set_subtensor(N[rows, a], n_new)
+    Q_upd = pt.set_subtensor(Q[rows, a], q_new)
+
+    optimal = pt.eq(a, pt.argmax(q_star, axis=1))  # did we pick the best arm?
+    step = pytensor.function(
+        [],
+        [reward, optimal],
+        updates={rng: rng3, N: N_upd, Q: Q_upd}
+    )
+    return SimpleNamespace(step=step, Q=Q, N=N, q_star=q_star)
+```
+
+## Upper-Confidence-Bound (UCB)
+
+ε-greedy explores indiscriminately. UCB instead explores *purposefully*, preferring arms that are
+either promising **or** under-explored. It selects
+
+$$
+A_t = \arg\max_a \left[\, Q_t(a) + c\,\sqrt{\frac{\ln t}{N_t(a)}}\, \right]
+$$
+
+The square-root term is a confidence radius: it shrinks as an arm is sampled more ($N_t(a)\uparrow$) and
+slowly grows for arms left untouched ($\ln t\uparrow$). The constant $c>0$ tunes how aggressively we
+explore. Any arm with $N_t(a)=0$ is treated as having an *infinite* bonus, so UCB tries every arm once before getting selective.
+
+
+```{python}
+def build_ucb(n_runs: int, k: int, c: float, seed: int=0):
+    rng = pt.random.shared_rng(np.random.default_rng(seed))
+    Q, N, q_star = _shared_state(n_runs, k)
+    t = pytensor.shared(np.array(1.0, floatX), name="t")  # global time step
+    rows = pt.arange(n_runs)
+
+    # Unvisited arms (N==0) get an infinite bonus so they are tried first.
+    bonus = pt.where(pt.eq(N, 0.0), np.inf, c * pt.sqrt(pt.log(t) / pt.maximum(N, 1e-12)))
+    a = pt.argmax(Q + bonus, axis=1)
+
+    rng1, noise = rng.normal(size=(n_runs,))
+    reward = q_star[rows, a] + noise
+
+    n_new = N[rows, a] + 1.0
+    q_old = Q[rows, a]
+    q_new = q_old + (reward - q_old) / n_new
+    N_upd = pt.set_subtensor(N[rows, a], n_new)
+    Q_upd = pt.set_subtensor(Q[rows, a], q_new)
+
+    optimal = pt.eq(a, pt.argmax(q_star, axis=1))
+    step = pytensor.function(
+        [],
+        [reward, optimal],
+        updates={rng: rng1, N: N_upd, Q: Q_upd, t: t + 1.0}
+    )
+    return SimpleNamespace(step=step, Q=Q, N=N, q_star=q_star, t=t)
+```
+
+## Thompson sampling
+
+A Bayesian strategy: maintain a **posterior distribution** over each arm's unknown value and, each step,
+**sample** one value per arm and act greedily on the samples. Arms we're uncertain about have wide
+posteriors, so they occasionally produce a high sample and get explored — exploration falls out of the
+probability matching automatically, with no ε or $c$ to tune.
+
+For our Gaussian testbed (rewards have known variance 1) we use a conjugate Gaussian model with a
+standard-normal prior on each arm's mean, $\mu_a \sim \mathcal{N}(0,1)$. After observing $n$ rewards
+for an arm with running sum $S$, the posterior is Gaussian with
+
+$$
+\text{mean} = \frac{S}{1+n}, \qquad \text{variance} = \frac{1}{1+n}
+$$
+
+:::{.callout-tip}
+The $1+n$ comes from adding the prior precision $1$ to the data precision $n$.
+:::
+
+We sample $\theta_a \sim \mathcal{N}(\text{mean}, \text{variance})$ for every arm and pull $\arg\max_a \theta_a$.
+Here the sufficient statistics are the per-arm reward sum and count rather than a running mean.
+
+
+```{python}
+def build_thompson(n_runs: int, k: int, seed: int=0):
+    rng = pt.random.shared_rng(np.random.default_rng(seed))
+    sumR = pytensor.shared(np.zeros((n_runs, k), floatX), name="sumR") # running reward sum per arm
+    N = pytensor.shared(np.zeros((n_runs, k), floatX), name="N") # visit counts
+    q_star = pytensor.shared(np.zeros((n_runs, k), floatX), name="q*")
+    rows = pt.arange(n_runs)
+
+    # Conjugate Gaussian posterior (prior N(0,1), known reward variance 1).
+    post_mean = sumR / (1.0 + N)
+    post_var = 1.0 / (1.0 + N)
+    rng1, z = rng.normal(size=(n_runs, k))
+    theta = post_mean + pt.sqrt(post_var) * z # one posterior sample per arm
+    a = pt.argmax(theta, axis=1)
+
+    rng2, noise = rng1.normal(size=(n_runs,))
+    reward = q_star[rows, a] + noise
+
+    sumR_upd = pt.set_subtensor(sumR[rows, a], sumR[rows, a] + reward)
+    N_upd = pt.set_subtensor(N[rows, a], N[rows, a] + 1.0)
+
+    optimal = pt.eq(a, pt.argmax(q_star, axis=1))
+    step = pytensor.function([], [reward, optimal],
+                             updates={rng: rng2, sumR: sumR_upd, N: N_upd})
+    return SimpleNamespace(step=step, sumR=sumR, N=N, q_star=q_star)
+```
+
+## Running the experiments
+
+`reset` reinitializes an agent's shared state and initializes a fresh set of true values.
+
+`run_experiment` then calls the compiled `step()` for `N_STEPS`, recording at each step the average reward across the 2000 runs and the fraction of runs that picked the optimal arm.
+
+
+```{python}
+def reset(agent, q_star_values):
+    n_runs, k = q_star_values.shape
+    agent.q_star.set_value(q_star_values)
+    agent.N.set_value(np.zeros((n_runs, k), floatX))
+    if hasattr(agent, "Q"):
+        agent.Q.set_value(np.zeros((n_runs, k), floatX))
+    if hasattr(agent, "sumR"):
+        agent.sumR.set_value(np.zeros((n_runs, k), floatX))
+    if hasattr(agent, "t"):
+        agent.t.set_value(np.array(1.0, floatX))
+
+
+def run_experiment(agent, q_star_values, n_steps):
+    reset(agent, q_star_values)
+    avg_reward = np.empty(n_steps)
+    pct_optimal = np.empty(n_steps)
+    for tstep in range(n_steps): # This can be a pytensor scan
+        r, opt = agent.step() # one vectorized step across all runs
+        avg_reward[tstep] = r.mean()
+        pct_optimal[tstep] = opt.mean()
+    return avg_reward, pct_optimal
+```
+
+
+```{python}
+q_star = make_testbed(N_RUNS, K, seed=42)
+
+agents = {
+    "ε=0 (greedy)": build_epsilon_greedy(N_RUNS, K, 0.0,  seed=1),
+    "ε=0.01": build_epsilon_greedy(N_RUNS, K, 0.01, seed=1),
+    "ε=0.1": build_epsilon_greedy(N_RUNS, K, 0.1,  seed=1),
+    "UCB (c=2)": build_ucb(N_RUNS, K, 2.0, seed=1),
+    "Thompson": build_thompson(N_RUNS, K, seed=1),
+}
+
+results = {}
+for name, agent in agents.items():
+    results[name] = run_experiment(agent, q_star, N_STEPS)
+```
+
+```{python}
+#| classes: light-mode
+fig = make_subplots(rows=2, cols=1, vertical_spacing=0.02, shared_xaxes=True)
+
+for i, (name, (ar, po)) in enumerate(results.items()):
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(N_STEPS),
+            y=ar,
+            name=name,
+            marker_color=colors[i]
+        ),
+        row=1,
+        col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(N_STEPS),
+            y=po,
+            name=name,
+            marker_color=colors[i],
+            showlegend=False
+        ),
+        row=2,
+        col=1
+    )
+
+fig.update_layout(
+    yaxis=dict(title="Average reward"),
+    xaxis2=dict(title="Steps"),
+    yaxis2=dict(title="% Optimal action", tickformat=".1%"),
+    hovermode="x unified",
+    template="plotly_white",
+)
+fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+fig = make_subplots(rows=2, cols=1, vertical_spacing=0.02, shared_xaxes=True)
+
+for i, (name, (ar, po)) in enumerate(results.items()):
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(N_STEPS),
+            y=ar,
+            name=name,
+            marker_color=colors[i]
+        ),
+        row=1,
+        col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=np.arange(N_STEPS),
+            y=po,
+            name=name,
+            marker_color=colors[i],
+            showlegend=False
+        ),
+        row=2,
+        col=1
+    )
+
+fig.update_layout(
+    yaxis=dict(title="Average reward"),
+    xaxis2=dict(title="Steps"),
+    yaxis2=dict(title="% Optimal action", tickformat=".1%"),
+    hovermode="x unified",
+    template="plotly_dark",
+)
+fig.show(config=dict(displayModeBar=False))
+```
+
+The results are summarized below.
+
+| Algorithm | Behavior on this testbed |
+|---|---|
+| **Greedy ($\varepsilon=0$)** | Climbs fastest at first, then plateaus low: it fixates on whatever looked good early and never discovers better arms. |
+| **$\mathbf{\varepsilon=0.1}$** | Learns quickly but its 10% forced exploration caps it (it can't exceed ~91% optimal once it knows the best arm since it still explores). |
+| **$\mathbf{\varepsilon=0.01}$** | Learns slower but overtakes $\varepsilon=0.1$ eventually (not shown in figure due to limited number of `N_STEPS`). |
+| **UCB** | Typically beats ε-greedy on this testbed: its exploration is targeted, and the early spike comes from trying each arm once. |
+| **Thompson sampling** | Usually the strongest and needs no exploration hyperparameter. |

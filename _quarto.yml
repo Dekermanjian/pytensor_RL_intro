@@ -1,0 +1,33 @@
+project:
+  type: book
+
+engine: jupyter
+jupyter: pymc6
+
+book:
+  sidebar:
+    style: docked
+  title: "Reinforcement Learning with Pytensor"
+  author:
+    - "Jonathan Dekermanjian"
+  date: today
+  chapters:
+    - index.qmd
+    - chapters/bandits.qmd
+    - chapters/markov_decision_processes.qmd
+    - chapters/dynamic_programming.qmd
+
+format:
+  html:
+    number-sections: false
+    theme:
+      light:
+        - cosmo
+        - light.scss
+      dark:
+        - cosmo
+        - dark.scss
+    grid:
+      body-width: 1000px
+      sidebar-width: 250px
+      margin-width: 200px
