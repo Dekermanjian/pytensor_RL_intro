@@ -14,15 +14,6 @@ We implement and compare three classic strategies for the multi-armed bandit pro
 | **UCB** | Add an *optimism bonus* to under-explored arms |
 | **Thompson sampling** | Keep a *posterior* over each arm's value and act greedily on a sample from it |
 
-**Why PyTensor?** PyTensor lets us write the agent–environment
-interaction as a *symbolic graph* once, compile it, and then run it. We use two features throughout:
-
-- **Shared variables** hold mutable state (the action-value estimates `Q`, visit counts `N`, and the RNG).
-- **`updates`** describe how that state mutates on every call to a compiled function - the
-  "increment toward the target" update rules from the book.
-
-We also **vectorize across the 2000 independent runs** of the testbed. Instead of 2000 Python loops,
-every shared variable has shape `(n_runs, k)` and one compiled `step()` advances all runs at once.
 
 ## The $k$-armed bandit problem
 
@@ -49,7 +40,7 @@ $$
 
 Read it as **NewEstimate = OldEstimate + StepSize · (Target − OldEstimate)**
 
-This is what we encode as a PyTensor `update`.
+This is what we encode as a PyTensor `update`. Our implementation will **vectorize across the 2000 independent runs** of the testbed. Instead of 2000 Python loops, every shared variable has shape `(n_runs, k)` and one compiled `step()` advances all runs at once.
 
 ## The 10-armed testbed
 
