@@ -16,6 +16,7 @@ book:
     - chapters/bandits.qmd
     - chapters/markov_decision_processes.qmd
     - chapters/dynamic_programming.qmd
+    - chapters/monte_carlo_methods.qmd
 
 format:
   html:
