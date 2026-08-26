@@ -1,0 +1,3608 @@
+---
+jupyter: pymc6
+---
+
+# Temporal-Difference Learning
+
+A hands-on companion to **Chapter 6 of Sutton & Barto, *Reinforcement Learning: An Introduction***.
+
+The two ideas we have built so far sit at opposite ends of a spectrum:
+
+- **Dynamic programming**: updates $V(s)$ from the current estimates of its successors (*bootstraps*) but needs a model $p(s'\mid s,a)$ to take the expectation.
+- **Monte Carlo**: doesn't need a model (*samples*) but must wait for the return $G_t$ which is only available at the end of an episode.
+
+Now we introduce a new algorithm, **Temporal-difference learning**, which *samples* one transition and *bootstraps* off the value of the state it lands in.
+
+Each algorithm incrementally updates $V(S_t)$ using a different estimate/target as shown below.
+
+$$
+V(S_t) \leftarrow V(S_t) + \alpha\left[\,\text{target} - V(S_t)\right]
+$$
+
+can be given:
+
+$$
+\underbrace{G_t}_{\textbf{MC: sample, no bootstrap}}
+\qquad
+\underbrace{\mathbb E_\pi\!\left[R_{t+1} + \gamma v(S_{t+1})\mid S_t\right]}_{\textbf{DP: bootstrap, no sample}}
+\qquad
+\underbrace{R_{t+1} + \gamma V(S_{t+1})}_{\textbf{TD(0): sample \textit{and} bootstrap}}
+$$
+
+The temporal-difference (TD) target is available **one step later**, making it fully incremental and online, it works on continuing (non-episodic) tasks, and it typically learns faster than Monte Carlo (MC) on the same episodes.
+
+We will touch on the following sections:
+
+1. **TD prediction**: the TD(0) update, the TD error $\delta_t$, and the identity that relates the MC error to a sum of TD errors
+2. **Advantages of TD prediction methods**: online learning and the random-walk comparison of TD against constant-$\alpha$ MC
+3. **Optimality of TD(0)**: batch updating, and policy evaluation on the maximum-likelihood model of the data
+4. **Sarsa**: on-policy TD control
+5. **Q-learning**: off-policy TD control
+6. **Expected Sarsa**: either on/off policy control
+7. **Maximization bias and double learning**: Double Q-learning
+8. **Games, afterstates, and other special cases**: value learning over afterstates
+
+# Utilities & Environment Setup
+
+This chapter has more running examples than any chapter so far, and each one exists to isolate a specific effect, so we build all five:
+
+- $4\times4$ **gridworld**
+- 5-state **random walk**
+- **windy gridworld**
+- **cliff walking**
+- **maximization-bias**
+
+All are finite MDPs, so we can always compute the exact answer with dynamic programming and grade the learner against it.
+
+## Environments
+
+```{python}
+import warnings
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", UserWarning)  # gravis' pkg_resources import
+    import gravis as gv
+
+import networkx as nx
+import numpy as np
+import pytensor
+import pytensor.tensor as pt
+from dataclasses import dataclass
+from collections import Counter
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.io as pio
+from plotly.subplots import make_subplots
+
+colors = px.colors.qualitative.Pastel
+pio.renderers.default = "notebook_connected"
+
+print("pytensor", pytensor.__version__)
+```
+
+One container holds everything an algorithm may ever need from an environment. The transition tensor $P[s,a,s']$ and the reward mean/sd tables $r_\mu[s,a], r_\sigma[s,a]$ are used in exactly two places:
+
+- The **simulator** samples $S_{t+1}\sim P[s,a,\cdot]$ and $R_{t+1}\sim\mathcal N(r_\mu, r_\sigma)$
+- **DP oracle** sweeps them to compute exact values to serve as the answer key.
+
+The learning algorithms don't have access to either.
+
+Two extra parameters are needed for environments of this chapter:
+
+- `legal_actions` marks which actions are legal in each state (the maximization-bias MDP has 2 actions in one state and 10 in another)
+- `reachable` marks the states that can actually be occupied (cliff walking has cells you can *fall into* but never *stand on*).
+
+```{python}
+NEG_INF = -1e30   # stand-in for -inf when masking illegal actions
+
+@dataclass
+class Env:
+    name: str
+    n_states: int
+    n_actions: int
+    P: np.ndarray              # (n_states, n_actions, n_states) transition probabilities
+    reward_mean: np.ndarray    # (n_states, n_actions)
+    reward_sd: np.ndarray      # (n_states, n_actions)
+    terminal: np.ndarray       # (n_states,) bool
+    start: np.ndarray          # (n_states,) start-state distribution
+    legal_actions: np.ndarray  # (n_states, n_actions) 1.0 where the action is allowed
+    reachable: np.ndarray      # (n_states,) reachable from a start state
+    shape: tuple = ()          # grid shape, for printing
+```
+
+
+```{python}
+def make_env(name, n_states, n_actions, step_fn, terminals, starts, shape=(), legal_actions=None):
+    "step_fn(s, a) returns (s_next, reward_mean, reward_sd); terminals absorb with reward 0."
+    P = np.zeros((n_states, n_actions, n_states))
+    reward_mean = np.zeros((n_states, n_actions))
+    reward_sd = np.zeros((n_states, n_actions))
+    terminal = np.zeros(n_states, dtype=bool); terminal[list(terminals)] = True
+
+    for s in range(n_states):
+        for a in range(n_actions):
+            if terminal[s]:
+                P[s, a, s] = 1.0
+                continue
+            s_next, mean, sd = step_fn(s, a)
+            P[s, a, s_next] = 1.0
+            reward_mean[s, a] = mean
+            reward_sd[s, a] = sd
+
+    start = np.zeros(n_states)
+    start[list(starts)] = 1.0 / len(list(starts))
+
+    if legal_actions is None:
+        legal_actions = np.ones((n_states, n_actions))
+
+    reachable = start > 0 # Breadth-First-Search over the legal actions
+    legal_P = P * (legal_actions > 0)[:, :, None] # illegal (s, a) rows zeroed out
+    while True:
+        frontier = legal_P[reachable & ~terminal] # transitions out of reachable, non-terminal states
+        one_step_reachable = frontier.sum(axis=(0, 1)) > 0
+        grown = reachable | one_step_reachable
+        if grown.sum() == reachable.sum(): # No new states are reachable
+            break
+        reachable = grown
+
+    return Env(
+        name,
+        n_states,
+        n_actions,
+        P,
+        reward_mean,
+        reward_sd,
+        terminal,
+        start,
+        legal_actions,
+        reachable,
+        shape
+    )
+```
+
+
+```{python}
+UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
+ARROWS = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
+
+def _move(row, col, action, n_rows, n_cols):
+    if action == UP: row = max(row - 1, 0)
+    elif action == DOWN: row = min(row + 1, n_rows - 1)
+    elif action == LEFT: col = max(col - 1, 0)
+    elif action == RIGHT: col = min(col + 1, n_cols - 1)
+    return row, col
+
+def show_grid(values, env, title="", fmt="6.1f"):
+    if title: print(title)
+    n_rows, n_cols = env.shape
+    for row in np.asarray(values, dtype=float).reshape(n_rows, n_cols):
+        print("  " + "  ".join(f"{x:{fmt}}" for x in row))
+
+def show_policy(actions, env, title="", extra=None):
+    "extra: dict cell -> character, drawn on top (terminals, cliff, start, ...)"
+    if title: print(title)
+    n_rows, n_cols = env.shape
+    chars = [ARROWS[int(a)] for a in actions]
+    for s in np.flatnonzero(env.terminal): chars[s] = "T"
+    for s in np.flatnonzero(~env.reachable): chars[s] = "."
+    for s, ch in (extra or {}).items(): chars[s] = ch
+    for row in range(n_rows):
+        print("   " + " ".join(chars[row * n_cols:(row + 1) * n_cols]))
+```
+
+The five environments are all undiscounted ($\gamma = 1$) with $-1$ reward per step unless noted.
+
+| Env | Shape | What it is |
+|:-------|:------|:-----------------------------------------------------------------------|
+| **`grid4`** | $4\times4$ | Terminal corners `0` and `15`, episodes start uniformly on a non-terminal cell. Our workbench for prediction, because we know $v_\pi$ and $v_*$ exactly. |
+| **`walk5`** | $1\times5$ | Five states in a row, absorbing ends, reward $+1$ only on stepping off the right end, always starting in the centre. Under the random policy $v_\pi(i) = i/6$ - values small enough that TD and MC can be compared cleanly. |
+| **`cliff`** | $4\times12$ | Stepping into the bottom-row cliff costs $-100$ and teleports you back to the start (the episode does *not* end). |
+| **`windy`** | $7\times10$ | An upward wind displaces you by 0-2 cells depending on the column you leave from. |
+| **`maxbias`** | 2 decision states | From `A` you may go `left` into `B` or `right` to terminate; every one of `B`'s ten actions terminates with reward $\mathcal N(-0.1, 1)$. Going left is *always* a mistake in expectation, which is what makes it a trap for a learner that maximizes over noisy estimates. |
+
+
+```{python}
+# Remember our environment factory takes:
+# name, n_states, n_actions, step_fn, terminals, starts, shape=(), legal_actions=None
+# as arguments
+
+def grid4_env():
+    def step(s, a):
+        "return next_state, reward_mean, reward_sd"
+        row, col = _move(*divmod(s, 4), a, 4, 4)
+        return row * 4 + col, -1.0, 0.0
+    return make_env("grid4", 16, 4, step, [0, 15],
+                    [s for s in range(16) if s not in (0, 15)], shape=(4, 4))
+
+def walk5_env():
+    def step(s, a): # a = 0 left, a = 1 right
+        s_next = s - 1 if a == 0 else s + 1
+        return s_next, 1.0 if s_next == 6 else 0.0, 0.0
+    return make_env("walk5", 7, 2, step, [0, 6], [3], shape=(1, 7))
+
+def cliff_env(n_rows=4, n_cols=12):
+    start_state = (n_rows - 1) * n_cols
+    goal = (n_rows - 1) * n_cols + n_cols - 1
+    cliff_cells = {(n_rows - 1) * n_cols + col for col in range(1, n_cols - 1)}
+    def step(s, a):
+        row, col = _move(*divmod(s, n_cols), a, n_rows, n_cols)
+        s_next = row * n_cols + col
+        return (start_state, -100.0, 0.0) if s_next in cliff_cells else (s_next, -1.0, 0.0)
+    return make_env("cliff", n_rows * n_cols, 4, step, [goal], [start_state],
+                    shape=(n_rows, n_cols))
+
+WIND = np.array([0, 0, 0, 1, 1, 1, 2, 2, 1, 0])
+
+def windy_env(n_rows=7, n_cols=10):
+    def step(s, a):
+        row, col = divmod(s, n_cols)
+        row_next, col_next = _move(row, col, a, n_rows, n_cols)
+        row_next = max(row_next - WIND[col], 0)   # wind of the column you leave, blowing up
+        return row_next * n_cols + col_next, -1.0, 0.0
+    return make_env("windy", n_rows * n_cols, 4, step, [3 * n_cols + 7], [3 * n_cols],
+                    shape=(n_rows, n_cols))
+
+def maxbias_env(n_B_actions=10, mean=-0.1, sd=1.0):
+    # 0 = A (start), 1 = B, 2 = terminal. A: 0 = left -> B, 1 = right -> terminal
+    legal_actions = np.zeros((3, n_B_actions))
+    legal_actions[0, :2] = 1.0 # only left(0) and right(1) are legal
+    legal_actions[1:, :] = 1.0 # B: all n_B_actions and terminal are legal
+    def step(s, a):
+        if s == 0:
+            return (1, 0.0, 0.0) if a == 0 else (2, 0.0, 0.0)
+        return 2, mean, sd
+    return make_env("maxbias", 3, n_B_actions, step, [2], [0], legal_actions=legal_actions)
+
+grid4, walk5, cliff, windy, maxbias = (grid4_env(), walk5_env(), cliff_env(), windy_env(), maxbias_env())
+```
+
+## DP Oracle
+
+We perform two sweeps per environment using our DP oracle. First, iterative policy evaluation for $v_\pi$, and second, value iteration for $v_*$. In addition, we compute the one-step lookahead
+ $$
+q(s,a) = r(s,a) + \gamma\sum_{s'}P[s,a,s']\,v(s')
+$$
+
+that turns any state-value vector into action values. Illegal actions are masked out of the $\max$ with a large negative number.
+
+
+```{python}
+def make_dp(env, n_iters=2000):
+    P = pt.as_tensor_variable(env.P)
+    reward = pt.as_tensor_variable(env.reward_mean)
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
+    gamma = pt.scalar("gamma")
+    pi = pt.matrix("pi")
+    v_in = pt.vector("v")
+
+    def q_from(v, gamma):
+        return reward + gamma * (P * v[None, None, :]).sum(axis=2)
+
+    def expectation_step(v, pi, gamma): # v_{k+1}(s) = sum_a pi(a|s) q_k(s, a)
+        return not_terminal * (pi * q_from(v, gamma)).sum(axis=1)
+
+    def optimality_step(v, gamma): # v_{k+1}(s) = max over the legal a of q_k(s, a)
+        q = pt.where(legal_actions > 0, q_from(v, gamma), NEG_INF)
+        return not_terminal * q.max(axis=1)
+
+    v_eval = pytensor.scan(
+        fn=expectation_step,
+        outputs_info=pt.zeros((env.n_states,)),
+        non_sequences=[pi, gamma],
+        n_steps=n_iters,
+        return_updates=False
+    )
+
+    v_star = pytensor.scan(
+        fn=optimality_step,
+        outputs_info=pt.zeros((env.n_states,)),
+        non_sequences=[gamma],
+        n_steps=n_iters,
+        return_updates=False
+    )
+    return (pytensor.function([pi, gamma], v_eval[-1]), # evaluate_policy
+            pytensor.function([gamma], v_star[-1]), # optimal_values
+            pytensor.function([v_in, gamma], q_from(v_in, gamma))) # action_values_of
+```
+
+
+```{python}
+ORACLE = {e.name: make_dp(e) for e in (grid4, walk5, cliff, windy, maxbias)}
+
+def exact(env, gamma=1.0, pi=None):
+    "v_pi if a policy is given, else v_*; always with the matching action values."
+    evaluate_policy, optimal_values, action_values_of = ORACLE[env.name]
+    v = evaluate_policy(pi, gamma) if pi is not None else optimal_values(gamma)
+    q = action_values_of(v, gamma)
+    q[env.terminal] = 0.0
+    return v, q
+
+pi_random_g4 = np.ones((grid4.n_states, grid4.n_actions)) / grid4.n_actions
+v_pi_g4, q_pi_g4 = exact(grid4, 1.0, pi_random_g4)
+v_star_g4, q_star_g4 = exact(grid4)
+
+show_grid(v_pi_g4, grid4, "exact v_pi, equiprobable random policy:")
+print()
+show_grid(v_star_g4, grid4, "exact v_* :")
+```
+
+## Simulator
+
+For *prediction* (policy evaluation) we need episodes generated by a fixed policy, so we reuse the batched rollout of the Monte Carlo chapter where the recurrent state of the `scan` is a length-$B$ vector of current states, and every step draws
+
+$$
+A_t\sim\pi(\cdot\mid S_t)
+$$
+
+$$
+S_{t+1}\sim P[S_t,A_t,\cdot]
+$$  
+
+$$
+R_{t+1}\sim\mathcal N(r_\mu, r_\sigma)
+$$
+
+for all $B$ episodes at once.
+
+The RNG is threaded through `scan` as one of the recurrent outputs and registered in `updates=` so successive calls continue the stream. Terminal states absorb with reward 0, so the padded steps after termination contribute nothing and are masked out of every statistic.
+
+The rollout returns aligned $(T,B)$ tensors, each row $t$ holding $(S_t, A_t, R_{t+1}, S_{t+1})$, where the TD update needs that fourth element compared to Monte Carlo.
+
+
+```{python}
+def make_rollout(env, seed):
+    P = pt.as_tensor_variable(env.P)
+    reward_mean = pt.as_tensor_variable(env.reward_mean)
+    reward_sd = pt.as_tensor_variable(env.reward_sd)
+    rng_shared = pt.random.shared_rng(seed=seed, name=f"rng_roll_{env.name}")
+    pi = pt.matrix("pi")
+    s_start = pt.lvector("s0")
+    max_steps = pt.iscalar("T")
+
+    def step(s, rng, pi):
+        rng, a = rng.categorical(p=pi[s]) # A_t ~ pi(.|S_t)
+        rng, s_next = rng.categorical(p=P[s, a]) # S_{t+1} ~ p(.|S_t,A_t)
+        rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a]) # R_{t+1}
+        return s_next, rng, a, r
+
+    S_next, rng_final, A, R = pytensor.scan(
+        fn=step,
+        outputs_info=[s_start, rng_shared, None, None],
+        non_sequences=[pi],
+        n_steps=max_steps,
+        return_updates=False
+    )
+    S = pt.concatenate([s_start[None, :], S_next[:-1]], axis=0) # row t = S_t
+    return pytensor.function([pi, s_start, max_steps], [S, A, R, S_next], updates={rng_shared: rng_final})
+
+def make_returns():
+    "G_t = R_{t+1} + gamma * G_{t+1}, backward updates."
+    R = pt.matrix("R")
+    gamma = pt.scalar("g")
+
+    def accumulate_return(r, G_next, gamma):
+        return r + gamma * G_next # R_{t+1} + gamma * G_{t+1}
+
+    G = pytensor.scan(
+        fn=accumulate_return,
+        sequences=[R],
+        outputs_info=pt.zeros_like(R[0]),
+        non_sequences=[gamma],
+        go_backwards=True, return_updates=False
+    )
+    return pytensor.function([R, gamma], G[::-1])
+
+returns_fn = make_returns()
+rollout_g4 = make_rollout(grid4, 2026)
+rollout_walk = make_rollout(walk5, 4242)
+np_rng = np.random.default_rng(0)
+```
+
+# TD Prediction
+
+In contrast to constant-$\alpha$ Monte Carlo that needs to wait for the return:
+
+$$
+V(S_t) \leftarrow V(S_t) + \alpha\left[G_t - V(S_t)\right].
+$$
+
+**TD(0)** replaces the unknown $G_t$ with a one-step estimate of it, $R_{t+1} + \gamma V(S_{t+1})$, which is available at time $t+1$:
+
+$$
+V(S_t) \;\leftarrow\; V(S_t) + \alpha\underbrace{\left[\,R_{t+1} + \gamma V(S_{t+1}) - V(S_t)\right]}_{\displaystyle \delta_t,\ \text{the TD error}}
+$$
+
+The substitution is supported by the Bellman equation for $v_\pi$: MC aims at
+
+$$
+v_\pi(s) = \mathbb E_\pi[G_t\mid S_t=s]
+$$
+
+While TD aims at
+
+$$
+v_\pi(s) = \mathbb E_\pi[R_{t+1} + \gamma v_\pi(S_{t+1})\mid S_t=s]
+$$
+
+MC's target is an unbiased sample of the first. Whereas, TD's target is a *biased* sample of the second; since it uses the current $V$, not $v_\pi$. However, TD has lower variance, since it depends on one random transition rather than a whole trajectory. TD(0) is a **bootstrapping** method, and its backup is a *sample* backup. TD looks at one successor, where DP's expected backup looks at all of them.
+
+$\delta_t$ is worth noting, because it is the error in $V(S_t)$ *as revealed one step later*.
+
+## Sequential updates as a `scan`
+
+TD is strictly sequential, each update uses the $V$ produced by the previous update. So the `scan` carries $V$ as its recurrent state and walks the transitions in order.
+
+We define two scans:
+
+- the inner one steps through the transitions of one episode
+- the outer one steps through episodes and hands back $V$ after each, yielding a learning curve
+
+In the previous chapter MC ran thousands of episodes *in parallel* along a batch dimension, because averaging returns is order-independent. Online TD cannot do that because episode $k+1$ must see the $V$ that episode $k$ produced. What we can still parallelize is **independent runs** of separate learners with their own $V$ (and their own $\alpha$, which is how we sweep step sizes). So $V$ has shape `(n_runs, n_states)` and every update is a batched `inc_subtensor`.
+
+
+```{python}
+def make_predict(env, kind):
+    """TD(0) (kind='td0') or constant-alpha every-visit MC (kind='mc') prediction.
+    Episodes come in as (n_episodes, max_steps, n_learners); returns V after each episode."""
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    S_all = pt.ltensor3("S")
+    targets_all = pt.dtensor3("X")
+    S_next_all = pt.ltensor3("Sp")
+    V_init = pt.dmatrix("V0")
+    alpha = pt.dvector("alpha")
+    gamma = pt.scalar("g")
+
+    def transition(s, x, s_next, V, alpha, gamma):
+        learners = pt.arange(V.shape[0])
+        still_running = not_terminal[s] # skip padding after termination
+        # x is R_{t+1} for TD(0) (bootstrap off V(S_{t+1})), and G_t for MC
+        target = (x + gamma * not_terminal[s_next] * V[learners, s_next]
+                  if kind == "td0" else x)
+        return pt.inc_subtensor(V[learners, s],
+                                alpha * still_running * (target - V[learners, s]))
+
+    def episode(S_ep, targets_ep, S_next_ep, V, alpha, gamma):
+        V_steps = pytensor.scan(fn=transition, sequences=[S_ep, targets_ep, S_next_ep],
+                                outputs_info=V, non_sequences=[alpha, gamma],
+                                return_updates=False)
+        return V_steps[-1]
+
+    V_per_episode = pytensor.scan(fn=episode, sequences=[S_all, targets_all, S_next_all],
+                                  outputs_info=V_init, non_sequences=[alpha, gamma],
+                                  return_updates=False)
+    return pytensor.function([S_all, targets_all, S_next_all, V_init, alpha, gamma],
+                             V_per_episode)
+
+td0_g4 = make_predict(grid4, "td0")
+mc_g4 = make_predict(grid4, "mc")
+```
+
+
+```{python}
+def episodes_for(rollout, env, pi, n_episodes, n_learners, max_steps, gamma=1.0):
+    """One rollout call, reshaped into (n_episodes, max_steps, n_learners) so that learner r
+    sees its own stream of n_episodes episodes in order."""
+    n_chains = n_episodes * n_learners
+    s_start = np_rng.choice(np.flatnonzero(env.start > 0), size=n_chains,
+                            p=env.start[env.start > 0]).astype("int64")
+    S, A, R, S_next = rollout(pi, s_start, max_steps)
+    G = returns_fn(R, gamma)
+    by_episode = lambda X: X.reshape(max_steps, n_episodes, n_learners).transpose(1, 0, 2)
+    frac_finished = env.terminal[S_next[-1]].mean()
+    return (by_episode(S), by_episode(A), by_episode(R), by_episode(S_next),
+            by_episode(G), frac_finished)
+```
+
+
+```{python}
+N_EPISODES, N_RUNS, MAX_STEPS_G4 = 3000, 10, 80
+alphas_g4 = [0.02, 0.05, 0.10]
+n_learners_g4 = N_RUNS * len(alphas_g4)
+alpha_per_learner = np.repeat(alphas_g4, N_RUNS)
+
+S_g4, A_g4, R_g4, S_next_g4, G_g4, frac_finished = episodes_for(rollout_g4, grid4, pi_random_g4, N_EPISODES, n_learners_g4, MAX_STEPS_G4)
+
+print(f"{N_EPISODES} episodes x {n_learners_g4} learners, {frac_finished:.2%} of episodes "
+      f"terminated within T={MAX_STEPS_G4}")
+```
+
+
+```{python}
+V_init_g4 = np.zeros((n_learners_g4, grid4.n_states))
+V_td = td0_g4(S_g4, R_g4, S_next_g4, V_init_g4, alpha_per_learner, 1.0)   # (n_episodes, n_learners, n_states)
+V_mc = mc_g4(S_g4, G_g4, S_next_g4, V_init_g4, alpha_per_learner, 1.0)
+
+non_terminal_g4 = ~grid4.terminal
+
+def rmse_over_states(V, v_true, states):
+    "V: (n_episodes, n_learners, n_states) -> (n_episodes, n_learners) RMSE over `states`."
+    return np.sqrt(((V[:, :, states] - v_true[states]) ** 2).mean(axis=2))
+
+rms_td = rmse_over_states(V_td, v_pi_g4, non_terminal_g4)
+rms_mc = rmse_over_states(V_mc, v_pi_g4, non_terminal_g4)
+smallest_alpha = slice(0, N_RUNS) # the alpha = 0.02 block
+show_grid(V_td[-1, smallest_alpha].mean(axis=0), grid4,
+          f"TD(0) estimate of v_pi after {N_EPISODES} episodes (alpha = {alphas_g4[0]}):")
+print()
+show_grid(v_pi_g4, grid4, "exact v_pi from the DP oracle:")
+```
+
+
+```{python}
+for i, alpha in enumerate(alphas_g4):
+    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
+    td_curve = rms_td[:, block].mean(axis=1)
+    mc_curve = rms_mc[:, block].mean(axis=1)
+
+    crossing = np.flatnonzero(td_curve < mc_curve)
+
+    print(f"\nRMSE at alpha = {alpha}")
+    for ep in [100, 500, 3000]:
+        print(f"  after {ep} episodes: TD(0) {td_curve[ep-1]:.2f} | "
+              f"constant-alpha MC {mc_curve[ep-1]:.2f}")
+    print(f"  TD overtakes MC at episode {crossing[0] + 1}" if crossing.size
+          else "  TD never overtakes MC")
+```
+
+
+```{python}
+#| classes: light-mode
+pred_fig = go.Figure()
+for i, alpha in enumerate(alphas_g4):
+    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
+
+    pred_fig.add_scatter(
+        x=np.arange(1, N_EPISODES + 1),
+        y=rms_td[:, block].mean(axis=1), # avg over learners
+        mode="lines",
+        name=f"TD(0), alpha={alpha}",
+        line=dict(color=colors[i], width=2),
+        hovertemplate="<b>RMSE</b> = %{y:.2f}"
+    )
+
+    pred_fig.add_scatter(
+        x=np.arange(1, N_EPISODES + 1),
+        y=rms_mc[:, block].mean(axis=1),
+        mode="lines",
+        name=f"MC, alpha={alpha}",
+        line=dict(color=colors[i], width=2, dash="dot"),
+        hovertemplate="<b>RMSE</b> = %{y:.2f}"
+    )
+
+pred_fig.update_layout(
+    title="<b>TD(0) vs constant-alpha MC on the 4x4 gridworld</b>"
+          f"<br><sup>RMSE against exact v_pi, {N_RUNS} runs per step size</sup>",
+    xaxis=dict(title="episodes (log scale)", type="log"),
+    yaxis=dict(title="RMSE over states"),
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=0.95, x=0),
+    hovermode="x unified",
+    margin=dict(t=100, b=100)
+)
+pred_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+pred_fig = go.Figure()
+for i, alpha in enumerate(alphas_g4):
+    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
+
+    pred_fig.add_scatter(
+        x=np.arange(1, N_EPISODES + 1),
+        y=rms_td[:, block].mean(axis=1), # avg over learners
+        mode="lines",
+        name=f"TD(0), alpha={alpha}",
+        line=dict(color=colors[i], width=2),
+        hovertemplate="<b>RMSE</b> = %{y:.2f}"
+    )
+
+    pred_fig.add_scatter(
+        x=np.arange(1, N_EPISODES + 1),
+        y=rms_mc[:, block].mean(axis=1),
+        mode="lines",
+        name=f"MC, alpha={alpha}",
+        line=dict(color=colors[i], width=2, dash="dot"),
+        hovertemplate="<b>RMSE</b> = %{y:.2f}"
+    )
+
+pred_fig.update_layout(
+    title="<b>TD(0) vs constant-alpha MC on the 4x4 gridworld</b>"
+          f"<br><sup>RMSE against exact v_pi, {N_RUNS} runs per step size</sup>",
+    xaxis=dict(title="episodes (log scale)", type="log"),
+    yaxis=dict(title="RMSE over states"),
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="bottom", y=0.95, x=0),
+    hovermode="x unified",
+    margin=dict(t=100, b=100)
+)
+pred_fig.show(config=dict(displayModeBar=False))
+```
+
+
+- Every curve **plateaus** rather than converging to zero. With a fixed $\alpha$ the estimate keeps chasing the most recent samples, so it settles into a noise band around $v_\pi$ whose width grows with $\alpha$.
+
+- **Monte Carlo descends first, but TD ends up more accurate.** This is the bias-variance off, where MC's target is an unbiased sample of the right magnitude, so from the cold start $V=0$ it lands in the right ballpark almost immediately. Whereas, TD which bootstraps off its own wrong values, has to *diffuse* the terminal-state information outward roughly one state per visit. However, when TD's estimates are in the right ballpark the situation reverses because returns on this gridworld are wildly variable (the random policy's episode lengths range from a couple of steps to dozens), MC keeps jumping toward noisy targets and never settles, but TD's target is anchored by an estimate that is already nearly right.
+
+- **Larger $\alpha$ is faster early and worse late** - and it hurts MC much more than TD, for the same reason.
+
+TD learning faster is not unconditional. MC pays for varianc while TD pays for bias, however, the bias is transient as TD will eventually convegerge on the correct estimate, but the variance is not as MC will continue jumping toward noisy targets.
+
+# Advantages of TD prediction methods
+
+TD(0) doesn't require a  model just like MC, and it is **fully incremental** because it learns from each transition as it happens, without waiting for the episode to end or requiring that an episode even *exist*. That last point matters for tasks that are continuing, or episodic-but-very-long, or where the outcome arrives so late that a MC learner would sit idle for hours. Both methods converge to $v_\pi$ for a fixed policy, and although nobody has proved a general rate result, TD is usually faster in practice on stochastic tasks. We explore two experiments from the book that depict the advantages.
+
+## Driving Home Problem
+
+You leave the office and predict how long the drive home will take, revising the prediction as things unfold. Each leg's elapsed time is a reward and the prediction is the value: total time =
+elapsed so far + predicted time to go.
+
+An MC learner can only update once it is home (end of the episode), and then it shifts *every* prediction of the
+trip toward the single outcome. A TD learner shifts each prediction toward the *next* prediction, as soon as that next prediction exists. For example, when you reach the car in the rain and revise 30 minutes to 40 minutes, the TD learner immediately corrects the "leaving office" estimate, without waiting to see whether the rest of the drive was lucky.
+
+
+```{python}
+# These values are hardcoded from the book's example
+legs = [
+    "leaving office",
+    "reach car, raining",
+    "exiting highway",
+    "behind truck",
+    "home street",
+    "arrive home"
+]
+
+elapsed = np.array([0., 5., 20., 30., 40., 43.])
+time_to_go = np.array([30., 35., 15., 10., 3., 0.])
+predicted_total = elapsed + time_to_go # predicted total time
+leg_cost = np.diff(elapsed) # per-leg cost
+
+V_drive = time_to_go.copy() # value = predicted time to go
+V_drive_mc = V_drive + 1.0 * ((elapsed[-1] - elapsed) - V_drive) # alpha = 1: target G_t
+V_drive_td = V_drive.copy()
+V_drive_td[:-1] = leg_cost + V_drive[1:] # alpha = 1: target R + V(next)
+
+print(f"{'state':>22} {'predicted total':>16} {'after MC':>10} {'after TD':>10}")
+for i, leg in enumerate(legs):
+    print(f"{leg:>22} {predicted_total[i]:16.0f} "
+          f"{elapsed[i] + V_drive_mc[i]:10.0f} {elapsed[i] + V_drive_td[i]:10.0f}")
+```
+
+
+```{python}
+#| classes: light-mode
+drive_fig = make_subplots(
+    rows=1,
+    cols=2,
+    shared_yaxes=False,
+    subplot_titles=("Monte Carlo: everything moves to the outcome", "TD: each prediction moves to the next one")
+)
+
+leg_index = np.arange(len(legs))
+
+for col, V_updated in [(1, V_drive_mc), (2, V_drive_td)]:
+    axis = "" if col == 1 else str(col)
+
+    drive_fig.add_scatter(
+        x=leg_index,
+        y=predicted_total,
+        mode="lines+markers",
+        name="prediction",
+        line=dict(color=colors[0], width=2),
+        marker=dict(size=9, line=dict(color="white", width=1)),
+        showlegend=(col == 1),
+        row=1,
+        col=col
+    )
+
+    drive_fig.add_scatter(
+        x=leg_index,
+        y=elapsed + V_updated,
+        mode="markers",
+        name="after the update",
+        marker=dict(
+            color=colors[2],
+            size=9,
+            symbol="diamond",
+            line=dict(color="white", width=1)
+        ),
+        showlegend=(col == 1),
+        row=1,
+        col=col
+    )
+
+    for i in range(len(legs)):
+        drive_fig.add_annotation(
+            x=leg_index[i],
+            y=elapsed[i] + V_updated[i],
+            ax=leg_index[i],
+            ay=predicted_total[i],
+            xref=f"x{axis}",
+            yref=f"y{axis}",
+            axref=f"x{axis}",
+            ayref=f"y{axis}",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=1.5,
+            arrowcolor="grey"
+        )
+
+    drive_fig.add_hline(y=43, line=dict(color="grey", width=1, dash="dash"), row=1, col=col)
+
+drive_fig.update_xaxes(
+    tickmode="array",
+    tickvals=leg_index,
+    ticktext=[s.replace(", ", ",<br>") for s in legs],
+    tickangle=-30
+)
+
+drive_fig.update_layout(
+    title=r"$\text{Revising the drive-home prediction }(\alpha = 1)$",
+    yaxis_title="predicted total travel time (min)",
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="top", y=-0.30, x=0),
+    margin=dict(t=100, b=100),
+)
+drive_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+drive_fig = make_subplots(
+    rows=1,
+    cols=2,
+    shared_yaxes=False,
+    subplot_titles=("Monte Carlo: everything moves to the outcome", "TD: each prediction moves to the next one")
+)
+
+leg_index = np.arange(len(legs))
+
+for col, V_updated in [(1, V_drive_mc), (2, V_drive_td)]:
+    axis = "" if col == 1 else str(col)
+
+    drive_fig.add_scatter(
+        x=leg_index,
+        y=predicted_total,
+        mode="lines+markers",
+        name="prediction",
+        line=dict(color=colors[0], width=2),
+        marker=dict(size=9, line=dict(color="white", width=1)),
+        showlegend=(col == 1),
+        row=1,
+        col=col
+    )
+
+    drive_fig.add_scatter(
+        x=leg_index,
+        y=elapsed + V_updated,
+        mode="markers",
+        name="after the update",
+        marker=dict(
+            color=colors[2],
+            size=9,
+            symbol="diamond",
+            line=dict(color="white", width=1)
+        ),
+        showlegend=(col == 1),
+        row=1,
+        col=col
+    )
+
+    for i in range(len(legs)):
+        drive_fig.add_annotation(
+            x=leg_index[i],
+            y=elapsed[i] + V_updated[i],
+            ax=leg_index[i],
+            ay=predicted_total[i],
+            xref=f"x{axis}",
+            yref=f"y{axis}",
+            axref=f"x{axis}",
+            ayref=f"y{axis}",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=1.5,
+            arrowcolor="grey"
+        )
+
+    drive_fig.add_hline(y=43, line=dict(color="grey", width=1, dash="dash"), row=1, col=col)
+
+drive_fig.update_xaxes(
+    tickmode="array",
+    tickvals=leg_index,
+    ticktext=[s.replace(", ", ",<br>") for s in legs],
+    tickangle=-30
+)
+
+drive_fig.update_layout(
+    title=r"$\text{Revising the drive-home prediction }(\alpha = 1)$",
+    yaxis_title="predicted total travel time (min)",
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="top", y=-0.30, x=0),
+    margin=dict(t=100, b=100),
+)
+drive_fig.show(config=dict(displayModeBar=False))
+```
+
+The table above is hard-coded and covers a single trip, which makes it a diagram rather than an experiment. We cannot see a *rate* in just one episode.
+
+So here is the same commute as an actual environment, driven 1000 times.
+
+Randomness is carried by the action draw where the rollout samples $A_t\sim\pi(\cdot\mid S_t)$ and then continues on deterministically, so a fixed $\pi$ collapses this MDP into the Markov chain, and we reuse `make_env`, the rollout, `make_predict`, and the DP oracle that supplies the answer key.
+
+Two branching scenarios make the trip stochastic:
+
+- it rains with probability $0.3$ (costing 5 minutes on the highway leg)
+- you get stuck behind a slow truck with probability $0.4$ (costing 6 minutes).
+
+Each leg's duration is itself noisy, so no two commutes are alike.
+
+Both learners are initialised with the static example's own table, $[30, 30, 35, 15, 10, 3, 0]$.
+
+
+```{python}
+OFFICE, CAR_DRY, CAR_RAIN, EXIT_HWY, TRUCK, STREET, HOME = range(7)
+
+DRIVE_STATES = ["leaving office", "at car, dry", "at car, raining",
+                "exiting highway", "behind truck", "home street", "home"]
+
+P_RAIN, P_TRUCK = 0.3, 0.4
+
+DRIVE_LEGS = { # (state, scenario/branch) -> (next state, mean minutes, sd)
+    (OFFICE, 0): (CAR_DRY, 5.0, 1.0),
+    (OFFICE, 1): (CAR_RAIN, 5.0, 1.0),
+    (CAR_DRY, 0): (EXIT_HWY, 13.0, 2.0),
+    (CAR_RAIN, 0): (EXIT_HWY, 18.0, 3.0), # rain costs 5 minutes on the highway leg
+    (EXIT_HWY, 0): (STREET, 12.0, 1.5),
+    (EXIT_HWY, 1): (TRUCK, 10.0, 1.0),
+    (TRUCK, 0): (STREET, 8.0, 1.5), # the truck detour: 10 + 8 instead of 12
+    (STREET, 0): (HOME, 3.0, 0.5),
+}
+
+def drive_env():
+    def step(s, a):
+        return DRIVE_LEGS.get((s, a), DRIVE_LEGS[(s, 0)]) # branch 1 == branch 0 where unbranched
+    return make_env("drive", 7, 2, step, [HOME], [OFFICE], shape=(1, 7))
+
+drive = drive_env()
+pi_drive = np.zeros((drive.n_states, drive.n_actions))
+pi_drive[:, 0] = 1.0 # If no branch always take branch 1
+pi_drive[OFFICE] = [1 - P_RAIN,  P_RAIN]
+pi_drive[EXIT_HWY] = [1 - P_TRUCK, P_TRUCK]
+
+ORACLE[drive.name] = make_dp(drive)
+v_drive_true, _ = exact(drive, 1.0, pi_drive)
+rollout_drive = make_rollout(drive, 606)
+td0_drive = make_predict(drive, "td0")
+mc_drive = make_predict(drive, "mc")
+
+MAX_STEPS_DRIVE = 6
+S_peek, _, _, _, G_peek, frac_drive = episodes_for(rollout_drive, drive, pi_drive, 6, 1, MAX_STEPS_DRIVE)
+
+print(f"exact E[time to go], from the DP oracle ({frac_drive:.0%} of trips reach home):")
+for s, name in enumerate(DRIVE_STATES):
+    print(f"  {name:>16}  {v_drive_true[s]:6.2f} min")
+
+print("\nsix sampled commutes:")
+for e in range(6):
+    route = [DRIVE_STATES[s] for s in S_peek[e, :, 0]]
+    route = route[:1] + [r for r in route[1:] if r != "home"]
+    print(f"  {G_peek[e, 0, 0]:5.1f} min " + " -> ".join(route))
+```
+
+
+
+```{python}
+N_EPISODES_D = 1000
+N_RUNS_D = 50
+alphas_d = [0.01, 0.05, 0.20]
+n_learners_d = N_RUNS_D * len(alphas_d)
+alpha_per_learner_d = np.repeat(alphas_d, N_RUNS_D)
+
+V_prior = np.array([30., 30., 35., 15., 10., 3., 0.]) # the hard-coded time_to_go
+V_init_d = np.tile(V_prior, (n_learners_d, 1))
+
+S_d, A_d, R_d, S_next_d, G_d, _ = episodes_for(rollout_drive, drive, pi_drive, N_EPISODES_D, n_learners_d, MAX_STEPS_DRIVE)
+V_td_d = td0_drive(S_d, R_d, S_next_d, V_init_d, alpha_per_learner_d, 1.0)
+V_mc_d = mc_drive(S_d, G_d, S_next_d, V_init_d, alpha_per_learner_d, 1.0)
+
+non_terminal_d = ~drive.terminal
+rms_td_d = rmse_over_states(V_td_d, v_drive_true, non_terminal_d)
+rms_mc_d = rmse_over_states(V_mc_d, v_drive_true, non_terminal_d)
+
+print(f"one trip's total time has sd {G_d[:, 0, :].std():.2f} min "
+      f"- that is the noise Monte Carlo puts into every target\n")
+
+for i, alpha in enumerate(alphas_d):
+    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
+    td_curve = rms_td_d[:, block].mean(axis=1)
+    mc_curve =  rms_mc_d[:, block].mean(axis=1)
+
+    crossing = np.flatnonzero(td_curve < mc_curve)
+    print(f"RMSE at alpha = {alpha}")
+
+    for ep in (25, 100, 1000):
+        print(f"  after {ep} trips: TD(0) {td_curve[ep-1]:.3f} | MC {mc_curve[ep-1]:.3f}")
+    print(f"  TD overtakes MC at trip {crossing[0] + 1}\n" if crossing.size
+          else "  TD never overtakes MC\n")
+
+mid = slice(N_RUNS_D, 2 * N_RUNS_D) # the alpha = 0.05 block
+print(f"{'state':>16} {'prior':>7} {'TD(0)':>7} {'MC':>7} {'exact':>7} - (alpha = 0.05)")
+for s, name in enumerate(DRIVE_STATES):
+    print(f"{name:>16} {V_prior[s]:7.2f} {V_td_d[-1, mid, s].mean():7.2f} "
+          f"{V_mc_d[-1, mid, s].mean():7.2f} {v_drive_true[s]:7.2f}")
+
+print(f"\nspread of V(leaving office) across the {N_RUNS_D} runs after 1000 trips: "
+      f"TD(0) {V_td_d[-1, mid, OFFICE].std():.3f} | MC {V_mc_d[-1, mid, OFFICE].std():.3f}")
+```
+
+
+```{python}
+#| classes: light-mode
+learn_fig = make_subplots(
+    rows=1,
+    cols=2,
+    subplot_titles=(
+        r"$\text{RMSE against exact }v_{\pi}$",
+        r"$V(\text{leaving office})\text{, one run at }\alpha = 0.05$")
+    )
+trips = np.arange(1, N_EPISODES_D + 1)
+
+for i, alpha in enumerate(alphas_d):
+    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
+
+    learn_fig.add_scatter(
+        x=trips,
+        y=rms_td_d[:, block].mean(axis=1),
+        mode="lines",
+        name=f"TD(0), alpha={alpha}",
+        legendgroup=f"a{i}",
+        line=dict(color=colors[i], width=2),
+        row=1,
+        col=1
+    )
+
+    learn_fig.add_scatter(
+        x=trips,
+        y=rms_mc_d[:, block].mean(axis=1),
+        mode="lines",
+        name=f"MC, alpha={alpha}",
+        legendgroup=f"a{i}",
+        line=dict(color=colors[i], width=2, dash="dot"),
+        row=1,
+        col=1
+    )
+
+run = N_RUNS_D # first learner of the alpha = 0.05 block
+
+learn_fig.add_scatter(
+    x=trips,
+    y=V_mc_d[:, run, OFFICE],
+    mode="lines",
+    name="MC",
+    line=dict(color=colors[3], width=1.5),
+    legend="legend2",
+    row=1,
+    col=2
+)
+
+learn_fig.add_scatter(
+    x=trips,
+    y=V_td_d[:, run, OFFICE],
+    mode="lines",
+    name="TD(0)",
+    line=dict(color=colors[4], width=1.5),
+    legend="legend2",
+    row=1,
+    col=2
+)
+
+learn_fig.add_hline(
+    y=v_drive_true[OFFICE],
+    line=dict(color="black", width=1, dash="dash"),
+    annotation_text=f"exact {v_drive_true[OFFICE]:.2f}",
+    row=1,
+    col=2
+)
+
+learn_fig.update_xaxes(title="trips (log scale)", type="log", row=1, col=1)
+learn_fig.update_xaxes(title="trips", row=1, col=2)
+learn_fig.update_yaxes(title="RMSE (minutes)", row=1, col=1)
+learn_fig.update_yaxes(title="predicted time to go", row=1, col=2)
+
+learn_fig.update_layout(
+    title="<b>Driving home, 1000 times</b><br><sup>constant-alpha MC vs TD(0), "
+          f"starting from the static table, {N_RUNS_D} runs</sup>",
+    template="plotly_white",
+    legend1=dict(orientation="h", yanchor="bottom", y=-0.28, x=0),
+    legend2=dict(orientation="h", yanchor="bottom", y=-0.28, x=0.55),
+    margin=dict(t=100, b=100),
+    hovermode="x unified",
+    )
+
+learn_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+learn_fig = make_subplots(
+    rows=1,
+    cols=2,
+    subplot_titles=(
+        r"$\text{RMSE against exact }v_{\pi}$",
+        r"$V(\text{leaving office})\text{, one run at }\alpha = 0.05$")
+    )
+trips = np.arange(1, N_EPISODES_D + 1)
+
+for i, alpha in enumerate(alphas_d):
+    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
+
+    learn_fig.add_scatter(
+        x=trips,
+        y=rms_td_d[:, block].mean(axis=1),
+        mode="lines",
+        name=f"TD(0), alpha={alpha}",
+        legendgroup=f"a{i}",
+        line=dict(color=colors[i], width=2),
+        row=1,
+        col=1
+    )
+
+    learn_fig.add_scatter(
+        x=trips,
+        y=rms_mc_d[:, block].mean(axis=1),
+        mode="lines",
+        name=f"MC, alpha={alpha}",
+        legendgroup=f"a{i}",
+        line=dict(color=colors[i], width=2, dash="dot"),
+        row=1,
+        col=1
+    )
+
+run = N_RUNS_D # first learner of the alpha = 0.05 block
+
+learn_fig.add_scatter(
+    x=trips,
+    y=V_mc_d[:, run, OFFICE],
+    mode="lines",
+    name="MC",
+    line=dict(color=colors[3], width=1.5),
+    legend="legend2",
+    row=1,
+    col=2
+)
+
+learn_fig.add_scatter(
+    x=trips,
+    y=V_td_d[:, run, OFFICE],
+    mode="lines",
+    name="TD(0)",
+    line=dict(color=colors[4], width=1.5),
+    legend="legend2",
+    row=1,
+    col=2
+)
+
+learn_fig.add_hline(
+    y=v_drive_true[OFFICE],
+    line=dict(color="black", width=1, dash="dash"),
+    annotation_text=f"exact {v_drive_true[OFFICE]:.2f}",
+    row=1,
+    col=2
+)
+
+learn_fig.update_xaxes(title="trips (log scale)", type="log", row=1, col=1)
+learn_fig.update_xaxes(title="trips", row=1, col=2)
+learn_fig.update_yaxes(title="RMSE (minutes)", row=1, col=1)
+learn_fig.update_yaxes(title="predicted time to go", row=1, col=2)
+
+learn_fig.update_layout(
+    title="<b>Driving home, 1000 times</b><br><sup>constant-alpha MC vs TD(0), "
+          f"starting from the static table, {N_RUNS_D} runs</sup>",
+    template="plotly_dark",
+    legend1=dict(orientation="h", yanchor="bottom", y=-0.28, x=0),
+    legend2=dict(orientation="h", yanchor="bottom", y=-0.28, x=0.55),
+    margin=dict(t=100, b=100),
+    hovermode="x unified",
+    )
+
+learn_fig.show(config=dict(displayModeBar=False))
+```
+
+- After 1000 trips every state is within a few hundredths of the exact $v_\pi$
+
+- The speed of learning is highly dependent on $\alpha$
+
+- Both traces hover around the true value, but MC wanders visibly further. Each MC target is one whole commute (standard deviation of $4.8$ minutes) so $V(\text{office})$ is dragged toward a fresh $\pm 5$-minute sample every trip. TD's target is one 5-minute walk to the car plus a stored estimate of the rest, so it barely moves.
+
+MC's target accumulates noise from *every remaining leg*, while TD's always sees exactly one. So lengthening the trip should hurt MC but not TD.
+
+
+```{python}
+# stretch the commute by inserting extra highway legs.
+def make_long_drive(n_highway, name):
+    hwy0 = 3
+    truck = hwy0 + n_highway
+    street = truck + 1
+    home = street + 1
+
+    legs = {
+        (OFFICE, 0): (CAR_DRY, 5.0, 1.0),
+        (OFFICE, 1): (CAR_RAIN, 5.0, 1.0),
+        (CAR_DRY, 0): (hwy0, 13.0, 2.0),
+        (CAR_RAIN, 0): (hwy0, 18.0, 3.0),
+        (truck, 0): (street, 8.0, 1.5),
+        (street, 0): (home, 3.0, 0.5)
+    }
+
+    for i in range(n_highway - 1):
+        legs[(hwy0 + i, 0)] = (hwy0 + i + 1, 4.0, 1.5)
+
+    legs[(hwy0 + n_highway - 1, 0)] = (street, 12.0, 1.5)
+    legs[(hwy0 + n_highway - 1, 1)] = (truck, 10.0, 1.0)
+
+    env = make_env(name, home + 1, 2, lambda s, a: legs.get((s, a), legs[(s, 0)]), [home], [OFFICE])
+
+    pi = np.zeros((env.n_states, 2))
+    pi[:, 0] = 1.0
+    pi[OFFICE] = [1 - P_RAIN, P_RAIN]
+    pi[hwy0 + n_highway - 1] = [1 - P_TRUCK, P_TRUCK]
+    return env, pi
+
+print("alpha = 0.05, 1000 trips, both started from the exact values plus N(0, 3) noise")
+print(f"{'legs':>5} {'return sd':>10} {'TD(0)':>8} {'MC':>8} {'MC/TD':>7}")
+for n_highway in (1, 3, 6, 12):
+    env_l, pi_l = make_long_drive(n_highway, f"drive_long{n_highway}")
+    ORACLE[env_l.name] = make_dp(env_l)
+    v_true_l, _ = exact(env_l, 1.0, pi_l)
+    S_l, _, R_l, S_next_l, G_l, _ = episodes_for(make_rollout(env_l, 99), env_l, pi_l,
+                                                 N_EPISODES_D, N_RUNS_D, n_highway + 7)
+    V0_l = v_true_l + np_rng.normal(size=(N_RUNS_D, env_l.n_states)) * 3.0
+    V0_l[:, env_l.terminal] = 0.0
+    alpha_l = np.full(N_RUNS_D, 0.05)
+    td_predict = make_predict(env_l, "td0")
+    mc_predict = make_predict(env_l, "mc")
+    v_td = td_predict(S_l, R_l, S_next_l, V0_l, alpha_l, 1.0)
+    v_mc = mc_predict(S_l, G_l, S_next_l, V0_l, alpha_l, 1.0)
+
+    td_l = rmse_over_states(v_td, v_true_l, ~env_l.terminal)[-1].mean()
+    mc_l = rmse_over_states(v_mc, v_true_l, ~env_l.terminal)[-1].mean()
+    print(f"{n_highway + 4:5d} {G_l[:, 0, :].std():10.2f} {td_l:8.3f} {mc_l:8.3f} {mc_l/td_l:7.2f}")
+```
+
+TD's error is flat at $\approx 0.44$ whether the commute is 5 legs or 16, while MC's climbs from $0.59$ to $0.75$.
+
+The advantage here is real but modest, only a factor of $1.3$-$1.7$, not an order of magnitude.
+
+## Random Walk Problem
+
+In this example, we have five states in a row with terminal absorbing states on both ends. We only receive a reward of $+1$ for stepping off the right end, and we use a policy that flips a coin at every step. The exact values are $v_\pi(i) = i/6$, which makes this a clean head-to-head comparison. In addition, we generate one set of episodes and hand *the same episodes* to both learners, so the comparison is paired and nothing is left to randomness about the data.
+
+
+```{python}
+td0_walk = make_predict(walk5, "td0")
+mc_walk = make_predict(walk5, "mc")
+
+v_walk_true = np.arange(walk5.n_states) / 6.0
+v_walk_true[6] = 0.0
+
+inner_states = np.arange(1, 6)
+pi_walk = np.ones((walk5.n_states, walk5.n_actions)) / walk5.n_actions
+
+N_RUNS_WALK = 100
+N_EPISODES_WALK = 100
+MAX_STEPS_WALK = 80
+
+alphas_td_walk = [0.05, 0.10, 0.15]
+alphas_mc_walk = [0.01, 0.02, 0.03, 0.04]
+
+def walk_experiment(predict, alphas):
+    n_learners = N_RUNS_WALK * len(alphas)
+    S, A, R, S_next, G, frac_finished = episodes_for(
+        rollout_walk, walk5, pi_walk, N_EPISODES_WALK, n_learners, MAX_STEPS_WALK)
+    V_init = np.full((n_learners, walk5.n_states), 0.5)
+    V_init[:, [0, 6]] = 0.0
+    targets = R if predict is td0_walk else G
+    V = predict(S, targets, S_next, V_init, np.repeat(alphas, N_RUNS_WALK), 1.0)
+    rmse = rmse_over_states(V, v_walk_true, inner_states)
+    return V, {alpha: rmse[:, i * N_RUNS_WALK:(i + 1) * N_RUNS_WALK].mean(axis=1)
+               for i, alpha in enumerate(alphas)}, frac_finished
+
+V_walk_td, curves_td, frac_finished_td = walk_experiment(td0_walk, alphas_td_walk)
+V_walk_mc, curves_mc, frac_finished_mc = walk_experiment(mc_walk, alphas_mc_walk)
+print(f"episodes finished within T={MAX_STEPS_WALK}: "
+      f"TD data {frac_finished_td:.3%}, MC data {frac_finished_mc:.3%}")
+
+for alpha, curve in curves_td.items():
+    print(f"  TD alpha={alpha:<5} RMS after 100 episodes: {curve[-1]:.4f}")
+
+for alpha, curve in curves_mc.items():
+    print(f"  MC alpha={alpha:<5} RMS after 100 episodes: {curve[-1]:.4f}")
+```
+
+
+
+```{python}
+#| classes: light-mode
+walk_fig = make_subplots(
+    rows=1,
+    cols=2,
+    subplot_titles=(
+        r"$\text{TD}(0) \text{ estimates sweeping up toward }v_\pi\text{ }(\alpha = 0.1)$",
+        "RMSE averaged over the five states (100 runs)"
+    )
+)
+
+alpha_010_run = N_RUNS_WALK  # first run of the alpha = 0.10 block
+
+for i, ep in enumerate([0, 1, 10, 100]):
+    y = np.full(5, 0.5) if ep == 0 else V_walk_td[ep - 1, alpha_010_run, inner_states]
+
+    walk_fig.add_scatter(
+        x=list("ABCDE"),
+        y=y,
+        mode="lines+markers+text",
+        text=[""] * 4 + [f" {ep} ep"],
+        textposition="middle right",
+        textfont=dict(size=11),
+        showlegend=False,
+        line=dict(color=colors[i], width=2),
+        marker=dict(size=8, line=dict(color="white", width=1)),
+        row=1,
+        col=1
+    )
+
+walk_fig.add_scatter(
+    x=list("ABCDE"),
+    y=v_walk_true[inner_states],
+    mode="lines+text",
+    text=[""] * 4 + [" truth"],
+    textposition="middle right",
+    textfont=dict(size=11),
+    showlegend=False,
+    line=dict(color="grey", width=1, dash="dash"),
+    row=1,
+    col=1
+)
+
+for i, (alpha, curve) in enumerate(curves_td.items()):
+    walk_fig.add_scatter(
+        x=np.arange(1, N_EPISODES_WALK + 1),
+        y=curve,
+        mode="lines",
+        name=f"TD alpha={alpha}",
+        line=dict(color=colors[i], width=2.5),
+        legend="legend1",
+        row=1,
+        col=2
+    )
+
+for i, (alpha, curve) in enumerate(curves_mc.items()):
+    walk_fig.add_scatter(
+        x=np.arange(1, N_EPISODES_WALK + 1),
+        y=curve,
+        mode="lines",
+        name=f"MC alpha={alpha}",
+        line=dict(color=colors[i + 4], width=2, dash="dot"),
+        legend="legend2",
+        row=1,
+        col=2
+    )
+
+walk_fig.update_xaxes(title_text="state", row=1, col=1)
+walk_fig.update_xaxes(title_text="walks / episodes", row=1, col=2)
+walk_fig.update_yaxes(title_text="estimated value", row=1, col=1)
+walk_fig.update_yaxes(title_text="RMSE", row=1, col=2)
+walk_fig.update_xaxes(range=[-0.3, 4.9], row=1, col=1)
+
+walk_fig.update_layout(
+        template="plotly_white",
+        legend1=dict(orientation="h", yanchor="top", y=-0.15, x=0.55),
+        legend2=dict(orientation="h", yanchor="top", y=-0.22, x=0.55),
+        margin=dict(t=100, b=100),
+        hovermode="x unified",
+)
+
+walk_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+walk_fig = make_subplots(
+    rows=1,
+    cols=2,
+    subplot_titles=(
+        r"$\text{TD}(0) \text{ estimates sweeping up toward }v_\pi\text{ }(\alpha = 0.1)$",
+        "RMSE averaged over the five states (100 runs)"
+    )
+)
+
+alpha_010_run = N_RUNS_WALK  # first run of the alpha = 0.10 block
+
+for i, ep in enumerate([0, 1, 10, 100]):
+    y = np.full(5, 0.5) if ep == 0 else V_walk_td[ep - 1, alpha_010_run, inner_states]
+
+    walk_fig.add_scatter(
+        x=list("ABCDE"),
+        y=y,
+        mode="lines+markers+text",
+        text=[""] * 4 + [f" {ep} ep"],
+        textposition="middle right",
+        textfont=dict(size=11),
+        showlegend=False,
+        line=dict(color=colors[i], width=2),
+        marker=dict(size=8, line=dict(color="white", width=1)),
+        row=1,
+        col=1
+    )
+
+walk_fig.add_scatter(
+    x=list("ABCDE"),
+    y=v_walk_true[inner_states],
+    mode="lines+text",
+    text=[""] * 4 + [" truth"],
+    textposition="middle right",
+    textfont=dict(size=11),
+    showlegend=False,
+    line=dict(color="grey", width=1, dash="dash"),
+    row=1,
+    col=1
+)
+
+for i, (alpha, curve) in enumerate(curves_td.items()):
+    walk_fig.add_scatter(
+        x=np.arange(1, N_EPISODES_WALK + 1),
+        y=curve,
+        mode="lines",
+        name=f"TD alpha={alpha}",
+        line=dict(color=colors[i], width=2.5),
+        legend="legend1",
+        row=1,
+        col=2
+    )
+
+for i, (alpha, curve) in enumerate(curves_mc.items()):
+    walk_fig.add_scatter(
+        x=np.arange(1, N_EPISODES_WALK + 1),
+        y=curve,
+        mode="lines",
+        name=f"MC alpha={alpha}",
+        line=dict(color=colors[i + 4], width=2, dash="dot"),
+        legend="legend2",
+        row=1,
+        col=2
+    )
+
+walk_fig.update_xaxes(title_text="state", row=1, col=1)
+walk_fig.update_xaxes(title_text="walks / episodes", row=1, col=2)
+walk_fig.update_yaxes(title_text="estimated value", row=1, col=1)
+walk_fig.update_yaxes(title_text="RMSE", row=1, col=2)
+walk_fig.update_xaxes(range=[-0.3, 4.9], row=1, col=1)
+
+walk_fig.update_layout(
+        template="plotly_dark",
+        legend1=dict(orientation="h", yanchor="top", y=-0.15, x=0.55),
+        legend2=dict(orientation="h", yanchor="top", y=-0.22, x=0.55),
+        margin=dict(t=100, b=100),
+        hovermode="x unified",
+)
+
+walk_fig.show(config=dict(displayModeBar=False))
+```
+
+TD is consistently better at this task compared to MC.
+
+The left panel shows learned values after a number of TD(0) episodes have completed. Only the rightmost transition ever returns a reward, and TD has to propagate that information leftward one state per episode-visit, which is also the mechanism that makes it efficient.
+
+# Optimality of TD
+
+Suppose we have only a *finite* batch of experience. We would still like to learn which actions yield more rewards. In such a case, we can present the batch of experiences repeatedly to our learner until the learner converges. It turns out that both TD(0) and constant-$\alpha$ MC converge, just not to the same answer. Below we walk through the book's example on why this is the case and subsequently we produce the example showing the learning curves on the random walk environment.
+
+## You Are The Predictor Example
+
+The following example depicts an undiscounted, two-state environment, in which we have 8 episodes. The question is to compute $v(A)$ and $v(B)$ from the experiences at hand.
+
+:::{.callout-tip}
+Drag nodes around, or scroll to zoom.
+:::
+
+```{python}
+#| classes: light-mode
+g = nx.MultiDiGraph()
+
+for name, x in [("A", -220), ("B", 0)]:
+    g.add_node(
+        name,
+        label=name,
+        shape="circle",
+        size=55,
+        color=colors[0],
+        border_color="#0b0b0b",
+        border_size=3,
+        label_size=18,
+        x=x, y=0,
+    )
+
+g.add_node(
+    "terminal",
+    label="terminal",
+    shape="rectangle",
+    size=24,
+    color=colors[2],
+    border_color="#0b0b0b",
+    border_size=2,
+    label_size=14,
+    x=240, y=0,
+)
+
+transitions = [
+    ("A", "B", "1/1, r = 0"),
+    ("B", "terminal", "6/8, r = +1"),
+    ("B", "terminal", "2/8, r = 0"),
+]
+for s, s_next, lbl in transitions:
+    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+
+gv.d3(
+    g,
+    graph_height=320,
+    layout_algorithm_active=False,
+    node_label_data_source="label",
+    show_edge_label=True,
+    edge_label_data_source="label",
+    edge_label_size_factor=1.8,
+    edge_curvature=0.5,
+    zoom_factor=1.0,
+)
+```
+
+```{python}
+#| classes: dark-mode
+g = nx.MultiDiGraph()
+
+for name, x in [("A", -220), ("B", 0)]:
+    g.add_node(
+        name,
+        label=name,
+        label_color="#faf8f8",
+        shape="circle",
+        size=55,
+        color=colors[0],
+        border_color="#faf8f8",
+        border_size=3,
+        label_size=18,
+        x=x, y=0,
+    )
+
+g.add_node(
+    "terminal",
+    label="terminal",
+    label_color="#faf8f8",
+    shape="rectangle",
+    size=24,
+    color=colors[2],
+    border_color="#faf8f8",
+    border_size=2,
+    label_size=14,
+    x=240, y=0,
+)
+
+transitions = [
+    ("A", "B", "1/1, r = 0"),
+    ("B", "terminal", "6/8, r = +1"),
+    ("B", "terminal", "2/8, r = 0"),
+]
+for s, s_next, lbl in transitions:
+    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+
+g.graph['background_color'] = 'black'
+
+gv.d3(
+    g,
+    graph_height=320,
+    layout_algorithm_active=False,
+    node_label_data_source="label",
+    show_edge_label=True,
+    edge_label_data_source="label",
+    edge_label_size_factor=1.8,
+    edge_curvature=0.5,
+    zoom_factor=1.0,
+)
+```
+
+We know that $V(B) = \frac{3}{4}$ for both learners since six of the eight visits to B returned 1. But what is $V(A)$?
+
+- **Batch Monte Carlo** answers $0$. The only return ever observed from A was 0, and 0 is the value that minimizes the squared error *on the training set*.
+
+- **Batch TD(0)** answers $\frac{3}{4}$. A went to B 100% of the time with reward 0, so if we believe the process is Markov, $v(A) = 0 + v(B) = \frac{3}{4}$.
+
+TD's answer is the one that generalizes because it converges to the **certainty-equivalence estimate**. Which is derived by building the maximum-likelihood MDP from the counts (observed transition frequencies and observed mean reward) and solving it exactly. Whereas, batch MC converges to the sample average of returns.
+
+Below we compute the batch fixed points *both* ways by running the book's sweeps, and by DP on the estimated model.
+
+
+```{python}
+def make_batch_td(env, n_iters=500):
+    """The batch-TD(0) fixed point, computed as policy evaluation on the maximum-likelihood
+    model estimated from the batch.  Transitions arrive flat, (n_transitions, n_runs),
+    weighted by weights."""
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    S = pt.lmatrix("S")
+    R = pt.dmatrix("R")
+    S_next = pt.lmatrix("Sp")
+    weights = pt.dmatrix("W")
+    gamma = pt.scalar("g")
+
+    n_transitions, n_runs = S.shape[0], S.shape[1]
+    run_of = pt.broadcast_to(pt.arange(n_runs), (n_transitions, n_runs)).ravel()
+
+    s_flat, s_next_flat = S.ravel(), S_next.ravel()
+    r_flat, w_flat = R.ravel(), weights.ravel()
+
+    visits = pt.inc_subtensor(pt.zeros((n_runs, env.n_states))[run_of, s_flat], w_flat)
+    reward_hat = pt.inc_subtensor(pt.zeros((n_runs, env.n_states))[run_of, s_flat], w_flat * r_flat)
+    P_hat = pt.inc_subtensor(pt.zeros((n_runs, env.n_states, env.n_states))[run_of, s_flat, s_next_flat], w_flat)
+
+    safe_visits = pt.switch(pt.gt(visits, 0), visits, 1.0)
+    reward_hat = reward_hat / safe_visits # the max-likelihood model
+    P_hat = P_hat / safe_visits[:, :, None]
+
+    def evaluation_sweep(V, P_hat, reward_hat, gamma):
+        return not_terminal[None, :] * (reward_hat + gamma * (P_hat * V[:, None, :]).sum(axis=2))
+
+    # evaluated by DP
+    V_iters = pytensor.scan(
+        fn=evaluation_sweep,
+        outputs_info=pt.zeros((n_runs, env.n_states)),
+        non_sequences=[P_hat, reward_hat, gamma],
+        n_steps=n_iters,
+        return_updates=False
+    )
+
+    return pytensor.function([S, R, S_next, weights, gamma], [V_iters[-1], visits, P_hat, reward_hat])
+
+def make_batch_mc(env):
+    "The batch-MC fixed point: the average observed return per state."
+    S = pt.lmatrix("S")
+    G = pt.dmatrix("G")
+    weights = pt.dmatrix("W")
+
+    n_transitions, n_runs = S.shape[0], S.shape[1]
+    run_of = pt.broadcast_to(pt.arange(n_runs), (n_transitions, n_runs)).ravel()
+
+    s_flat, g_flat, w_flat = S.ravel(), G.ravel(), weights.ravel()
+
+    visits = pt.inc_subtensor(pt.zeros((n_runs, env.n_states))[run_of, s_flat], w_flat)
+    return_total = pt.inc_subtensor(pt.zeros((n_runs, env.n_states))[run_of, s_flat], w_flat * g_flat)
+
+    V_mc = return_total / pt.switch(pt.gt(visits, 0), visits, 1.0)
+
+    return pytensor.function([S, G, weights], V_mc)
+```
+
+
+```{python}
+def make_batch_sweeps(env, kind):
+    """increments summed over the whole batch with V
+    held fixed, applied once per sweep, repeated until nothing moves."""
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    S = pt.lmatrix("S")
+    targets = pt.dmatrix("X")
+    S_next = pt.lmatrix("Sp")
+    weights = pt.dmatrix("W")
+    V_init = pt.dmatrix("V0")
+    alpha = pt.scalar("alpha")
+    gamma = pt.scalar("g")
+    n_sweeps = pt.iscalar("K")
+
+    n_transitions, n_runs = S.shape[0], S.shape[1]
+    run_of = (pt.arange(n_runs)[None, :] * pt.ones((n_transitions, 1), dtype="int64")).ravel()
+    s_flat, s_next_flat = S.ravel(), S_next.ravel()
+    x_flat, w_flat = targets.ravel(), weights.ravel()
+
+    def sweep(V, alpha, gamma):
+        target = (x_flat + gamma * not_terminal[s_next_flat] * V[run_of, s_next_flat] if kind == "td0" else x_flat)
+
+        increment = pt.inc_subtensor(pt.zeros_like(V)[run_of, s_flat],
+                                     w_flat * (target - V[run_of, s_flat]))
+        return V + alpha * increment
+
+    V_sweeps = pytensor.scan(
+        fn=sweep,
+        outputs_info=V_init,
+        non_sequences=[alpha, gamma],
+        n_steps=n_sweeps,
+        return_updates=False
+    )
+
+    return pytensor.function([S, targets, S_next, weights, V_init, alpha, gamma, n_sweeps],
+                             V_sweeps, on_unused_input="ignore")
+```
+
+
+```{python}
+ab_env = make_env(
+    name = "ab",
+    n_states = 3,
+    n_actions = 1,
+    step_fn = lambda s, a: (s + 1, 0.0, 0.0),  # A -> B -> terminal
+    terminals = [2],
+    starts = [0]
+)
+
+# A->B(r=0)  B->T(r=1) x6  B->T(r=0) x2
+S_ab = np.array([[0],   [1], [1], [1], [1], [1], [1],   [1], [1]], dtype="int64")
+S_next_ab = np.array([[1],   [2], [2], [2], [2], [2], [2],   [2], [2]], dtype="int64")
+R_ab = np.array([[0.],  [1.], [1.], [1.], [1.], [1.], [1.], [0.], [0.]])
+G_ab = R_ab.copy() # gamma = 1: the A episode returned 0 + 0 = 0
+G_ab[0] = 0.0
+weights_ab = np.ones_like(R_ab)
+
+V_td_ab, visits_ab, P_ab, reward_ab = make_batch_td(ab_env)(S_ab, R_ab, S_next_ab, weights_ab, 1.0)
+V_mc_ab = make_batch_mc(ab_env)(S_ab, G_ab, weights_ab)
+
+print(f"maximum-likelihood model:  p(B | A) = {P_ab[0, 0, 1]:.2f}, "
+      f"r_hat(A) = {reward_ab[0, 0]:.2f}, r_hat(B) = {reward_ab[0, 1]:.2f}")
+print(f"batch MC   : V(A) = {V_mc_ab[0, 0]:.3f}   V(B) = {V_mc_ab[0, 1]:.3f}")
+print(f"batch TD(0): V(A) = {V_td_ab[0, 0]:.3f}   V(B) = {V_td_ab[0, 1]:.3f}")
+```
+
+## Batch Random Walk
+
+Next we replicate the batch experiment on the random walk environment.
+
+We collect $n$ episodes and run each batch method to convergence. We then measure the RMSE against $v_\pi(i) = i/6$, averaged over 100 independent batches. We also check that the literal sweep algorithm walks to exactly the same place.
+
+
+```{python}
+batch_td_walk = make_batch_td(walk5)
+batch_mc_walk = make_batch_mc(walk5)
+sweep_td_walk = make_batch_sweeps(walk5, "td0")
+sweep_mc_walk = make_batch_sweeps(walk5, "mc")
+
+N_RUNS_BATCH = 100
+N_EPISODES_BATCH = 100
+MAX_STEPS_BATCH = 80
+ALPHA = 0.002
+GAMMA = 1.0
+NSTEPS = 4000
+
+S_batch, A_batch, R_batch, S_next_batch, G_batch, frac_finished_batch = episodes_for(rollout_walk, walk5, pi_walk, N_EPISODES_BATCH, N_RUNS_BATCH, MAX_STEPS_BATCH)
+
+flatten = lambda X: X.reshape(N_EPISODES_BATCH * MAX_STEPS_BATCH, N_RUNS_BATCH)
+S_flat, R_flat = flatten(S_batch), flatten(R_batch)
+S_next_flat, G_flat = flatten(S_next_batch), flatten(G_batch)
+is_real_step = (~walk5.terminal)[S_flat].astype(float) # padded steps carry no weight
+episode_of_row = np.repeat(np.arange(N_EPISODES_BATCH), MAX_STEPS_BATCH)[:, None]
+
+weights_first_10 = is_real_step * (episode_of_row < 10) # the first ten episodes
+V_init_batch = np.zeros((N_RUNS_BATCH, walk5.n_states))
+V_fixed_point, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights_first_10, 1.0)
+V_swept_td = sweep_td_walk(S_flat, R_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA, GAMMA, NSTEPS)
+
+print("batch TD: max |sweeps - DP on the estimated model| =",
+      f"{np.abs(V_swept_td[-1] - V_fixed_point)[:, inner_states].max():.2e}")
+
+V_swept_mc = sweep_mc_walk(S_flat, G_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA, GAMMA, NSTEPS)
+
+print("batch MC: max |sweeps - mean observed return| =",
+      f"{np.abs(V_swept_mc[-1] - batch_mc_walk(S_flat, G_flat, weights_first_10))[:, inner_states].max():.2e}")
+```
+
+
+```{python}
+#| classes: light-mode
+batch_sizes = [1, 2, 3, 4, 5, 7, 10, 15, 20, 30, 40, 50, 70, 100]
+rmse_batch_td, rmse_batch_mc = [], []
+
+for n_episodes in batch_sizes:
+    weights = is_real_step * (episode_of_row < n_episodes)
+    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, 1.0)
+    V_mc_batch = batch_mc_walk(S_flat, G_flat, weights)
+
+    rmse = lambda V: np.sqrt(((V[:, inner_states] - v_walk_true[inner_states]) ** 2).mean(axis=1)).mean()
+    rmse_batch_td.append(rmse(V_td_batch))
+    rmse_batch_mc.append(rmse(V_mc_batch))
+
+batch_fig = go.Figure()
+batch_fig.add_scatter(
+    x=batch_sizes,
+    y=rmse_batch_td,
+    mode="lines+markers",
+    name="batch TD(0)",
+    line=dict(color=colors[0], width=2),
+    marker=dict(size=7, line=dict(color="white", width=1))
+)
+
+batch_fig.add_scatter(
+    x=batch_sizes,
+    y=rmse_batch_mc,
+    mode="lines+markers",
+    name="batch MC",
+    line=dict(color=colors[2], width=2),
+    marker=dict(size=7, line=dict(color="white", width=1))
+)
+
+batch_fig.update_layout(
+    title="<b>Batch updating on the random walk</b><br>"
+              "<sup>both run to convergence on the same batches; 100 batches per point</sup>",
+    xaxis=dict(title="episodes in the batch (log scale)", type="log"),
+    yaxis=dict(title=r"$\text{RMSE against }v_\pi$"),
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100),
+)
+
+batch_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+batch_sizes = [1, 2, 3, 4, 5, 7, 10, 15, 20, 30, 40, 50, 70, 100]
+rmse_batch_td, rmse_batch_mc = [], []
+
+for n_episodes in batch_sizes:
+    weights = is_real_step * (episode_of_row < n_episodes)
+    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, 1.0)
+    V_mc_batch = batch_mc_walk(S_flat, G_flat, weights)
+
+    rmse = lambda V: np.sqrt(((V[:, inner_states] - v_walk_true[inner_states]) ** 2).mean(axis=1)).mean()
+    rmse_batch_td.append(rmse(V_td_batch))
+    rmse_batch_mc.append(rmse(V_mc_batch))
+
+batch_fig = go.Figure()
+batch_fig.add_scatter(
+    x=batch_sizes,
+    y=rmse_batch_td,
+    mode="lines+markers",
+    name="batch TD(0)",
+    line=dict(color=colors[0], width=2),
+    marker=dict(size=7, line=dict(color="white", width=1))
+)
+
+batch_fig.add_scatter(
+    x=batch_sizes,
+    y=rmse_batch_mc,
+    mode="lines+markers",
+    name="batch MC",
+    line=dict(color=colors[2], width=2),
+    marker=dict(size=7, line=dict(color="white", width=1))
+)
+
+batch_fig.update_layout(
+    title="<b>Batch updating on the random walk</b><br>"
+              "<sup>both run to convergence on the same batches; 100 batches per point</sup>",
+    xaxis=dict(title="episodes in the batch (log scale)", type="log"),
+    yaxis=dict(title=r"$\text{RMSE against }v_\pi$"),
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100),
+)
+
+batch_fig.show(config=dict(displayModeBar=False))
+```
+
+Batch TD has a lower error compared to batch MC. Even though batch MC is *optimal on the training set*. The reason is because minimizing in-sample error is the wrong objective if what you want is the value function of the underlying Markov process. Batch MC throws away the transition structure. Whereas batch TD is exactly DP applied to the best model of that structure you can
+build from the data, which is why it extrapolates to states whose returns you never observed.
+
+However if the process is *not* Markov in the states, the certainty-equivalence estimate is fitting the wrong model, and TD's advantage can disappear.
+
+# Sarsa: on-policy TD control
+
+For control we move from learning state values to learning state-action pairs. SARSA is an on-policy algorithm because it estimates $q_\pi$ of the current behavior policy $\pi$ for all states and actions. The algorithms name comes from the fact that the update uses all the elements that define a transition from one state-action pair to another; $(S_t, A_t, R_{t+1}, S_{t+1}, A_{t+1})$.
+
+$$
+Q(S_t,A_t) \;\leftarrow\; Q(S_t,A_t) + \alpha\left[R_{t+1} + \gamma\,Q(S_{t+1},A_{t+1}) - Q(S_t,A_t)\right]
+$$
+
+When $S_{t+1}$ is terminal, we set $Q(S_{t+1},A_{t+1}) = 0$.
+
+The policy is $\varepsilon$-greedy in $Q$, and evaluation and improvement are interleaved at every step instead of every episode. Since Sarsa is **on-policy**, it converges to $q_\pi$ for the $\varepsilon$-greedy policy it is following, not to $q_*$.
+
+## Scan Implementation for Control Algorithms
+
+Sarsa, Q-learning and Expected Sarsa differ *only* in how they compute the bootstrap term, so we build them from one factory function. The structure is a nested `scan`, and this time the environment lives *inside* the loop because the behaviour depends on $Q$, meaning it cannot be pre-generated:
+
+- **inner scan** one step of the agent's life: draw $S_{t+1}$ and $R_{t+1}$, form the target, update $Q$ with a batched `inc_subtensor`, pick the next action.
+
+- **outer scan** one episode: run `T` inner steps, then draw a fresh start state and first action.
+
+Important implementation details:
+
+A `live` flag (1 until the episode terminates, 0 after) multiplies $\alpha$, so the fixed-length inner scan can pad past the end of a short episode without corrupting anything.
+`eps_probs` builds the $\varepsilon$-greedy distribution explicitly rather than sampling a coin flip, because Expected Sarsa needs those probabilities. Illegal actions get $-\infty$ before the `argmax` and zero probability after it.
+
+`alpha` and `eps` are *vectors* over the run dimension, which is how the step-size sweeps with just one batched call.
+
+
+```{python}
+def make_control(env, kind, seed):
+    """One-step tabular TD control.  kind = 'sarsa' | 'q' | 'expected_sarsa'.
+    Returns f(Q_init, alpha, eps, gamma, n_episodes, max_steps) -> Q, reward sums, step
+    counts, done flags, first action of each episode.  Q_init is (n_runs, n_states,
+    n_actions); alpha and eps are (n_runs,)."""
+    P = pt.as_tensor_variable(env.P)
+    reward_mean = pt.as_tensor_variable(env.reward_mean)
+    reward_sd = pt.as_tensor_variable(env.reward_sd)
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
+    start_dist = pt.as_tensor_variable(env.start)
+    rng_shared = pt.random.shared_rng(seed=seed, name=f"rng_{kind}_{env.name}")
+
+    Q_init = pt.dtensor3("Q0")
+    alpha = pt.dvector("alpha")
+    eps = pt.dvector("eps")
+    gamma = pt.scalar("gamma")
+    n_episodes = pt.iscalar("n_ep")
+    max_steps = pt.iscalar("T")
+
+    def eps_greedy_probs(Q, s, eps):
+        "eps-greedy distribution over the legal actions of s, per run -> (n_runs, n_actions)"
+        runs = pt.arange(Q.shape[0])
+        legal = legal_actions[s]
+        greedy = pt.argmax(pt.where(legal > 0, Q[runs, s], NEG_INF), axis=1)
+        probs = legal * (eps / legal.sum(axis=1))[:, None]
+        return pt.inc_subtensor(probs[runs, greedy], 1.0 - eps)
+
+    def pick(rng, Q, s, eps):
+        return rng.categorical(p=eps_greedy_probs(Q, s, eps))
+
+    def step(rng, s, a, Q, alpha, eps, gamma, still_running):
+        "the shared half: take the step, then form the method's target"
+        runs = pt.arange(Q.shape[0])
+        rng, s_next = rng.categorical(p=P[s, a])
+        rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a])
+
+        if kind == "sarsa":
+            rng, a_next = pick(rng, Q, s_next, eps) # A' chosen before the update
+            bootstrap = Q[runs, s_next, a_next]
+        elif kind == "q":
+            a_next = None
+            bootstrap = pt.where(legal_actions[s_next] > 0, Q[runs, s_next], NEG_INF).max(axis=1)
+        else: # expected_sarsa
+            a_next = None
+            bootstrap = (eps_greedy_probs(Q, s_next, eps) * Q[runs, s_next]).sum(axis=1)
+
+        delta = r + gamma * not_terminal[s_next] * bootstrap - Q[runs, s, a]
+        Q_new = pt.inc_subtensor(Q[runs, s, a], alpha * still_running * delta)
+
+        if a_next is None: # off-policy / expected target:
+            rng, a_next = pick(rng, Q_new, s_next, eps) # next action from the new Q
+
+        return rng, s_next, a_next, r, Q_new
+
+    def inner(rng, s, a, still_running, Q, reward_sum, step_count, alpha, eps, gamma):
+        rng, s_next, a_next, r, Q_new = step(rng, s, a, Q, alpha, eps, gamma, still_running)
+        return (rng, s_next, a_next, still_running * not_terminal[s_next], Q_new,
+                reward_sum + still_running * r, step_count + still_running)
+
+    def episode(rng, s, a, Q, alpha, eps, gamma, max_steps):
+        zero = pt.zeros_like(not_terminal[s])
+
+        rng_final, S_seq, A_seq, running_seq, Q_seq, reward_sum, step_count = pytensor.scan(
+            fn=inner,
+            outputs_info=[rng, s, a, zero + 1.0, Q, zero, zero],
+            non_sequences=[alpha, eps, gamma],
+            n_steps=max_steps,
+            return_updates=False
+        )
+
+        Q_new = Q_seq[-1]
+        rng, s_new = rng_final.categorical(p=pt.ones((Q.shape[0], 1)) * start_dist[None, :])
+        rng, a_new = pick(rng, Q_new, s_new, eps)
+        return rng, s_new, a_new, Q_new, reward_sum[-1], step_count[-1], 1.0 - running_seq[-1]
+
+    rng_a, s_first = rng_shared.categorical(p=pt.ones((Q_init.shape[0], 1)) * start_dist[None, :])
+    rng_b, a_first = pick(rng_a, Q_init, s_first, eps)
+
+    rng_final, S_out, A_out, Q_out, reward_sum, step_count, done = pytensor.scan(
+        fn=episode,
+        outputs_info=[rng_b, s_first, a_first, Q_init, None, None, None],
+        non_sequences=[alpha, eps, gamma, max_steps],
+        n_steps=n_episodes,
+        return_updates=False
+    )
+
+    first_action = pt.concatenate([a_first[None, :], A_out[:-1]], axis=0)
+
+    return pytensor.function([Q_init, alpha, eps, gamma, n_episodes, max_steps],
+                             [Q_out[-1], reward_sum, step_count, done, first_action],
+                             updates={rng_shared: rng_final})
+```
+
+
+```{python}
+def eps_greedy_pi(Q, eps, env):
+    "the eps-greedy policy of a Q table, as an (n_states, n_actions) matrix for the DP oracle"
+    legal = env.legal_actions > 0
+    pi = legal * (eps / legal.sum(axis=1))[:, None]
+    pi[np.arange(env.n_states), np.where(legal, Q, NEG_INF).argmax(axis=1)] += 1 - eps
+    return pi
+
+def greedy_pi(Q, env):
+    pi = np.zeros((env.n_states, env.n_actions))
+    pi[np.arange(env.n_states),
+       np.where(env.legal_actions > 0, Q, NEG_INF).argmax(axis=1)] = 1.0
+    return pi
+
+def value_gap(Q, env, gamma=1.0):
+    "how far the greedy policy of Q is from optimal, measured exactly by DP"
+    evaluate_policy, optimal_values, _ = ORACLE[env.name]
+    graded_states = env.reachable & ~env.terminal
+    return np.abs(evaluate_policy(greedy_pi(Q, env), gamma) - optimal_values(gamma))[graded_states].max()
+```
+
+
+```{python}
+EPS = 0.1
+ALPHA = 0.2
+GAMMA = 1.0
+N_RUNS_GRID = 20
+N_EPISODES_GRID = 800
+MAX_STEPS_GRID = 60
+
+sarsa_g4 = make_control(grid4, "sarsa", 101)
+Q_init_g4 = np.zeros((N_RUNS_GRID, grid4.n_states, grid4.n_actions))
+Q_sarsa, reward_sum_sarsa, step_count_sarsa, done_sarsa, _ = sarsa_g4(
+    Q_init_g4,
+    np.full(N_RUNS_GRID, ALPHA),
+    np.full(N_RUNS_GRID, EPS),
+    GAMMA,
+    N_EPISODES_GRID,
+    MAX_STEPS_GRID
+)
+
+gaps = np.array([value_gap(Q_sarsa[run], grid4) for run in range(N_RUNS_GRID)])
+
+print(f"Sarsa on grid4: {N_EPISODES_GRID} episodes x {N_RUNS_GRID} runs, "
+      f"{done_sarsa.mean():.1%} of episodes finished")
+print(f"runs whose greedy policy is exactly optimal: {(gaps < 1e-9).sum()}/{N_RUNS_GRID}")
+print(f"average return over the last 50 episodes: {reward_sum_sarsa[-50:].mean():.2f}"
+      f"   (optimal, from a random start: {v_star_g4[~grid4.terminal].mean():.2f})")
+show_policy(Q_sarsa[0].argmax(axis=1), grid4, "\ngreedy policy of run 0 (T = terminal):")
+```
+
+
+## Windy Gridworld
+
+An upward wind can push the agent up 1-2 cells, depending on the column you are leaving. Every step costs $-1$, so the task is to reach the goal quickly. The shortest route is 15 steps to the goal.
+
+MC control would struggle on this environment because with an undiscounted, purely negative reward per step and a policy that has not yet found the goal, episodes can run for thousands of steps and an MC method learns *nothing at all* until an episode ends. Whereas Sarsa improves its policy mid-episode, which is why the first episode below takes ~900 steps and the twentieth
+takes ~70.
+
+A steeper slope in the plot below signifies shorter episodes.
+
+```{python}
+sarsa_windy = make_control(windy, "sarsa", 202)
+
+N_RUNS_WINDY = 30
+N_EPISODES_WINDY = 170
+MAX_STEPS_WINDY = 1500
+GAMMA = 1.0
+
+Q_windy, reward_sum_windy, step_count_windy, done_windy, _ = sarsa_windy(
+      np.zeros((N_RUNS_WINDY, windy.n_states, windy.n_actions)),
+      np.full(N_RUNS_WINDY, 0.5),
+      np.full(N_RUNS_WINDY, 0.1),
+      GAMMA,
+      N_EPISODES_WINDY,
+      MAX_STEPS_WINDY
+)
+
+print(f"episodes completed within T={MAX_STEPS_WINDY}: {done_windy.mean():.1%}")
+print(f"steps: episode 1 -> {step_count_windy[0].mean():.0f}, "
+      f"episode 20 -> {step_count_windy[19].mean():.0f}, "
+      f"last 10 -> {step_count_windy[-10:].mean():.0f} "
+      f"(optimal 15, eps-greedy pays a little more)")
+
+v_star_windy, q_star_windy = exact(windy)
+
+print(f"total time steps for {N_EPISODES_WINDY} episodes: "
+      f"{step_count_windy.sum(axis=0).mean():.0f}")
+
+show_policy(Q_windy[0].argmax(axis=1), windy,
+            f"\ngreedy policy of run 0 (wind per column: {WIND.tolist()}) | Initial State = {np.flatnonzero(windy.start).item()}:")
+
+show_policy(q_star_windy.argmax(axis=1), windy,
+            f"\noptimal policy:")
+```
+
+
+```{python}
+#| classes: light-mode
+windy_fig = go.Figure()
+
+cumulative_steps = np.cumsum(step_count_windy, axis=0)
+
+for run in range(N_RUNS_WINDY):
+    windy_fig.add_scatter(
+        x=cumulative_steps[:, run],
+        y=np.arange(1, N_EPISODES_WINDY + 1),
+        mode="lines", line=dict(color=colors[0], width=1),
+        opacity=0.35,
+        name="single run",
+        showlegend=(run == 0)
+    )
+
+windy_fig.add_scatter(
+    x=cumulative_steps.mean(axis=1),
+    y=np.arange(1, N_EPISODES_WINDY + 1),
+    mode="lines",
+    line=dict(color=colors[2], width=3),
+    name="mean over 30 runs"
+)
+
+windy_fig.add_scatter(
+    x=[0, 15 * N_EPISODES_WINDY],
+    y=[0, N_EPISODES_WINDY],
+    mode="lines",
+    line=dict(color="grey", width=1, dash="dash"),
+    name="optimal slope (15 steps/episode)"
+)
+
+windy_fig.update_layout(
+    title="Sarsa on the windy gridworld",
+    xaxis=dict(title="time steps", range=[0, 8000]),
+    yaxis=dict(title="episodes completed"),
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100),
+)
+
+windy_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+windy_fig = go.Figure()
+
+cumulative_steps = np.cumsum(step_count_windy, axis=0)
+
+for run in range(N_RUNS_WINDY):
+    windy_fig.add_scatter(
+        x=cumulative_steps[:, run],
+        y=np.arange(1, N_EPISODES_WINDY + 1),
+        mode="lines", line=dict(color=colors[0], width=1),
+        opacity=0.35,
+        name="single run",
+        showlegend=(run == 0)
+    )
+
+windy_fig.add_scatter(
+    x=cumulative_steps.mean(axis=1),
+    y=np.arange(1, N_EPISODES_WINDY + 1),
+    mode="lines",
+    line=dict(color=colors[2], width=3),
+    name="mean over 30 runs"
+)
+
+windy_fig.add_scatter(
+    x=[0, 15 * N_EPISODES_WINDY],
+    y=[0, N_EPISODES_WINDY],
+    mode="lines",
+    line=dict(color="grey", width=1, dash="dash"),
+    name="optimal slope (15 steps/episode)"
+)
+
+windy_fig.update_layout(
+    title="Sarsa on the windy gridworld",
+    xaxis=dict(title="time steps", range=[0, 8000]),
+    yaxis=dict(title="episodes completed"),
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100),
+)
+
+windy_fig.show(config=dict(displayModeBar=False))
+```
+
+Let's take a look at what the learned policy does if we place our agent in the starting position. The arrows are the greedy action in every
+cell, the tint of a column is its wind strength, and the numbers under the grid are how many cells upwards the wind will blow the agent.
+
+```{python}
+#| classes: light-mode
+n_rows_windy, n_cols_windy = windy.shape
+WIND_FILL = {0: colors[0], 1: colors[4], 2: colors[6]}
+
+def windy_xy(s):
+    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
+    row, col = divmod(s, n_cols_windy)
+    return col, n_rows_windy - 1 - row
+
+def greedy_path(env, Q, max_steps=200):
+    "follow argmax_a Q(s, a) from the start state through the (deterministic) dynamics"
+    s = np.flatnonzero(env.start).item()
+    path = [s]
+    while not env.terminal[s] and len(path) <= max_steps:
+        s = int(env.P[s, int(Q[s].argmax())].argmax())
+        path.append(s)
+    return path
+
+a_greedy_windy = Q_windy[0].argmax(axis=1)
+path_windy = greedy_path(windy, Q_windy[0])
+xs_windy, ys_windy = map(np.array, zip(*(windy_xy(s) for s in path_windy)))
+
+start_windy = np.flatnonzero(windy.start).item()
+goal_windy = np.flatnonzero(windy.terminal).item()
+
+windy_grid_fig = go.Figure()
+pad = 0.04
+
+for s in range(windy.n_states):
+    x, y = windy_xy(s)
+    windy_grid_fig.add_shape(
+        type="rect",
+        x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
+        fillcolor=colors[-1] if s == goal_windy else WIND_FILL[WIND[x]],
+        line_width=0,
+        layer="below"
+    )
+    label = {start_windy: "S", goal_windy: "G"}.get(s, ARROWS[int(a_greedy_windy[s])])
+    windy_grid_fig.add_annotation(
+        x=x, y=y,
+        text=f"<b>{label}</b>",
+        showarrow=False,
+        font=dict(size=16, color="#4a4a4a")
+    )
+
+episode_windy_fig = go.Figure(windy_grid_fig)
+
+trail_color = colors[2]
+episode_windy_fig.add_scatter(
+    x=xs_windy[:1],
+    y=ys_windy[:1],
+    mode="lines",
+    line=dict(color=trail_color, width=3),
+    hoverinfo="skip",
+    showlegend=False
+)
+
+episode_windy_fig.add_scatter(
+    x=xs_windy[:1],
+    y=ys_windy[:1],
+    mode="markers",
+    marker=dict(
+        size=22,
+        color=trail_color,
+        line=dict(
+            color="white",
+            width=2
+        )
+    ),
+    hoverinfo="skip",
+    showlegend=False
+)
+
+episode_windy_fig.frames = [
+    go.Frame(
+        name=str(k),
+        data=[
+            go.Scatter(x=xs_windy[:k+1], y=ys_windy[:k+1]),
+            go.Scatter(x=xs_windy[k:k+1], y=ys_windy[k:k+1])
+        ],
+        traces=[0, 1]
+    )
+    for k in range(len(path_windy))
+]
+
+updatemenus = [
+    dict(
+        type="buttons",
+        x=-0.06,
+        xanchor="right",
+        y=-0.12,
+        yanchor="top",
+        buttons=[
+            dict(
+                label="&#9654; Play",
+                method="animate",
+                args=[
+                    None,
+                    dict(
+                        fromcurrent=True,
+                        frame=dict(duration=450, redraw=False),
+                        transition=dict(duration=0)
+                    )
+                ]
+            )
+        ]
+    )
+]
+
+sliders = [
+    dict(
+        currentvalue=dict(prefix="step "),
+        steps=[
+            dict(
+                label=str(k),
+                method="animate",
+                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for k in range(len(path_windy))
+        ]
+    )
+]
+
+episode_windy_fig.update_layout(
+    title=f"<b>Greedy episode on the windy gridworld</b>: start {start_windy} "
+          f"-> goal {goal_windy} in {len(path_windy)-1} moves (optimal 15)",
+    xaxis=dict(
+        title="wind strength per column",
+        range=[-0.55, n_cols_windy - 0.45],
+        tickmode="array",
+        tickvals=np.arange(n_cols_windy),
+        ticktext=[str(w) for w in WIND],
+        showgrid=False,
+        zeroline=False
+    ),
+    yaxis=dict(
+        range=[-0.55, n_rows_windy - 0.45],
+        showticklabels=False,
+        showgrid=False,
+        zeroline=False,
+        scaleanchor="x"
+    ),
+    template="plotly_white",
+    updatemenus=updatemenus,
+    sliders=sliders,
+    margin=dict(l=10, r=10, t=40, b=30),
+    height=800,
+)
+
+episode_windy_fig.show(config=dict(displayModeBar=False))
+```
+
+
+```{python}
+#| classes: dark-mode
+n_rows_windy, n_cols_windy = windy.shape
+WIND_FILL = {0: colors[0], 1: colors[4], 2: colors[6]}
+
+def windy_xy(s):
+    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
+    row, col = divmod(s, n_cols_windy)
+    return col, n_rows_windy - 1 - row
+
+def greedy_path(env, Q, max_steps=200):
+    "follow argmax_a Q(s, a) from the start state through the (deterministic) dynamics"
+    s = np.flatnonzero(env.start).item()
+    path = [s]
+    while not env.terminal[s] and len(path) <= max_steps:
+        s = int(env.P[s, int(Q[s].argmax())].argmax())
+        path.append(s)
+    return path
+
+a_greedy_windy = Q_windy[0].argmax(axis=1)
+path_windy = greedy_path(windy, Q_windy[0])
+xs_windy, ys_windy = map(np.array, zip(*(windy_xy(s) for s in path_windy)))
+
+start_windy = np.flatnonzero(windy.start).item()
+goal_windy = np.flatnonzero(windy.terminal).item()
+
+windy_grid_fig = go.Figure()
+pad = 0.04
+
+for s in range(windy.n_states):
+    x, y = windy_xy(s)
+    windy_grid_fig.add_shape(
+        type="rect",
+        x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
+        fillcolor=colors[-1] if s == goal_windy else WIND_FILL[WIND[x]],
+        line_width=0,
+        layer="below"
+    )
+    label = {start_windy: "S", goal_windy: "G"}.get(s, ARROWS[int(a_greedy_windy[s])])
+    windy_grid_fig.add_annotation(
+        x=x, y=y,
+        text=f"<b>{label}</b>",
+        showarrow=False,
+        font=dict(size=16, color="#4a4a4a")
+    )
+
+episode_windy_fig = go.Figure(windy_grid_fig)
+
+trail_color = colors[2]
+episode_windy_fig.add_scatter(
+    x=xs_windy[:1],
+    y=ys_windy[:1],
+    mode="lines",
+    line=dict(color=trail_color, width=3),
+    hoverinfo="skip",
+    showlegend=False
+)
+
+episode_windy_fig.add_scatter(
+    x=xs_windy[:1],
+    y=ys_windy[:1],
+    mode="markers",
+    marker=dict(
+        size=22,
+        color=trail_color,
+        line=dict(
+            color="white",
+            width=2
+        )
+    ),
+    hoverinfo="skip",
+    showlegend=False
+)
+
+episode_windy_fig.frames = [
+    go.Frame(
+        name=str(k),
+        data=[
+            go.Scatter(x=xs_windy[:k+1], y=ys_windy[:k+1]),
+            go.Scatter(x=xs_windy[k:k+1], y=ys_windy[k:k+1])
+        ],
+        traces=[0, 1]
+    )
+    for k in range(len(path_windy))
+]
+
+updatemenus = [
+    dict(
+        type="buttons",
+        x=-0.06,
+        xanchor="right",
+        y=-0.12,
+        yanchor="top",
+        font_color = "black",
+        buttons=[
+            dict(
+                label="&#9654; Play",
+                method="animate",
+                args=[
+                    None,
+                    dict(
+                        fromcurrent=True,
+                        frame=dict(duration=450, redraw=False),
+                        transition=dict(duration=0)
+                    )
+                ]
+            )
+        ]
+    )
+]
+
+sliders = [
+    dict(
+        bgcolor="#3498db",
+        bordercolor="#fffcfc",
+        currentvalue=dict(prefix="step "),
+        steps=[
+            dict(
+                label=str(k),
+                method="animate",
+                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for k in range(len(path_windy))
+        ]
+    )
+]
+
+episode_windy_fig.update_layout(
+    title=f"<b>Greedy episode on the windy gridworld</b>: start {start_windy} "
+          f"-> goal {goal_windy} in {len(path_windy)-1} moves (optimal 15)",
+    xaxis=dict(
+        title="wind strength per column",
+        range=[-0.55, n_cols_windy - 0.45],
+        tickmode="array",
+        tickvals=np.arange(n_cols_windy),
+        ticktext=[str(w) for w in WIND],
+        showgrid=False,
+        zeroline=False
+    ),
+    yaxis=dict(
+        range=[-0.55, n_rows_windy - 0.45],
+        showticklabels=False,
+        showgrid=False,
+        zeroline=False,
+        scaleanchor="x"
+    ),
+    template="plotly_dark",
+    updatemenus=updatemenus,
+    sliders=sliders,
+    margin=dict(l=10, r=10, t=40, b=30),
+    height=800,
+)
+
+episode_windy_fig.show(config=dict(displayModeBar=False))
+```
+
+# Q-learning: off-policy TD control
+
+In the previous chapter we looked at off-policy control were we had two policies:
+
+- A **behavior policy**: The policy that generates our experiences
+
+- A **target policy**: The policy whose values we want to estimate
+
+Q-learning does something very clever. It's bootstrapping target is independent of the distribution of the behavior policy, which means we no longer need to leverage *importance sampling* to correct for distributions from the wrong policy. You may have already noticed that the target is the Bellman optimality target, which refers to the greedy policy regardless of which action the behavior policy takes.
+
+::: {.callout-important}
+
+The behavior policy still influences the learning because we still require coverage between the behavior and target policy.
+
+:::
+
+$$
+Q(S_t,A_t) \;\leftarrow\; Q(S_t,A_t) + \alpha\left[R_{t+1} + \gamma\,\max_a Q(S_{t+1},a) - Q(S_t,A_t)\right]
+$$
+
+
+## Cliff Walking
+
+The point of the cliff is that the *optimal* path and the *safe* path differ. The shortest route runs along the very edge of the cliff. Notice though, that with $\varepsilon=0.1$ that route also means a one-in-ten chance per step of being blown into the cliff for $-100$ reward.
+
+- **Q-learning** learns the values of the optimal path and falls into the cliff regularly. Its *online* return is the worst of the three learners even though its $Q$ is the most correct.
+
+- **Sarsa** learns the values of its own *$\varepsilon$-greedy behaviour*, which include the cliff risk, so it backs off to a safer route and earns more per episode.
+
+That is the on-policy/off-policy distinction paying a visible dividend, in both directions.
+
+
+```{python}
+N_RUNS_CLIFF = 200
+N_EPISODES_CLIFF = 500
+MAX_STEPS_CLIFF = 200
+cliff_results = {}
+
+for kind in ["sarsa", "q", "expected_sarsa"]:
+    learner = make_control(cliff, kind, 303)
+    cliff_results[kind] = learner(
+        np.zeros((N_RUNS_CLIFF, cliff.n_states, cliff.n_actions)),
+        np.full(N_RUNS_CLIFF, 0.5),
+        np.full(N_RUNS_CLIFF, 0.1),
+        GAMMA,
+        N_EPISODES_CLIFF,
+        MAX_STEPS_CLIFF
+    )
+    Q_cliff, reward_sum_cliff, step_count_cliff, done_cliff, _ = cliff_results[kind]
+    print(f"{kind} episodes finished within T={MAX_STEPS_CLIFF}: {done_cliff.mean():.1%} "
+          f"mean return over the last 100 episodes: {reward_sum_cliff[-100:].mean():.2f}")
+
+v_star_cliff, q_star_cliff = exact(cliff)
+cliff_start = np.argmax(cliff.start)
+print(f"\noptimal path: {-v_star_cliff[cliff_start]:.0f} steps "
+      f"(v_* = {v_star_cliff[cliff_start]:.0f}), "
+      f"reachable states: {cliff.reachable.sum()}/{cliff.n_states}")
+```
+
+
+```{python}
+#| classes: light-mode
+n_rows_cliff = cliff.shape[0]
+n_cols_cliff = cliff.shape[1]
+cliff_goal = np.argmax(cliff.terminal)
+cliff_cells = {3 * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
+
+CLIFF_FILL = {"safe": "#f0f0f0", "cliff": colors[2], "goal": colors[8]}
+methods = ["sarsa", "q"]
+method_labels = {"sarsa": "Sarsa (on-policy)", "q": "Q-learning (off-policy)"}
+method_colors = {"sarsa": colors[0], "q": colors[9]}
+
+def cliff_xy(s):
+    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
+    row, col = divmod(s, n_cols_cliff)
+    return col, n_rows_cliff - 1 - row
+
+paths_cliff = {kind: greedy_path(cliff, cliff_results[kind][0].mean(axis=0)) for kind in methods}
+xy_cliff = {kind: tuple(map(np.array, zip(*(cliff_xy(s) for s in path))))
+            for kind, path in paths_cliff.items()}
+n_frames_cliff = max(len(path) for path in paths_cliff.values())
+
+episode_cliff_fig = make_subplots(
+    rows=2,
+    cols=1,
+    vertical_spacing=0.10,
+    subplot_titles=[f"<b>{method_labels[kind]}</b>: {len(paths_cliff[kind]) - 1} moves, "
+                    f"return {-(len(paths_cliff[kind]) - 1)}" for kind in methods]
+)
+
+pad = 0.04
+
+for row, kind in enumerate(methods, start=1):
+    a_greedy = cliff_results[kind][0].mean(axis=0).argmax(axis=1)
+
+    for s in range(cliff.n_states):
+        x, y = cliff_xy(s)
+        cell_kind = "cliff" if s in cliff_cells else "goal" if s == cliff_goal else "safe"
+        episode_cliff_fig.add_shape(
+            type="rect",
+            x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
+            fillcolor=CLIFF_FILL[cell_kind],
+            line_width=0,
+            layer="below",
+            row=row, col=1
+        )
+        label = {cliff_start: "S", cliff_goal: "G"}.get(
+            s, "C" if s in cliff_cells else ARROWS[int(a_greedy[s])])
+        episode_cliff_fig.add_annotation(
+            x=x, y=y,
+            text=f"<b>{label}</b>",
+            showarrow=False,
+            font=dict(size=15, color="#4a4a4a"),
+            row=row, col=1
+        )
+
+    xs, ys = xy_cliff[kind]
+    episode_cliff_fig.add_scatter(
+        x=xs[:1],
+        y=ys[:1],
+        mode="lines",
+        line=dict(color=method_colors[kind], width=3),
+        hoverinfo="skip",
+        showlegend=False,
+        row=row, col=1
+    )
+    episode_cliff_fig.add_scatter(
+        x=xs[:1],
+        y=ys[:1],
+        mode="markers",
+        marker=dict(
+            size=20,
+            color=method_colors[kind],
+            line=dict(
+                color="white",
+                width=2
+            )
+        ),
+        hoverinfo="skip",
+        showlegend=False,
+        row=row, col=1
+    )
+
+def frame_data(k):
+    "both agents step together; whoever reaches the goal first waits there"
+    data = []
+    for kind in methods:
+        xs, ys = xy_cliff[kind]
+        j = min(k, len(xs) - 1)
+        data += [go.Scatter(x=xs[:j+1], y=ys[:j+1]), go.Scatter(x=xs[j:j+1], y=ys[j:j+1])]
+    return data
+
+episode_cliff_fig.frames = [
+    go.Frame(name=str(k), data=frame_data(k), traces=[0, 1, 2, 3])
+    for k in range(n_frames_cliff)
+]
+
+updatemenus = [
+    dict(
+        type="buttons",
+        x=-0.06,
+        xanchor="right",
+        y=-0.08,
+        yanchor="top",
+        buttons=[
+            dict(
+                label="&#9654; Play",
+                method="animate",
+                args=[
+                    None,
+                    dict(
+                        fromcurrent=True,
+                        frame=dict(duration=450, redraw=False),
+                        transition=dict(duration=0)
+                    )
+                ]
+            )
+        ]
+    )
+]
+
+sliders = [
+    dict(
+        currentvalue=dict(prefix="step "),
+        steps=[
+            dict(
+                label=str(k),
+                method="animate",
+                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for k in range(n_frames_cliff)
+        ]
+    )
+]
+
+episode_cliff_fig.update_xaxes(
+    range=[-0.55, n_cols_cliff - 0.45],
+    showgrid=False,
+    zeroline=False,
+    showticklabels=False
+)
+
+for row, x_axis in enumerate(["x", "x2"], start=1):
+    episode_cliff_fig.update_yaxes(
+        range=[-0.55, n_rows_cliff - 0.45],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        scaleanchor=x_axis,
+        row=row, col=1
+    )
+
+episode_cliff_fig.update_layout(
+    title="<b>Greedy episodes on the cliff</b>"
+          "<br><sup>S = start, G = goal, C = cliff (reward -100, and back to S); "
+          "arrows are each method's greedy action</sup>",
+    template="plotly_white",
+    updatemenus=updatemenus,
+    sliders=sliders,
+    height=820,
+    margin=dict(l=10, r=10, t=100, b=30),
+)
+
+episode_cliff_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+n_rows_cliff = cliff.shape[0]
+n_cols_cliff = cliff.shape[1]
+cliff_goal = np.argmax(cliff.terminal)
+cliff_cells = {3 * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
+
+CLIFF_FILL = {"safe": "#f0f0f0", "cliff": colors[2], "goal": colors[8]}
+methods = ["sarsa", "q"]
+method_labels = {"sarsa": "Sarsa (on-policy)", "q": "Q-learning (off-policy)"}
+method_colors = {"sarsa": colors[0], "q": colors[9]}
+
+def cliff_xy(s):
+    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
+    row, col = divmod(s, n_cols_cliff)
+    return col, n_rows_cliff - 1 - row
+
+paths_cliff = {kind: greedy_path(cliff, cliff_results[kind][0].mean(axis=0)) for kind in methods}
+xy_cliff = {kind: tuple(map(np.array, zip(*(cliff_xy(s) for s in path))))
+            for kind, path in paths_cliff.items()}
+n_frames_cliff = max(len(path) for path in paths_cliff.values())
+
+episode_cliff_fig = make_subplots(
+    rows=2,
+    cols=1,
+    vertical_spacing=0.10,
+    subplot_titles=[f"<b>{method_labels[kind]}</b>: {len(paths_cliff[kind]) - 1} moves, "
+                    f"return {-(len(paths_cliff[kind]) - 1)}" for kind in methods]
+)
+
+pad = 0.04
+
+for row, kind in enumerate(methods, start=1):
+    a_greedy = cliff_results[kind][0].mean(axis=0).argmax(axis=1)
+
+    for s in range(cliff.n_states):
+        x, y = cliff_xy(s)
+        cell_kind = "cliff" if s in cliff_cells else "goal" if s == cliff_goal else "safe"
+        episode_cliff_fig.add_shape(
+            type="rect",
+            x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
+            fillcolor=CLIFF_FILL[cell_kind],
+            line_width=0,
+            layer="below",
+            row=row, col=1
+        )
+        label = {cliff_start: "S", cliff_goal: "G"}.get(
+            s, "C" if s in cliff_cells else ARROWS[int(a_greedy[s])])
+        episode_cliff_fig.add_annotation(
+            x=x, y=y,
+            text=f"<b>{label}</b>",
+            showarrow=False,
+            font=dict(size=15, color="#4a4a4a"),
+            row=row, col=1
+        )
+
+    xs, ys = xy_cliff[kind]
+    episode_cliff_fig.add_scatter(
+        x=xs[:1],
+        y=ys[:1],
+        mode="lines",
+        line=dict(color=method_colors[kind], width=3),
+        hoverinfo="skip",
+        showlegend=False,
+        row=row, col=1
+    )
+    episode_cliff_fig.add_scatter(
+        x=xs[:1],
+        y=ys[:1],
+        mode="markers",
+        marker=dict(
+            size=20,
+            color=method_colors[kind],
+            line=dict(
+                color="white",
+                width=2
+            )
+        ),
+        hoverinfo="skip",
+        showlegend=False,
+        row=row, col=1
+    )
+
+def frame_data(k):
+    "both agents step together; whoever reaches the goal first waits there"
+    data = []
+    for kind in methods:
+        xs, ys = xy_cliff[kind]
+        j = min(k, len(xs) - 1)
+        data += [go.Scatter(x=xs[:j+1], y=ys[:j+1]), go.Scatter(x=xs[j:j+1], y=ys[j:j+1])]
+    return data
+
+episode_cliff_fig.frames = [
+    go.Frame(name=str(k), data=frame_data(k), traces=[0, 1, 2, 3])
+    for k in range(n_frames_cliff)
+]
+
+updatemenus = [
+    dict(
+        type="buttons",
+        x=-0.06,
+        xanchor="right",
+        y=-0.08,
+        yanchor="top",
+        font_color = "black",
+        buttons=[
+            dict(
+                label="&#9654; Play",
+                method="animate",
+                args=[
+                    None,
+                    dict(
+                        fromcurrent=True,
+                        frame=dict(duration=450, redraw=False),
+                        transition=dict(duration=0)
+                    )
+                ]
+            )
+        ]
+    )
+]
+
+sliders = [
+    dict(
+        bgcolor="#3498db",
+        bordercolor="#fffcfc",
+        currentvalue=dict(prefix="step "),
+        steps=[
+            dict(
+                label=str(k),
+                method="animate",
+                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for k in range(n_frames_cliff)
+        ]
+    )
+]
+
+episode_cliff_fig.update_xaxes(
+    range=[-0.55, n_cols_cliff - 0.45],
+    showgrid=False,
+    zeroline=False,
+    showticklabels=False
+)
+
+for row, x_axis in enumerate(["x", "x2"], start=1):
+    episode_cliff_fig.update_yaxes(
+        range=[-0.55, n_rows_cliff - 0.45],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        scaleanchor=x_axis,
+        row=row, col=1
+    )
+
+episode_cliff_fig.update_layout(
+    title="<b>Greedy episodes on the cliff</b>"
+          "<br><sup>S = start, G = goal, C = cliff (reward -100, and back to S); "
+          "arrows are each method's greedy action</sup>",
+    template="plotly_dark",
+    updatemenus=updatemenus,
+    sliders=sliders,
+    height=820,
+    margin=dict(l=10, r=10, t=100, b=30),
+)
+
+episode_cliff_fig.show(config=dict(displayModeBar=False))
+```
+
+
+```{python}
+#| classes: light-mode
+cliff_fig = go.Figure()
+moving_average = lambda y, window=10: np.convolve(y, np.ones(window) / window, mode="valid")
+
+for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
+    y = moving_average(cliff_results[kind][1].mean(axis=1))
+
+    cliff_fig.add_scatter(
+      x=np.arange(len(y)) + 10,
+      y=y,
+      mode="lines",
+      name={"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}[kind],
+      line=dict(color=colors[i], width=2)
+    )
+
+cliff_fig.add_hline(
+      y=v_star_cliff[cliff_start],
+      line=dict(color="grey", width=1, dash="dash"),
+      annotation_text="optimal path (-13), if you never explore",
+      annotation_position="bottom right"
+)
+
+cliff_fig.update_layout(
+      title=dict(
+        text=r"$\text{Cliff walking, }\alpha = 0.5\text{, }\epsilon = 0.1$",
+        subtitle=dict(text=f"sum of rewards per episode (online return), {N_RUNS_CLIFF} runs, 10-episode moving average"),
+      ),
+      xaxis_title="episodes",
+      yaxis=dict(title="sum of rewards per episode", range=[-100, 0]),
+      template="plotly_white",
+      legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+      margin=dict(t=100, b=100),
+      hovermode="x unified",
+)
+
+cliff_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+cliff_fig = go.Figure()
+moving_average = lambda y, window=10: np.convolve(y, np.ones(window) / window, mode="valid")
+
+for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
+    y = moving_average(cliff_results[kind][1].mean(axis=1))
+
+    cliff_fig.add_scatter(
+      x=np.arange(len(y)) + 10,
+      y=y,
+      mode="lines",
+      name={"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}[kind],
+      line=dict(color=colors[i], width=2)
+    )
+
+cliff_fig.add_hline(
+      y=v_star_cliff[cliff_start],
+      line=dict(color="grey", width=1, dash="dash"),
+      annotation_text="optimal path (-13), if you never explore",
+      annotation_position="bottom right"
+)
+
+cliff_fig.update_layout(
+      title=dict(
+        text=r"$\text{Cliff walking, }\alpha = 0.5\text{, }\epsilon = 0.1$",
+        subtitle=dict(text=f"sum of rewards per episode (online return), {N_RUNS_CLIFF} runs, 10-episode moving average"),
+      ),
+      xaxis_title="episodes",
+      yaxis=dict(title="sum of rewards per episode", range=[-100, 0]),
+      template="plotly_dark",
+      legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+      margin=dict(t=100, b=100),
+      hovermode="x unified",
+)
+
+cliff_fig.show(config=dict(displayModeBar=False))
+```
+
+
+Each learner predicts a different answer at the start state, and we can compute them exactly using our DP Oracle:
+
+- Q-learning's $\max_a Q(\text{start},a)$ should equal $v_*(\text{start}) = -13$;
+
+- Sarsa's should equal $q_\pi(\text{start},a)$ for $\pi$ = *its own* $\varepsilon$-greedy policy, which we get by DP-evaluating that policy.
+
+We give both a smaller step size and more episodes so the constant-$\alpha$ noise band is narrow, and we compare over states the final policy actually occupies.
+
+
+```{python}
+N_RUNS_OPT = 30
+N_EPISODES_OPT = 3000
+MAX_STEPS_OPT = 150
+ALPHA_OPT = EPS_OPT = 0.1
+rollout_cliff = make_rollout(cliff, 404)
+
+labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
+
+# the oracle each method's own theory says it converges to: q_* off-policy, q_pi on-policy
+converges_to_q_star = {"sarsa": False, "q": True, "expected_sarsa": False}
+
+def cell(x, is_target, width, decimals=2):
+    "right-aligned number; a trailing ' *' marks the oracle this method should match"
+    return f"{x:.{decimals}f}".rjust(width - 2) + (" *" if is_target else "  ")
+
+print(f"cliff: alpha = {ALPHA_OPT}, eps = {EPS_OPT}, {N_EPISODES_OPT} episodes, "
+      f"Q averaged over {N_RUNS_OPT} runs\n")
+print("q_* = optimal action values (Q-learning's target)")
+print("q_pi_eps = action values of the learner's own eps-greedy policy (Sarsa's target)")
+print("* = the oracle that method's own theory says it converges to\n")
+print(f"{'':16s}{'value at the start state':^34s}{'worst state its own policy occupies':^39s}")
+print(f"{'method':16s}{'Q(start)':>10}{'q_*':>10}  {'q_pi_eps':>10}  "
+      f"  {'states':>6}{'max|Q-q_*|':>12}  {'max|Q-q_pi_eps|':>15}")
+print("-" * 89)
+
+for kind in ["sarsa", "q", "expected_sarsa"]:
+    learner = make_control(cliff, kind, 505)
+    Q_opt, *_ = learner(
+            np.zeros((N_RUNS_OPT, cliff.n_states, cliff.n_actions)),
+            np.full(N_RUNS_OPT, ALPHA_OPT),
+            np.full(N_RUNS_OPT, EPS_OPT),
+            GAMMA,
+            N_EPISODES_OPT,
+            MAX_STEPS_OPT
+    )
+
+    Q_mean = Q_opt.mean(axis=0)
+    pi_eps = eps_greedy_pi(Q_mean, EPS_OPT, cliff)
+    _, q_pi_eps = exact(cliff, GAMMA, pi_eps)
+    greedy_action = Q_mean[cliff_start].argmax()
+
+    # grade only where the learner actually has experience: the greedy action of
+    # each state its own policy occupies
+    S_visited, _, _, _ = rollout_cliff(pi_eps, np.full(2000, cliff_start, dtype="int64"), 200)
+    occupied = np.zeros(cliff.n_states, dtype=bool); occupied[np.unique(S_visited)] = True
+    occupied &= ~cliff.terminal
+    graded = (np.flatnonzero(occupied), Q_mean.argmax(axis=1)[occupied])
+
+    is_star = converges_to_q_star[kind]
+    print(f"{labels[kind]:16s}{Q_mean[cliff_start, greedy_action]:10.2f}"
+          f"{cell(q_star_cliff[cliff_start, greedy_action], is_star, 12)}"
+          f"{cell(q_pi_eps[cliff_start, greedy_action], not is_star, 12)}"
+          f"  {occupied.sum():6d}"
+          f"{cell(np.abs(Q_mean[graded] - q_star_cliff[graded]).max(), is_star, 14)}"
+          f"{cell(np.abs(Q_mean[graded] - q_pi_eps[graded]).max(), not is_star, 17)}".rstrip())
+
+```
+
+- **Q-learning matches $q_*$.** $Q(\text{start}) = -13.00$ is exactly the optimal action value, even though every episode was generated by an $\varepsilon$-greedy policy that keeps falling off the cliff. Due to learning using an off-policy framework, we evaluate the *greedy* policy, the $\max_a$ in the target, while the agent behaves according to its own behavior policy which gets estimated poorly at $q_{\pi_\varepsilon}(\text{start}) = -45.78$. This is why the online return in the figure above is *worse* than Sarsa's even though its value estimates are better.
+
+- **Sarsa and Expected Sarsa match $q_{\pi_\varepsilon}$**, the value of the policy they actually follow. Their $\approx5$ gap to $q_*$ is the price of 10% exploration
+
+# Expected Sarsa
+
+Expected Sarsa is actually more similar to Q-learning than to regular Sarsa because its target also does not require the next state-action.
+
+$$
+Q(S_t,A_t) \leftarrow Q(S_t,A_t) + \alpha\Big[R_{t+1} + \gamma\sum_a \pi(a\mid S_{t+1})\,Q(S_{t+1},a) - Q(S_t,A_t)\Big]
+$$
+
+This is an *expected* backup over actions with a *sampled* transition. It moves in the same direction as Sarsa in expectation, however, since the algorithm does not require a random next-action the variance is lesser. Notice if we select the greedy policy for $\pi$ inside the sum then expected Sarsa is exactly Q-learning. Thus, expected Sarsa is a generalization of Q-leanring.
+
+Expected Sarsa can be on-policy or off-policy if the behavior policy is selected to be different from the target policy.
+
+Sweeping the step-size highlights the variance reduction in comparison to regular Sarsa. Interim performance is the average return over the first 100 episodes, while the "longer-run" column averages the last 100 of 500 episodes.
+
+
+```{python}
+alphas_sweep = np.round(np.arange(0.1, 1.001, 0.1), 2)
+N_RUNS_SWEEP, N_EPISODES_SWEEP, MAX_STEPS_SWEEP = 50, 500, 150
+EPS = 0.1
+
+n_learners_sweep = len(alphas_sweep) * N_RUNS_SWEEP
+alpha_per_learner_sweep = np.repeat(alphas_sweep, N_RUNS_SWEEP)
+
+sweep_results = {}
+for kind in ["sarsa", "q", "expected_sarsa"]:
+    learner = make_control(cliff, kind, 606)
+    _, reward_sum_sweep, _, done_sweep, _ = learner(
+        np.zeros((n_learners_sweep, cliff.n_states, cliff.n_actions)),
+        alpha_per_learner_sweep,
+        np.full(n_learners_sweep, EPS),
+        GAMMA,
+        N_EPISODES_SWEEP,
+        MAX_STEPS_SWEEP
+    )
+
+    per_alpha = reward_sum_sweep.reshape(N_EPISODES_SWEEP, len(alphas_sweep), N_RUNS_SWEEP)
+    sweep_results[kind] = (per_alpha[:100].mean(axis=(0, 2)),
+                           per_alpha[-100:].mean(axis=(0, 2)))
+    print(f"{kind}: episodes finished: {done_sweep.mean():.1%}")
+```
+
+
+```{python}
+#| classes: light-mode
+labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
+sweep_fig = make_subplots(
+    rows=1,
+    cols=2,
+    shared_yaxes=True,
+    horizontal_spacing=0.02,
+    subplot_titles=(
+        "interim: first 100 episodes",
+        "longer run: episodes 400-500"
+    )
+)
+
+for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
+    interim, late = sweep_results[kind]
+    for col, y in [(1, interim), (2, late)]:
+        sweep_fig.add_scatter(
+            x=alphas_sweep,
+            y=y,
+            mode="lines+markers",
+            name=labels[kind],
+            line=dict(color=colors[i], width=2),
+            marker=dict(size=7, line=dict(color="white", width=1)),
+            showlegend=(col == 1),
+            row=1,
+            col=col
+        )
+
+sweep_fig.update_xaxes(title_text="alpha")
+sweep_fig.update_yaxes(title_text="sum of rewards per episode", row=1, col=1)
+
+sweep_fig.update_layout(
+    title = dict(
+        text = "<b>Step-size sweep on cliff walking</b>",
+        subtitle = dict(text=f"{N_RUNS_SWEEP} runs per point, ε = 0.1")
+    ),
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="top", y=-0.18, x=0),
+    margin=dict(t=100, b=100),
+    hovermode="x unified",
+)
+
+sweep_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
+sweep_fig = make_subplots(
+    rows=1,
+    cols=2,
+    shared_yaxes=True,
+    horizontal_spacing=0.02,
+    subplot_titles=(
+        "interim: first 100 episodes",
+        "longer run: episodes 400-500"
+    )
+)
+
+for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
+    interim, late = sweep_results[kind]
+    for col, y in [(1, interim), (2, late)]:
+        sweep_fig.add_scatter(
+            x=alphas_sweep,
+            y=y,
+            mode="lines+markers",
+            name=labels[kind],
+            line=dict(color=colors[i], width=2),
+            marker=dict(size=7, line=dict(color="white", width=1)),
+            showlegend=(col == 1),
+            row=1,
+            col=col
+        )
+
+sweep_fig.update_xaxes(title_text="alpha")
+sweep_fig.update_yaxes(title_text="sum of rewards per episode", row=1, col=1)
+
+sweep_fig.update_layout(
+    title = dict(
+        text = "<b>Step-size sweep on cliff walking</b>",
+        subtitle = dict(text=f"{N_RUNS_SWEEP} runs per point, ε = 0.1")
+    ),
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="top", y=-0.18, x=0),
+    margin=dict(t=100, b=100),
+    hovermode="x unified",
+)
+
+sweep_fig.show(config=dict(displayModeBar=False))
+```
+
+- **Expected Sarsa performs well at every $\alpha$**, both interim and in longer runs.
+
+- **Expected Sarsa is flat in $\alpha$ over the long run** - even at $\alpha = 1$ it is fine, because its target has no next-action sampling noise.
+
+- Sarsa, by contrast, **decays badly as $\alpha$ grows**. At $\alpha=1$ each update *replaces* $Q$ with a target built from one random next action.
+
+- **Q-learning's long-run curve is flat but lower**. The price of behaving $\varepsilon$-greedily with respect to the *optimal* policy right next to a cliff.
+
+# Maximization bias and double learning
+
+Many algorithms we looked at so far uses a maximum over estimates in its target, and a maximum of noisy estimates is positively biased. If the true values of ten actions are all $-0.1$ but
+each is estimated with noise, then $\max_a Q(s,a)$ can be *positive* due to the noise. This is known as **maximization bias**.
+
+We create the book's two state MDP that highlights the difficulties of learning under maximization bias.
+
+```{python}
+#| classes: light-mode
+g = nx.MultiDiGraph()
+
+for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
+    g.add_node(
+        name,
+        label=label,
+        shape="circle",
+        size=55,
+        color=colors[0],
+        border_color="#0b0b0b",
+        border_size=3,
+        label_size=18,
+        x=x, y=0,
+    )
+
+for name, x in [("left terminal", -420), ("right terminal", 300)]:
+    g.add_node(
+        name,
+        label="terminal",
+        shape="rectangle",
+        size=24,
+        color=colors[2],
+        border_color="#0b0b0b",
+        border_size=2,
+        label_size=14,
+        x=x, y=0,
+    )
+
+transitions = [
+    ("A", "B", "left, r = 0"),
+    ("A", "right terminal", "right, r = 0"),
+    ("B", "left terminal", "10 actions, r ~ N(−0.1, 1)"),
+]
+for s, s_next, lbl in transitions:
+    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+
+gv.d3(
+    g,
+    graph_height=320,
+    layout_algorithm_active=False,
+    node_label_data_source="label",
+    show_edge_label=True,
+    edge_label_data_source="label",
+    edge_label_size_factor=1.8,
+    edge_curvature=0.5,
+    zoom_factor=1.0,
+)
+```
+
+```{python}
+#| classes: dark-mode
+g = nx.MultiDiGraph()
+
+for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
+    g.add_node(
+        name,
+        label=label,
+        label_color="#faf8f8",
+        shape="circle",
+        size=55,
+        color=colors[0],
+        border_color="#faf8f8",
+        border_size=3,
+        label_size=18,
+        x=x, y=0,
+    )
+
+for name, x in [("left terminal", -420), ("right terminal", 300)]:
+    g.add_node(
+        name,
+        label="terminal",
+        label_color="#faf8f8",
+        shape="rectangle",
+        size=24,
+        color=colors[2],
+        border_color="#faf8f8",
+        border_size=2,
+        label_size=14,
+        x=x, y=0,
+    )
+
+transitions = [
+    ("A", "B", "left, r = 0"),
+    ("A", "right terminal", "right, r = 0"),
+    ("B", "left terminal", "10 actions, r ~ N(−0.1, 1)"),
+]
+for s, s_next, lbl in transitions:
+    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+
+g.graph['background_color'] = 'black'
+
+gv.d3(
+    g,
+    graph_height=320,
+    layout_algorithm_active=False,
+    node_label_data_source="label",
+    show_edge_label=True,
+    edge_label_data_source="label",
+    edge_label_size_factor=1.8,
+    edge_curvature=0.5,
+    zoom_factor=1.0,
+)
+```
+
+Going `left` has an expected return of $-0.1$, so a good learner takes `right` and only visits `left` due to exploration. Q-learning instead prefers `left` for a long time, because $\max_a Q(B,a)$ stays positive while its ten estimates are still noisy.
+
+**Double learning** removes the bias by splitting the two jobs the max was doing at once, which consists of *choosing* the maximizing action and then *estimating* its value. We now maintain two tables ($Q1$ and $Q2$) and let each evaluate the other's max action selection.
+
+$$
+Q_1(S_t,A_t) \leftarrow Q_1(S_t,A_t) + \alpha\Big[R_{t+1} + \gamma\,Q_2\big(S_{t+1},\,\arg\max_a Q_1(S_{t+1},a)\big) - Q_1(S_t,A_t)\Big]
+$$
+
+The roles are swapped on a coin flip at each step, and the behaviour is $\varepsilon$-greedy in $Q_1+Q_2$. $Q_2$'s estimate of the action $Q_1$ picked is unbiased, because the noise that made $Q_1$ pick it is independent of $Q_2$. In the scan, the coin flip is a per-run mask rather than an `if` statement where both updates are computed and one is multiplied by zero.
+
+
+```{python}
+def make_double_q(env, seed):
+    "Double Q-learning: two tables, one picks the action and the other values it."
+    P = pt.as_tensor_variable(env.P)
+    reward_mean = pt.as_tensor_variable(env.reward_mean)
+    reward_sd = pt.as_tensor_variable(env.reward_sd)
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
+    start_dist = pt.as_tensor_variable(env.start)
+    rng_shared = pt.random.shared_rng(seed=seed, name=f"rng_dq_{env.name}")
+
+    Q_init = pt.dtensor3("Q0")
+    alpha = pt.dvector("alpha")
+    eps = pt.dvector("eps")
+    gamma = pt.scalar("gamma")
+    n_episodes = pt.iscalar("n_ep")
+    max_steps = pt.iscalar("T")
+
+    def argmax_legal(Q, s):
+        runs = pt.arange(Q.shape[0])
+        return pt.argmax(pt.where(legal_actions[s] > 0, Q[runs, s], NEG_INF), axis=1)
+
+    def pick(rng, Q_sum, s, eps):
+        runs = pt.arange(Q_sum.shape[0])
+        legal = legal_actions[s]
+        probs = legal * (eps / legal.sum(axis=1))[:, None]
+        return rng.categorical(p=pt.inc_subtensor(probs[runs, argmax_legal(Q_sum, s)], 1.0 - eps))
+
+    def inner(rng, s, a, still_running, Q1, Q2, reward_sum, alpha, eps, gamma):
+        runs = pt.arange(Q1.shape[0])
+        rng, s_next = rng.categorical(p=P[s, a])
+        rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a])
+
+        best1 = argmax_legal(Q1, s_next) # each table's own choice
+        best2 = argmax_legal(Q2, s_next)
+        bootstrap1 = not_terminal[s_next] * Q2[runs, s_next, best1]  # eval by the other
+        bootstrap2 = not_terminal[s_next] * Q1[runs, s_next, best2]
+
+        rng, u = rng.uniform(size=still_running.shape)
+        updates_Q1 = pt.cast(u < 0.5, "float64")# which table learns this step
+
+        Q1 = pt.inc_subtensor(Q1[runs, s, a], alpha * still_running * updates_Q1 * (r + gamma * bootstrap1 - Q1[runs, s, a]))
+        Q2 = pt.inc_subtensor(Q2[runs, s, a], alpha * still_running * (1 - updates_Q1) * (r + gamma * bootstrap2 - Q2[runs, s, a]))
+
+        rng, a_next = pick(rng, Q1 + Q2, s_next, eps)
+        return (rng, s_next, a_next, still_running * not_terminal[s_next], Q1, Q2,
+                reward_sum + still_running * r)
+
+    def episode(rng, s, a, Q1, Q2, alpha, eps, gamma, max_steps):
+        zero = pt.zeros_like(not_terminal[s])
+
+        rng_final, S_seq, A_seq, running_seq, Q1_seq, Q2_seq, reward_sum = pytensor.scan(
+            fn=inner,
+            outputs_info=[rng, s, a, zero + 1.0, Q1, Q2, zero],
+            non_sequences=[alpha, eps, gamma],
+            n_steps=max_steps,
+            return_updates=False
+        )
+
+        Q1_new, Q2_new = Q1_seq[-1], Q2_seq[-1]
+        rng, s_new = rng_final.categorical(p=pt.ones((Q1.shape[0], 1)) * start_dist[None, :])
+        rng, a_new = pick(rng, Q1_new + Q2_new, s_new, eps)
+        return rng, s_new, a_new, Q1_new, Q2_new, reward_sum[-1]
+
+    rng_a, s_first = rng_shared.categorical(p=pt.ones((Q_init.shape[0], 1)) * start_dist[None, :])
+    rng_b, a_first = pick(rng_a, Q_init + Q_init, s_first, eps)
+
+    rng_final, S_out, A_out, Q1_out, Q2_out, reward_sum = pytensor.scan(
+        fn=episode,
+        outputs_info=[rng_b, s_first, a_first, Q_init, pt.zeros_like(Q_init), None],
+        non_sequences=[alpha, eps, gamma, max_steps],
+        n_steps=n_episodes,
+        return_updates=False
+    )
+
+    first_action = pt.concatenate([a_first[None, :], A_out[:-1]], axis=0)
+    return pytensor.function([Q_init, alpha, eps, gamma, n_episodes, max_steps],
+                             [Q1_out[-1], Q2_out[-1], reward_sum, first_action],
+                             updates={rng_shared: rng_final})
+```
+
+
+```{python}
+N_RUNS_MAXBIAS = 2000
+N_EPISODES_MAXBIAS = 300
+MAX_STEPS_MAXBIAS = 4
+
+q_learner_maxbias = make_control(maxbias, "q", 707)
+double_q_maxbias = make_double_q(maxbias, 808)
+
+Q_init_maxbias = np.zeros((N_RUNS_MAXBIAS, maxbias.n_states, maxbias.n_actions))
+
+Q_q, _, _, _, first_action_q = q_learner_maxbias(
+    Q_init_maxbias,
+    np.full(N_RUNS_MAXBIAS, 0.1),
+    np.full(N_RUNS_MAXBIAS, 0.1),
+    GAMMA,
+    N_EPISODES_MAXBIAS,
+    MAX_STEPS_MAXBIAS
+)
+
+Q1_double, Q2_double, _, first_action_double = double_q_maxbias(
+    Q_init_maxbias,
+    np.full(N_RUNS_MAXBIAS, 0.1),
+    np.full(N_RUNS_MAXBIAS, 0.1),
+    GAMMA,
+    N_EPISODES_MAXBIAS,
+    MAX_STEPS_MAXBIAS
+)
+
+left_q = (first_action_q == 0).mean(axis=1)
+left_double = (first_action_double == 0).mean(axis=1)
+
+print(f"% of episodes taking 'left' from A (eps-greedy floor = {0.1/2:.0%})")
+for ep in [1, 10, 50, 100, 200, 300]:
+    print(f"  after {ep:3d} episodes: Q-learning {left_q[ep-1]:6.1%}   "
+          f"Double Q {left_double[ep-1]:6.1%}")
+
+# the biased quantity is the bootstrap value each method feeds into Q(A, left)
+bootstrap_q = Q_q[:, 1].max(axis=1) # max_a Q(B,a)
+best_by_Q1 = Q1_double[:, 1].argmax(axis=1)
+bootstrap_double = Q2_double[np.arange(N_RUNS_MAXBIAS), 1, best_by_Q1]  # Q2(B, argmax_a Q1(B,a))
+print(f"\nbootstrap value used for the Q(A,left) update, true value -0.1:")
+print(f"  Q-learning max_a Q(B,a) = {bootstrap_q.mean():+.3f}")
+print(f"  Double Q Q2(B, argmax_a Q1(B,a)) = {bootstrap_double.mean():+.3f}")
+```
+
+
+```{python}
+#| classes: light-mode
+maxbias_fig = go.Figure()
+
+episode_axis = np.arange(1, N_EPISODES_MAXBIAS + 1)
+
+maxbias_fig.add_scatter(
+    x=episode_axis,
+    y=left_q,
+    mode="lines",
+    name="Q-learning",
+    line=dict(color=colors[2], width=2)
+)
+
+maxbias_fig.add_scatter(
+    x=episode_axis,
+    y=left_double,
+    mode="lines",
+    name="Double Q-learning",
+    line=dict(color=colors[0], width=2)
+)
+
+maxbias_fig.add_hline(
+    y=0.05,
+    line=dict(color="grey", width=1, dash="dash"),
+    annotation_text="optimal (the eps-greedy 5% floor)",
+    annotation_position="bottom right"
+)
+
+maxbias_fig.update_layout(
+    title="Maximization bias, how double learning removes it"
+            f"<br>&nbsp;&nbsp;<sup>{N_RUNS_MAXBIAS} runs, alpha = 0.1, eps = 0.1</sup>",
+    xaxis_title="episodes",
+    yaxis=dict(title="left actions from A", tickformat=".2%"),
+    template="plotly_white",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100)
+)
+
+maxbias_fig.show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+maxbias_fig = go.Figure()
+
+episode_axis = np.arange(1, N_EPISODES_MAXBIAS + 1)
+
+maxbias_fig.add_scatter(
+    x=episode_axis,
+    y=left_q,
+    mode="lines",
+    name="Q-learning",
+    line=dict(color=colors[2], width=2)
+)
+
+maxbias_fig.add_scatter(
+    x=episode_axis,
+    y=left_double,
+    mode="lines",
+    name="Double Q-learning",
+    line=dict(color=colors[0], width=2)
+)
+
+maxbias_fig.add_hline(
+    y=0.05,
+    line=dict(color="grey", width=1, dash="dash"),
+    annotation_text="optimal (the eps-greedy 5% floor)",
+    annotation_position="bottom right"
+)
+
+maxbias_fig.update_layout(
+    title="Maximization bias, how double learning removes it"
+            f"<br>&nbsp;&nbsp;<sup>{N_RUNS_MAXBIAS} runs, alpha = 0.1, eps = 0.1</sup>",
+    xaxis_title="episodes",
+    yaxis=dict(title="left actions from A", tickformat=".2%"),
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+    margin=dict(t=100, b=100)
+)
+
+maxbias_fig.show(config=dict(displayModeBar=False))
+```
+
+
+Q-learning needs hundreds of episodes to avoid going `left`, because every time exploration takes it into B, $\max_a Q(B,a)$ hands it back an optimistic number due to the variance. Double Q-learning converges to the 5% floor within a few dozen episodes, and the bootstrap value it feeds into $Q(A,\text{left})$ sits close to the true $-0.1$ where Q-learning's sits above it. The residual gap in both is the constant-$\alpha$ noise floor, which never fully vanishes.
+
+The cost, however, of double Q-learning is doubled memory because we need to maintain two tables.
+
+# Games, afterstates, and other special cases
+
+When you have partial information about the environment, tabular action values may not be the most efficient object to update. In certain cases, like many games and even our gridworld example, when we take an action we know the immediate effects of our moves and that information allows us to learn more efficiently.
+
+Two different (state, action) pairs that produce the same board have exactly the same value, but a $q(s,a)$ table has no way to know that because it must learn each entry separately. A value function over **afterstates** defined as the state *after* the agent acts, but before the environment responds will share that learning automatically.
+
+For example, because our gridworld moves are deterministic, the afterstate of $(s,a)$ is just the cell you land in, and that allows us to collapse $56$ non-terminal (state, action) pairs onto $16$ afterstates.
+
+Acting requires knowing the rules, the greedy step is a one-step lookahead through the model,
+
+$$
+\pi(s) = \arg\max_a\;\big[\,r(s,a) + \gamma\,U(\text{afterstate}(s,a))\big],
+$$
+
+We know the rules of the gridworld environment, so we can spend that knowledge on the greedy step and learn a table that is $|\mathcal A|$ times smaller. The
+learning update is plain TD(0) on $U$, which is on-policy, so like Sarsa it evaluates the $\varepsilon$-greedy policy it follows.
+
+
+```{python}
+def make_afterstate_control(env, seed):
+    """TD(0) over afterstate values.  Deterministic dynamics only: the afterstate of (s,a)
+    is the cell you land in, so one table U indexed by afterstate replaces the (s,a) table
+    and the greedy step becomes a one-step lookahead through the known model."""
+
+    assert np.allclose(env.P.max(axis=2), 1.0), "afterstates here assume deterministic dynamics"
+
+    afterstate = pt.as_tensor_variable(env.P.argmax(axis=2))   # (n_states, n_actions) -> afterstate
+    reward = pt.as_tensor_variable(env.reward_mean)
+    not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
+    start_dist = pt.as_tensor_variable(env.start)
+    rng_shared = pt.random.shared_rng(seed=seed, name=f"rng_after_{env.name}")
+
+    U_init = pt.dmatrix("U0")
+    alpha = pt.dvector("alpha")
+    eps = pt.dvector("eps")
+    gamma = pt.scalar("gamma")
+    n_episodes = pt.iscalar("n_ep")
+    max_steps = pt.iscalar("T")
+
+    def lookahead(U, s, gamma):
+        "model-implied action values  r(s,a) + gamma * U(afterstate(s,a))  -> (n_runs, n_actions)"
+        runs = pt.arange(U.shape[0])[:, None]
+        s_next = afterstate[s]
+        return reward[s] + gamma * not_terminal[s_next] * U[runs, s_next]
+
+    def pick(rng, U, s, eps, gamma):
+        runs = pt.arange(U.shape[0])
+        legal = legal_actions[s]
+        greedy = pt.argmax(pt.where(legal > 0, lookahead(U, s, gamma), NEG_INF), axis=1)
+        probs = legal * (eps / legal.sum(axis=1))[:, None]
+        return rng.categorical(p=pt.inc_subtensor(probs[runs, greedy], 1.0 - eps))
+
+    def inner(rng, s, still_running, U, reward_sum, alpha, eps, gamma):
+        runs = pt.arange(U.shape[0])
+        rng, a = pick(rng, U, s, eps, gamma)
+        s_next, r = afterstate[s, a], reward[s, a]
+        delta = r + gamma * not_terminal[s_next] * U[runs, s_next] - U[runs, s]  # plain TD(0)
+        U = pt.inc_subtensor(U[runs, s], alpha * still_running * delta)
+        return (rng, s_next, still_running * not_terminal[s_next], U, reward_sum + still_running * r)
+
+    def episode(rng, s, U, alpha, eps, gamma, max_steps):
+        zero = pt.zeros_like(not_terminal[s])
+
+        rng_final, S_seq, running_seq, U_seq, reward_sum = pytensor.scan(
+            fn=inner,
+            outputs_info=[rng, s, zero + 1.0, U, zero],
+            non_sequences=[alpha, eps, gamma],
+            n_steps=max_steps,
+            return_updates=False
+        )
+
+        rng, s_new = rng_final.categorical(p=pt.ones((U.shape[0], 1)) * start_dist[None, :])
+        return rng, s_new, U_seq[-1], reward_sum[-1], 1.0 - running_seq[-1]
+
+    rng_a, s_first = rng_shared.categorical(p=pt.ones((U_init.shape[0], 1)) * start_dist[None, :])
+
+    rng_final, S_out, U_out, reward_sum, done = pytensor.scan(
+        fn=episode,
+        outputs_info=[rng_a, s_first, U_init, None, None],
+        non_sequences=[alpha, eps, gamma, max_steps],
+        n_steps=n_episodes,
+        return_updates=False
+    )
+
+    control = pytensor.function(
+        [U_init, alpha, eps, gamma, n_episodes, max_steps],
+        [U_out[-1], reward_sum, done],
+        updates={rng_shared: rng_final}
+    )
+
+    U_one = pt.dvector("U")  # the greedy rule, for one table
+    lookahead_fn = pytensor.function(
+        [U_one, gamma],
+        reward + gamma * not_terminal[afterstate] * U_one[afterstate]
+    )
+
+    return control, lookahead_fn
+```
+
+
+```{python}
+afterstate_control_g4, lookahead_g4 = make_afterstate_control(grid4, 909)
+
+N_RUNS_AFTER = 20
+
+U_after, reward_sum_after, done_after = afterstate_control_g4(
+      np.zeros((N_RUNS_AFTER, grid4.n_states)),
+      np.full(N_RUNS_AFTER, 0.2),
+      np.full(N_RUNS_AFTER, 0.1),
+      GAMMA,
+      400,
+      60
+)
+
+evaluate_policy_g4, optimal_values_g4, _ = ORACLE["grid4"]
+
+gaps_after = np.array(
+    [
+        np.abs(evaluate_policy_g4(greedy_pi(lookahead_g4(U_after[run], GAMMA), grid4), GAMMA) - v_star_g4)[~grid4.terminal].max()
+        for run in range(N_RUNS_AFTER)
+    ]
+)
+
+print(f"afterstate TD(0), 400 episodes: runs whose greedy policy is exactly optimal: "
+      f"{(gaps_after < 1e-9).sum()}/{N_RUNS_AFTER}")
+
+show_grid(U_after.mean(axis=0), grid4, "\nlearned afterstate values U (mean over runs):")
+print()
+
+show_grid(v_star_g4, grid4, "exact v_* :")
+
+```
+
+
+# Summary & Recap
+
+Everything in this chapter came from one update, with different targets plugged in:
+
+| method | target | on/off-policy |
+|---|---|---|
+| TD(0) prediction | $R_{t+1} + \gamma V(S_{t+1})$ | on-policy |
+| Sarsa | $R_{t+1} + \gamma Q(S_{t+1},A_{t+1})$ | on-policy |
+| Expected Sarsa | $R_{t+1} + \gamma\sum_a\pi(a\mid S_{t+1})Q(S_{t+1},a)$ | either |
+| Q-learning | $R_{t+1} + \gamma\max_a Q(S_{t+1},a)$ | off-policy |
+| Double Q-learning | $R_{t+1} + \gamma Q_2(S_{t+1},\arg\max_a Q_1(S_{t+1},a))$ | off-policy |
+
+All of them are *one-step, tabular, and model-free*.
+
+- **TD(0)** updates from $\delta_t = R_{t+1} + \gamma V(S_{t+1}) - V(S_t)$: one transition, no model,
+  no waiting for the end of the episode. Its target has lower variance than MC's return but is biased
+  by the current estimate.
+
+- **Batch TD(0) is DP on the maximum-likelihood model** of the batch, while batch MC is the sample
+  average of returns.
+
+- **Sarsa** bootstraps off the action taken, so it learns $q_\pi$ for its own $\varepsilon$-greedy
+  policy.
+
+- **Q-learning** bootstraps off the max, so it learns $q_*$ regardless of behaviour; with no
+  importance sampling.
+
+- **Expected Sarsa** replaces the sampled next action with its expectation. Same direction, less
+  variance, stable even at $\alpha = 1$, and Q-learning is the greedy special case.
+
+- **Maximization bias** comes from using one set of estimates to both choose the action and evaluate the value; double
+  learning splits those jobs into independent estimates circumventing the bias.
+
+- **Afterstates** exploit known dynamics to merge (state, action) pairs with identical consequences.
