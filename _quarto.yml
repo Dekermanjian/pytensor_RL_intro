@@ -20,6 +20,7 @@ book:
         - chapters/dynamic_programming.qmd
         - chapters/monte_carlo_methods.qmd
         - chapters/temporal-difference_learning.qmd
+        - chapters/n_step_bootstrapping.qmd
 
 format:
   html:

@@ -17,6 +17,104 @@ $code-color: #c792ea;
 // Code cell output
 $pre-color: $body-color;
 
+// great_tables (GT) output
+// mirrors the light defaults: the table blends into the page, row-group
+// bands sit one step above it, and the borders carry the structure
+$gt-bg: $body-bg;          // light: #FFFFFF
+$gt-band: #242424;         // light: #F4F4F4 (row groups, striped rows)
+$gt-fg: #e8e8e8;           // light: #333333 (softened off white for dense numerals)
+$gt-border: #3a3a3a;       // light: #D3D3D3 (grid lines)
+$gt-border-strong: #666666; // light: #A8A8A8 (the 2px rules above and below the table)
+
 /*-- scss:rules --*/
 .dark-mode { display: block; }
 .light-mode { display: none; }
+
+// GT writes its palette inline as `#<random-id> .gt_*`, so these need
+// !important to outrank it. Applies to every GT table in the book.
+.gt_table {
+  color: $gt-fg !important;
+  background-color: $gt-bg !important;
+  border-top-color: $gt-border-strong !important;
+  border-bottom-color: $gt-border-strong !important;
+  border-left-color: $gt-border !important;
+  border-right-color: $gt-border !important;
+}
+
+.gt_heading {
+  background-color: $gt-bg !important;
+  border-bottom-color: $gt-bg !important;
+  border-left-color: $gt-border !important;
+  border-right-color: $gt-border !important;
+}
+
+.gt_title {
+  color: $gt-fg !important;
+  border-bottom-color: $gt-bg !important;
+}
+
+.gt_subtitle {
+  color: $gt-fg !important;
+  border-top-color: $gt-bg !important;
+}
+
+.gt_col_heading,
+.gt_column_spanner_outer,
+.gt_stub,
+.gt_stub_row_group,
+.gt_summary_row,
+.gt_grand_summary_row,
+.gt_sourcenotes,
+.gt_footnotes {
+  color: $gt-fg !important;
+  background-color: $gt-bg !important;
+}
+
+.gt_group_heading,
+.gt_empty_group_heading,
+.gt_striped {
+  color: $gt-fg !important;
+  background-color: $gt-band !important;
+}
+
+// grid lines: every GT class that paints a border at the default #D3D3D3
+.gt_bottom_border,
+.gt_column_spanner,
+.gt_table_body,
+.gt_last_summary_row_top,
+.gt_last_grand_summary_row_top {
+  border-bottom-color: $gt-border !important;
+}
+
+.gt_col_headings,
+.gt_group_heading,
+.gt_empty_group_heading,
+.gt_row,
+.gt_table_body,
+.gt_first_summary_row,
+.gt_first_grand_summary_row_bottom {
+  border-top-color: $gt-border !important;
+}
+
+.gt_col_headings,
+.gt_col_heading,
+.gt_group_heading,
+.gt_row,
+.gt_sourcenotes,
+.gt_footnotes {
+  border-left-color: $gt-border !important;
+  border-right-color: $gt-border !important;
+}
+
+.gt_group_heading,
+.gt_empty_group_heading,
+.gt_col_headings,
+.gt_sourcenotes,
+.gt_footnotes {
+  border-bottom-color: $gt-border !important;
+}
+
+.gt_stub,
+.gt_stub_row_group {
+  border-right-color: $gt-border !important;
+}
