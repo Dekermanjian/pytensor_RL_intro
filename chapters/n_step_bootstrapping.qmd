@@ -61,13 +61,12 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 from dataclasses import dataclass
-import time
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.io as pio
 from plotly.subplots import make_subplots
 import pandas as pd
-from great_tables import GT
+from great_tables import GT, md, html
 
 colors = px.colors.qualitative.Pastel
 pio.renderers.default = "notebook_connected"
@@ -99,7 +98,37 @@ class Env:
 
 ```{python}
 def make_env(name, n_states, n_actions, step_fn, terminals, starts, shape=(), legal_actions=None):
-    "step_fn(s, a) returns (s_next, reward_mean, reward_sd); terminals absorb with reward 0."
+    """Build a tabular `Env` by asking a step function about every (s, a) pair.
+
+    Terminal states absorb: every action leaves a terminal state where it is, with reward 0.
+    The reachable states are found by a breadth-first search from the start states that
+    follows only legal actions.
+
+    Parameters
+    ----------
+    name : str
+        Label for the environment. It also keys the DP oracle and names random generators.
+    n_states, n_actions : int
+        Number of states and of actions.
+    step_fn : callable
+        ``step_fn(s, a)`` returns ``(s_next, reward_mean, reward_sd)`` for one deterministic
+        transition. It is never called on a terminal state.
+    terminals : iterable of int
+        The terminal states.
+    starts : iterable of int
+        The start states. Each episode starts in one of them, chosen uniformly.
+    shape : tuple of int, default ()
+        ``(n_rows, n_cols)`` of the grid. Used only for drawing.
+    legal_actions : ndarray, shape (n_states, n_actions), optional
+        1.0 where an action is allowed, 0.0 where it is not. By default every action is legal.
+
+    Returns
+    -------
+    Env
+        The model ``P`` (n_states, n_actions, n_states), the reward mean and standard
+        deviation (n_states, n_actions), and the terminal, start, legal-action and
+        reachable arrays.
+    """
     P = np.zeros((n_states, n_actions, n_states))
     reward_mean = np.zeros((n_states, n_actions))
     reward_sd = np.zeros((n_states, n_actions))
@@ -138,61 +167,256 @@ def make_env(name, n_states, n_actions, step_fn, terminals, starts, shape=(), le
 
 ```{python}
 UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-ARROWS = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
 STEP = {UP: (0, 1), DOWN: (0, -1), LEFT: (-1, 0), RIGHT: (1, 0)}   # action -> (dx, dy) when drawn
 
 def _move(row, col, action, n_rows, n_cols):
+    """Move one cell on a grid. A move off the edge leaves the agent where it is.
+
+    Parameters
+    ----------
+    row, col : int
+        The current cell. Row 0 is the top row.
+    action : {UP, DOWN, LEFT, RIGHT}
+        The direction to move.
+    n_rows, n_cols : int
+        Size of the grid.
+
+    Returns
+    -------
+    row, col : int
+        The cell after the move.
+    """
     if action == UP: row = max(row - 1, 0)
     elif action == DOWN: row = min(row + 1, n_rows - 1)
     elif action == LEFT: col = max(col - 1, 0)
     elif action == RIGHT: col = min(col + 1, n_cols - 1)
     return row, col
 
-def show_grid(values, env, title="", fmt="6.1f"):
-    if title: print(title)
-    n_rows, n_cols = env.shape
-    for row in np.asarray(values, dtype=float).reshape(n_rows, n_cols):
-        print("  " + "  ".join(f"{x:{fmt}}" for x in row))
+@dataclass(frozen=True)
+class GridTheme:
+    template: str    # plotly template
+    background: str  # plot background, which shows in the gaps between cells
+    floor: str       # fill of a non-terminal cell the agent can stand on
+    wall: str        # fill of a cell the agent can never stand on
 
-def show_policy(actions, env, title="", extra=None):
-    "extra: dict cell -> character, drawn on top (terminals, goal, start, ...)"
-    if title: print(title)
-    n_rows, n_cols = env.shape
-    chars = [ARROWS[int(a)] for a in actions]
-    for s in np.flatnonzero(env.terminal): chars[s] = "T"
-    for s in np.flatnonzero(~env.reachable): chars[s] = "."
-    for s, ch in (extra or {}).items(): chars[s] = ch
-    for row in range(n_rows):
-        print("   " + " ".join(chars[row * n_cols:(row + 1) * n_cols]))
+GRID_LIGHT = GridTheme(template="plotly_white", background="white", floor="#f2f2f2", wall="#9a9a9a")
+GRID_DARK = GridTheme(template="plotly_dark", background="black", floor="#9e9d9d", wall="#4f4f4f")
+GRID_TERMINAL = colors[4] # terminal cell fill, the same in both themes
+GRID_INK, GRID_ARROW = "#4a4a4a", colors[2] # labels and policy arrows, drawn on the cells in both themes
+
+def grid_xy(s, shape):
+    """Convert a state id to (x, y) plot coordinates, with grid row 0 drawn at the top.
+
+    Parameters
+    ----------
+    s : int
+        The state, numbered ``row * n_cols + col``.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+
+    Returns
+    -------
+    x, y : int
+        The column, and the row counted up from the bottom.
+    """
+    n_rows, n_cols = shape
+    row, col = divmod(int(s), n_cols)
+    return col, n_rows - 1 - row
+
+def grid_panels(panel_titles, shape, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Make an empty figure with one subplot per panel, each holding a grid of square cells.
+
+    The figure is tall enough for every cell to be ``cell_px`` pixels high and takes the page
+    width; the cells stay square. The panels are laid out left to right, then top to bottom.
+
+    Parameters
+    ----------
+    panel_titles : list of str
+        One title per panel.
+    shape : tuple of (int, int)
+        The (n_rows, n_cols) of the grid. Every panel shares it.
+    title : str, default ""
+        The figure title. Plotly HTML (<b>, <br>, <sup>) works.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        The figure, with the axes of every panel hidden and scaled so the cells are square.
+    """
+    n_rows, n_cols = shape
+    n_panels = len(panel_titles)
+    n_panel_cols = n_panel_cols or n_panels
+    n_panel_rows = -(-n_panels // n_panel_cols) # ceiling division
+    gap_x_px, gap_y_px = 20, 40 # between panels
+    plot_width = n_panel_cols * n_cols * cell_px + (n_panel_cols - 1) * gap_x_px
+    plot_height = n_panel_rows * n_rows * cell_px + (n_panel_rows - 1) * gap_y_px
+
+    fig = make_subplots(
+        rows=n_panel_rows,
+        cols=n_panel_cols,
+        subplot_titles=[f"<b>{t}</b>" for t in panel_titles],
+        horizontal_spacing=gap_x_px / plot_width,
+        vertical_spacing=gap_y_px / plot_height
+    )
+
+    for row in range(1, n_panel_rows + 1):
+        for col in range(1, n_panel_cols + 1):
+            x_axis = fig.get_subplot(row, col).xaxis.plotly_name.replace("axis", "")
+            fig.update_xaxes(range=[-0.55, n_cols - 0.45], visible=False, constrain="domain",
+                             row=row, col=col)
+            fig.update_yaxes(range=[-0.55, n_rows - 0.45], visible=False, scaleanchor=x_axis,
+                             constrain="domain", row=row, col=col)
+
+    margin = dict(l=10, r=10, b=10, t=(80 if title else 0) + 30)
+    fig.update_layout(
+        title=title,
+        height=plot_height + margin["t"] + margin["b"],
+        margin=margin,
+        template=theme.template,
+        plot_bgcolor=theme.background,
+        showlegend=False
+    )
+    return fig
+
+def draw_cells(fig, env, fills, labels, row=1, col=1, pad=0.04):
+    """Draw one filled square per state into a subplot, with an optional label on top.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    env : Env
+        Supplies the grid shape.
+    fills : list of str, length n_states
+        The fill color of each state's cell.
+    labels : dict of {int: str}
+        Text drawn in the middle of a cell, by state, e.g. ``{start: "S"}``.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    pad : float, default 0.04
+        Gap around each cell, in cell widths.
+    """
+    for s in range(env.n_states):
+        x, y = grid_xy(s, env.shape)
+        fig.add_shape(
+            type="rect",
+            x0=x - 0.5 + pad,
+            x1=x + 0.5 - pad,
+            y0=y - 0.5 + pad,
+            y1=y + 0.5 - pad,
+            fillcolor=fills[s],
+            line_width=0,
+            layer="below",
+            row=row, col=col
+        )
+    for s, label in labels.items():
+        x, y = grid_xy(s, env.shape)
+        fig.add_annotation(x=x, y=y, text=f"<b>{label}</b>", showarrow=False,
+                           font=dict(size=14, color=GRID_INK), row=row, col=col)
 ```
 
 The four environments. All are undiscounted ($\gamma = 1$).
 
-- **`walk19`**: Nineteen states in a row, absorbing on both ends, $-1$ for stepping off the left end and $+1$ off the right, always starting in the centre.
+- **`walk19`**: Nineteen states in a row, absorbing on both ends, $-1$ for stepping off the left end and $+1$ off the right, always starting in the center.
 - **`room`**: A $6\times10$ open room, every reward $0$ except $+1$ for reaching the goal in the top-right corner.
 - **`windy`**: a $7\times10$ grid with an upward wind of 0-2 cells depending on the column you leave from, $-1$ per step.
 - **`cliff`**: a $4\times12$ grid where stepping into the bottom-row cliff costs $-100$ and teleports you back to the start.
 
 ```{python}
-def walk_env(n_walk=19):
-    """A random walk on n_walk states in a row with absorbing ends: -1 for stepping off the
-    left end, +1 off the right, 0 everywhere else, always starting in the middle."""
+def walk_env(n_walk=19, left_end_reward=-1.0, right_end_reward=1.0):
+    """Build a random walk on ``n_walk`` states in a row, with absorbing ends.
+
+    Stepping off the left end earns ``left_end_reward``, stepping off the right end
+    ``right_end_reward``, and every other step 0. Every episode starts in the middle state.
+
+    Parameters
+    ----------
+    n_walk : int, default 19
+        Number of non-terminal states. Use an odd number so there is a middle state.
+    left_end_reward, right_end_reward : float, default -1.0, 1.0
+        Rewards for stepping off the left end and off the right end.
+
+    Returns
+    -------
+    Env
+        The walk, with ``n_walk + 2`` states (the two ends included) and 2 actions: 0 steps
+        left, 1 steps right.
+    """
     n_states = n_walk + 2
     def step(s, a): # a = 0 left, a = 1 right
+        """The step function for `make_env`: one step left or right.
+
+        Parameters
+        ----------
+        s : int
+            The current state, 1 to ``n_walk``.
+        a : {0, 1}
+            0 steps left, 1 steps right.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``left_end_reward`` for the step into the left end, ``right_end_reward`` into the
+            right end, 0.0 otherwise.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         s_next = s - 1 if a == 0 else s + 1
-        return s_next, (-1.0 if s_next == 0 else 1.0 if s_next == n_states - 1 else 0.0), 0.0
+        return s_next, (left_end_reward if s_next == 0 else right_end_reward if s_next == n_states - 1 else 0.0), 0.0
     return make_env(f"walk{n_walk}", n_states, 2, step, [0, n_states - 1],
                     [(n_states - 1) // 2], shape=(1, n_states))
 
-def room_env(n_rows=6, n_cols=10):
-    """Figure 7.4's board: an open room, every reward 0 except +1 for reaching the goal in the
-    top-right corner. Until an episode reaches G there is nothing at all to learn."""
+def room_env(n_rows=6, n_cols=10, goal_reward=1.0):
+    """Build Figure 7.4's board: an open room with the goal in the top-right corner.
+
+    Every reward is 0 except ``goal_reward`` for the step into the goal, so until an episode
+    reaches G there is nothing at all to learn. Episodes start in the bottom-left corner. Moves
+    are deterministic, and a move into the wall leaves the agent where it is.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 6, 10
+        Size of the room.
+    goal_reward : float, default 1.0
+        Reward for the step into the goal.
+
+    Returns
+    -------
+    Env
+        The room, with 4 actions (UP, DOWN, LEFT, RIGHT).
+    """
     goal = n_cols - 1
     start = (n_rows - 1) * n_cols
     def step(s, a):
+        """The step function for `make_env`: one deterministic move.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``goal_reward`` for the step into the goal, 0.0 otherwise.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         row, col = _move(*divmod(s, n_cols), a, n_rows, n_cols)
         s_next = row * n_cols + col
-        return s_next, (1.0 if s_next == goal else 0.0), 0.0
+        return s_next, (goal_reward if s_next == goal else 0.0), 0.0
     return make_env("room", n_rows * n_cols, 4, step, [goal], [start], shape=(n_rows, n_cols))
 ```
 
@@ -200,23 +424,98 @@ def room_env(n_rows=6, n_cols=10):
 ```{python}
 WIND = np.array([0, 0, 0, 1, 1, 1, 2, 2, 1, 0])
 
-def windy_env(n_rows=7, n_cols=10):
+def windy_env(n_rows=7, n_cols=10, step_reward=-1.0):
+    """Build the windy gridworld.
+
+    After each move, the wind of the column the agent leaves, ``WIND[col]``, pushes it that many
+    rows up, stopping at the top edge. Episodes start at row 3, column 0, and the goal is row 3,
+    column 7. Every step earns ``step_reward``, without noise.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 7, 10
+        Size of the grid.
+    step_reward : float, default -1.0
+        Reward on every step.
+
+    Returns
+    -------
+    Env
+        The gridworld, with 4 actions.
+    """
     def step(s, a):
+        """The step function for `make_env`: one move, then the wind.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``step_reward`` on every step.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         row, col = divmod(s, n_cols)
         row_next, col_next = _move(row, col, a, n_rows, n_cols)
         row_next = max(row_next - WIND[col], 0)   # wind of the column you leave, blowing up
-        return row_next * n_cols + col_next, -1.0, 0.0
+        return row_next * n_cols + col_next, step_reward, 0.0
     return make_env("windy", n_rows * n_cols, 4, step, [3 * n_cols + 7], [3 * n_cols],
                     shape=(n_rows, n_cols))
 
-def cliff_env(n_rows=4, n_cols=12):
+def cliff_env(n_rows=4, n_cols=12, step_reward=-1.0, cliff_reward=-100.0):
+    """Build the cliff-walking gridworld.
+
+    The start and the goal are the two bottom corners, and the cells between them are the cliff.
+    Stepping into the cliff earns ``cliff_reward`` and sends the agent back to the start, without
+    ending the episode, so the cliff cells themselves are never occupied. Every other step earns
+    ``step_reward``. Rewards have no noise.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 4, 12
+        Size of the grid.
+    step_reward : float, default -1.0
+        Reward for a step that does not enter the cliff.
+    cliff_reward : float, default -100.0
+        Reward for stepping into the cliff.
+
+    Returns
+    -------
+    Env
+        The gridworld, with 4 actions.
+    """
     start_state = (n_rows - 1) * n_cols
     goal = (n_rows - 1) * n_cols + n_cols - 1
     cliff_cells = {(n_rows - 1) * n_cols + col for col in range(1, n_cols - 1)}
     def step(s, a):
+        """The step function for `make_env`: one move, or a fall into the cliff.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state: the start state after a fall.
+        reward_mean : float
+            ``cliff_reward`` for a fall into the cliff, ``step_reward`` otherwise.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         row, col = _move(*divmod(s, n_cols), a, n_rows, n_cols)
         s_next = row * n_cols + col
-        return (start_state, -100.0, 0.0) if s_next in cliff_cells else (s_next, -1.0, 0.0)
+        return (start_state, cliff_reward, 0.0) if s_next in cliff_cells else (s_next, step_reward, 0.0)
     return make_env("cliff", n_rows * n_cols, 4, step, [goal], [start_state],
                     shape=(n_rows, n_cols))
 
@@ -229,6 +528,34 @@ The same DP Oracle deal we have been implementing across the last few chapters.
 
 ```{python}
 def make_dp(env, n_iters=2000):
+    """Compile exact dynamic programming for one environment: the "DP oracle".
+
+    Both solvers start from v = 0 and apply ``n_iters`` synchronous sweeps, with terminal
+    states held at 0. Policy evaluation applies the Bellman expectation backup,
+
+        v(s) <- sum_a pi(a|s) [ r(s, a) + gamma * sum_s' p(s'|s, a) v(s') ],
+
+    and value iteration applies the Bellman optimality backup, a max over the legal actions
+    in place of the sum over pi.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model: ``P``, ``reward_mean``, ``terminal`` and ``legal_actions``.
+    n_iters : int, default 2000
+        Number of sweeps for each solver.
+
+    Returns
+    -------
+    evaluate_policy : callable
+        ``evaluate_policy(pi, gamma) -> v_pi``, with ``pi`` of shape (n_states, n_actions)
+        and ``v_pi`` of shape (n_states,).
+    optimal_values : callable
+        ``optimal_values(gamma) -> v_*``, shape (n_states,).
+    action_values_of : callable
+        ``action_values_of(v, gamma) -> q``, the one-step lookahead
+        ``q(s, a) = r(s, a) + gamma * sum_s' p(s'|s, a) v(s')``, shape (n_states, n_actions).
+    """
     P = pt.as_tensor_variable(env.P)
     reward = pt.as_tensor_variable(env.reward_mean)
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
@@ -238,12 +565,58 @@ def make_dp(env, n_iters=2000):
     v_in = pt.vector("v")
 
     def q_from(v, gamma):
+        """One-step lookahead: turn state values into action values.
+
+            q(s, a) = r(s, a) + gamma * sum_s' p(s'|s, a) v(s')
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            State values.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states, n_actions)
+            The action values q(s, a).
+        """
         return reward + gamma * (P * v[None, None, :]).sum(axis=2)
 
-    def expectation_step(v, pi, gamma): # v_{k+1}(s) = sum_a pi(a|s) q_k(s, a)
+    def expectation_step(v, pi, gamma):
+        """One sweep of policy evaluation: v_{k+1}(s) = sum_a pi(a|s) q_k(s, a), terminals held at 0.
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            The values v_k from the previous sweep.
+        pi : TensorVariable, shape (n_states, n_actions)
+            The policy pi(a|s).
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states,)
+            The values v_{k+1}.
+        """
         return not_terminal * (pi * q_from(v, gamma)).sum(axis=1)
 
-    def optimality_step(v, gamma): # v_{k+1}(s) = max over the legal a of q_k(s, a)
+    def optimality_step(v, gamma):
+        """One sweep of value iteration: v_{k+1}(s) = max over the legal a of q_k(s, a), terminals held at 0.
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            The values v_k from the previous sweep.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states,)
+            The values v_{k+1}.
+        """
         q = pt.where(legal_actions > 0, q_from(v, gamma), NEG_INF)
         return not_terminal * q.max(axis=1)
 
@@ -269,10 +642,33 @@ def make_dp(env, n_iters=2000):
 
 
 ```{python}
+GAMMA_WALK = 1.0 # every environment in this chapter is undiscounted
+GAMMA_ROOM = 1.0
+GAMMA_WINDY = 1.0
+GAMMA_CLIFF = 1.0
+
 ORACLE = {e.name: make_dp(e) for e in (walk19, room, windy, cliff)}
 
-def exact(env, gamma=1.0, pi=None):
-    "v_pi if a policy is given, else v_*; always with the matching action values."
+def exact(env, gamma, pi=None):
+    """Return the exact state and action values from the DP oracle in ``ORACLE[env.name]``.
+
+    Parameters
+    ----------
+    env : Env
+        The environment. Its oracle must already be in ``ORACLE``.
+    gamma : float
+        Discount factor.
+    pi : ndarray, shape (n_states, n_actions), optional
+        A policy, as pi(a|s). If given, return v_pi and q_pi; otherwise v_* and q_*.
+
+    Returns
+    -------
+    v : ndarray, shape (n_states,)
+        v_pi or v_*.
+    q : ndarray, shape (n_states, n_actions)
+        The matching action values, ``r(s, a) + gamma * sum_s' p(s'|s, a) v(s')``, set to 0
+        in terminal states.
+    """
     evaluate_policy, optimal_values, action_values_of = ORACLE[env.name]
     v = evaluate_policy(pi, gamma) if pi is not None else optimal_values(gamma)
     q = action_values_of(v, gamma)
@@ -280,6 +676,22 @@ def exact(env, gamma=1.0, pi=None):
     return v, q
 
 def greedy_pi(Q, env):
+    """Return the deterministic greedy policy of a Q table, as a pi(a|s) matrix.
+
+    Ties go to the lowest-numbered legal action.
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    env : Env
+        Supplies the legal actions.
+
+    Returns
+    -------
+    ndarray, shape (n_states, n_actions)
+        1.0 on the greedy legal action of each state, 0.0 elsewhere.
+    """
     pi = np.zeros((env.n_states, env.n_actions))
     pi[np.arange(env.n_states),
        np.where(env.legal_actions > 0, Q, NEG_INF).argmax(axis=1)] = 1.0
@@ -287,7 +699,7 @@ def greedy_pi(Q, env):
 
 inner_states = np.arange(1, 20)                       # the 19 non-terminal walk states
 pi_walk = np.ones((walk19.n_states, 2)) / 2           # the equiprobable random policy
-v_walk, _ = exact(walk19, 1.0, pi_walk)
+v_walk, _ = exact(walk19, GAMMA_WALK, pi_walk)
 ```
 
 ## Simulator
@@ -299,6 +711,30 @@ That padding does more work in this chapter than it did in the last one. An $n$-
 
 ```{python}
 def make_rollout(env, seed):
+    """Compile a batched episode simulator for one environment.
+
+    Rolls out many episodes in parallel for ``max_steps`` steps each, under a behavior policy b.
+    At every step,
+
+        A_t ~ b(. | S_t),    S_{t+1} ~ p(. | S_t, A_t),    R_{t+1} ~ N(r_mu(S_t, A_t), r_sigma(S_t, A_t)).
+
+    Terminal states absorb with reward 0, so the steps after an episode ends are padding. The
+    random generator state carries over between calls.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model: ``P``, ``reward_mean`` and ``reward_sd``.
+    seed : int
+        Seed for the simulator's random generator.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(b, s_start, max_steps) -> (S, A, R, S_next)``. ``b`` has
+        shape (n_states, n_actions) and ``s_start`` is int64 of shape (n_episodes,). Each output
+        has shape (max_steps, n_episodes), and row t holds S_t, A_t, R_{t+1} and S_{t+1}.
+    """
     P = pt.as_tensor_variable(env.P)
     reward_mean = pt.as_tensor_variable(env.reward_mean)
     reward_sd = pt.as_tensor_variable(env.reward_sd)
@@ -308,6 +744,28 @@ def make_rollout(env, seed):
     max_steps = pt.iscalar("T")
 
     def step(s, rng, pi):
+        """Advance every episode by one time step: draw A_t, then S_{t+1} and R_{t+1}.
+
+        Parameters
+        ----------
+        s : TensorVariable of int, shape (n_episodes,)
+            The current states S_t.
+        rng : RandomGeneratorSharedVariable
+            The random generator state, threaded through the scan.
+        pi : TensorVariable, shape (n_states, n_actions)
+            The policy being rolled out (the behavior policy b).
+
+        Returns
+        -------
+        s_next : TensorVariable of int, shape (n_episodes,)
+            The next states S_{t+1}.
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_episodes,)
+            The actions A_t.
+        r : TensorVariable, shape (n_episodes,)
+            The rewards R_{t+1}.
+        """
         rng, a = rng.categorical(p=pi[s]) # A_t ~ b(.|S_t)
         rng, s_next = rng.categorical(p=P[s, a]) # S_{t+1} ~ p(.|S_t,A_t)
         rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a]) # R_{t+1}
@@ -325,9 +783,40 @@ def make_rollout(env, seed):
                              updates={rng_shared: rng_final})
 
 def episodes_for(rollout, env, b, n_episodes, n_learners, max_steps, pi=None):
-    """One rollout call under the behavior policy b, reshaped into
-    (n_episodes, max_steps, n_learners) so learner r sees its own stream of episodes in order.
-    rho is pi(A|S)/b(A|S), and 1 on the padded steps past termination."""
+    """Simulate a stream of episodes for every learner under the behavior policy b, in one rollout call.
+
+    Start states are drawn from ``env.start``. The (max_steps, n_episodes * n_learners) rollout is
+    reshaped to (n_episodes, max_steps, n_learners), so that learner r sees its own stream of
+    ``n_episodes`` episodes in order. The importance ratio at each step is
+
+        rho_t = pi(A_t | S_t) / b(A_t | S_t),
+
+    set to 1 on the padded steps past termination, and everywhere when no target policy is given.
+
+    Parameters
+    ----------
+    rollout : callable
+        A simulator from `make_rollout` for ``env``.
+    env : Env
+        Supplies the start-state distribution and the terminal states.
+    b : ndarray, shape (n_states, n_actions)
+        The behavior policy that generates the episodes.
+    n_episodes : int
+        Episodes per learner.
+    n_learners : int
+        Number of independent learners.
+    max_steps : int
+        Steps per episode. An episode that has not terminated by then is cut off.
+    pi : ndarray, shape (n_states, n_actions), optional
+        The target policy. If omitted, every ratio is 1 (on-policy).
+
+    Returns
+    -------
+    S, A, R, rho : ndarray, shape (n_episodes, max_steps, n_learners)
+        The states, actions, rewards R_{t+1} and importance ratios at every step.
+    frac_finished : float
+        The fraction of episodes that reached a terminal state within ``max_steps``.
+    """
     n_chains = n_episodes * n_learners
     s_start = np_rng.choice(np.flatnonzero(env.start > 0), size=n_chains,
                             p=env.start[env.start > 0]).astype("int64")
@@ -344,7 +833,7 @@ rollout_walk = make_rollout(walk19, 2026)
 
 # $n$-step TD prediction
 
-The $$-step return sits between the full return that Monte Carlo targets and the one reward plus a bootstrap that TD(0) targets.
+The $n$-step return sits between the full return that Monte Carlo targets and the one reward plus a bootstrap that TD(0) targets.
 
 $$
 \underbrace{G_t}_{\text{MC}}
@@ -379,9 +868,48 @@ The `V` carried through the scan at iteration $\tau$ is the one produced by all 
 
 ```{python}
 def make_n_step_predict(env, n, kind="on_policy"):
-    """n-step TD prediction.  kind = 'on_policy' | 'importance_sampling' | 'control_variates'.
-    Episodes arrive as (n_episodes, max_steps, n_learners); V comes back after every episode.
-    alpha is an (n_learners,) vector, which is how the step-size sweeps run as one call."""
+    """Compile n-step TD prediction for many learners at once: on-policy, or off-policy two ways.
+
+    Each learner walks its own episodes in order. At each time tau it updates the state S_tau
+    from the window S_tau .. S_{tau+n}, R_{tau+1} .. R_{tau+n},
+
+        V(S_tau) <- V(S_tau) + alpha * weight * [ G - V(S_tau) ],
+
+    where, with V of a terminal state counted as 0,
+
+    - 'on_policy': ``G = G_{tau:tau+n} = sum_{k<n} gamma^k R_{tau+k+1} + gamma^n V(S_{tau+n})``,
+      weight 1;
+    - 'importance_sampling': the same G, ``weight = rho_{tau:tau+n-1}``, the product of the
+      window's ratios;
+    - 'control_variates': weight 1, and the per-decision return built backward from
+      ``G_{h:h} = V(S_h)`` with ``G_{j:h} = rho_j (R_{j+1} + gamma G_{j+1:h}) + (1 - rho_j) V(S_j)``.
+
+    Past the end of an episode the rewards are 0 and V of the terminal state is 0, so the
+    n-step return collapses to the full return, and states after termination are not updated.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the terminal states.
+    n : int
+        Number of steps in the return.
+    kind : {'on_policy', 'importance_sampling', 'control_variates'}, default 'on_policy'
+        Which return and weight to use.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(S, R, rho, V_init, alpha, gamma) -> V``:
+
+        - ``S``: int64, shape (n_episodes, max_steps, n_learners).
+        - ``R``, ``rho``: shape (n_episodes, max_steps, n_learners), the rewards R_{t+1} and the
+          importance ratios (all 1 on-policy).
+        - ``V_init``: shape (n_learners, n_states).
+        - ``alpha``: shape (n_learners,), each learner's step size, which is how the step-size
+          sweeps run as one call.
+        - ``gamma``: float, the discount factor.
+        - ``V``: shape (n_episodes, n_learners, n_states), the values after each episode.
+    """
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
     S_all = pt.ltensor3("S")
     R_all = pt.dtensor3("R")
@@ -389,11 +917,37 @@ def make_n_step_predict(env, n, kind="on_policy"):
     V_init = pt.dmatrix("V0")
     alpha = pt.dvector("alpha")
     gamma = pt.scalar("g")
-    gamma_pow = (gamma ** pt.arange(n + 1))[:, None] # gamma^0 .. gamma^n
+    gamma_powers = (gamma ** pt.arange(n + 1))[:, None] # gamma^0 .. gamma^n
 
-    def transition(tau, V, S_ep, R_ep, rho_ep, alpha, gamma, gamma_pow):
-        """The update at time tau.  The window is sliced out of the episode, and the return over it
-        is scanned rather than unrolled, so the graph is the same size whatever n is."""
+    def transition(tau, V, S_ep, R_ep, rho_ep, alpha, gamma, gamma_powers):
+        """Apply the update at time tau, for every learner.
+
+        The window is sliced out of the episode. For control variates the return over it is
+        scanned rather than unrolled, so the graph is the same size whatever n is.
+
+        Parameters
+        ----------
+        tau : TensorVariable of int, scalar
+            The time whose state is updated, supplied by the scan sequence.
+        V : TensorVariable, shape (n_learners, n_states)
+            The values before the update: the book's V_{tau+n-1}.
+        S_ep : TensorVariable of int, shape (max_steps, n_learners)
+            One episode's states.
+        R_ep, rho_ep : TensorVariable, shape (max_steps, n_learners)
+            Its rewards R_{t+1} and importance ratios.
+        alpha : TensorVariable, shape (n_learners,)
+            Each learner's step size.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        gamma_powers : TensorVariable, shape (n + 1, 1)
+            gamma^0 .. gamma^n.
+
+        Returns
+        -------
+        TensorVariable, shape (n_learners, n_states)
+            The values after the update. Only V(S_tau) changes, and not at all once the episode
+            has ended.
+        """
         S_win = S_ep[tau:tau + n + 1] # S_tau .. S_{tau+n}, (n+1, n_learners)
         R_win = R_ep[tau:tau + n] # R_{tau+1} .. R_{tau+n}, (n, n_learners)
         rho_win = rho_ep[tau:tau + n] # rho_tau .. rho_{tau+n-1}, (n, n_learners)
@@ -406,7 +960,28 @@ def make_n_step_predict(env, n, kind="on_policy"):
         if kind == "control_variates":
 
             def down_one_level(rho_j, R_j, V_j, G, gamma):
-                "G_{j:h} = rho_j (R_{j+1} + gamma G_{j+1:h}) + (1 - rho_j) V(S_j)"
+                """One level of the per-decision return with control variates, walking backward.
+
+                    G_{j:h} = rho_j (R_{j+1} + gamma G_{j+1:h}) + (1 - rho_j) V(S_j)
+
+                Parameters
+                ----------
+                rho_j : TensorVariable, shape (n_learners,)
+                    The importance ratio at time j, supplied by the scan sequence.
+                R_j : TensorVariable, shape (n_learners,)
+                    The reward R_{j+1}, supplied by the scan sequence.
+                V_j : TensorVariable, shape (n_learners,)
+                    V(S_j), 0 at a terminal state, supplied by the scan sequence.
+                G : TensorVariable, shape (n_learners,)
+                    The return one level down, G_{j+1:h}.
+                gamma : TensorVariable, scalar
+                    Discount factor.
+
+                Returns
+                -------
+                TensorVariable, shape (n_learners,)
+                    The return G_{j:h}.
+                """
                 return rho_j * (R_j + gamma * G) + (1 - rho_j) * V_j
 
             G_levels = pytensor.scan( # from the base case back up to tau
@@ -417,18 +992,40 @@ def make_n_step_predict(env, n, kind="on_policy"):
                 return_updates=False)
             G, weight = G_levels[-1], 1.0
         else:
-            G = (gamma_pow[:n] * R_win).sum(axis=0) + gamma_pow[n] * V_win[n]
+            G = (gamma_powers[:n] * R_win).sum(axis=0) + gamma_powers[n] * V_win[n]
             weight = rho_win.prod(axis=0) if kind == "importance_sampling" else 1.0
 
         return pt.inc_subtensor(V[learners, s_tau],
                                 alpha * still_running * weight * (G - V[learners, s_tau]))
 
-    def episode(S_ep, R_ep, rho_ep, V, alpha, gamma, gamma_pow):
+    def episode(S_ep, R_ep, rho_ep, V, alpha, gamma, gamma_powers):
+        """Run `transition` for tau = 0 .. max_steps - n - 1 over one episode, in order.
+
+        Parameters
+        ----------
+        S_ep : TensorVariable of int, shape (max_steps, n_learners)
+            One episode's states, supplied by the outer scan sequence.
+        R_ep, rho_ep : TensorVariable, shape (max_steps, n_learners)
+            Its rewards R_{t+1} and importance ratios.
+        V : TensorVariable, shape (n_learners, n_states)
+            The values before this episode.
+        alpha : TensorVariable, shape (n_learners,)
+            Each learner's step size.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        gamma_powers : TensorVariable, shape (n + 1, 1)
+            gamma^0 .. gamma^n.
+
+        Returns
+        -------
+        TensorVariable, shape (n_learners, n_states)
+            The values after this episode.
+        """
         V_steps = pytensor.scan(
             fn=transition,
             sequences=pt.arange(S_ep.shape[0] - n), # tau = 0 .. max_steps-n-1
             outputs_info=V,
-            non_sequences=[S_ep, R_ep, rho_ep, alpha, gamma, gamma_pow],
+            non_sequences=[S_ep, R_ep, rho_ep, alpha, gamma, gamma_powers],
             return_updates=False
         )
         return V_steps[-1]
@@ -437,7 +1034,7 @@ def make_n_step_predict(env, n, kind="on_policy"):
         fn=episode,
         sequences=[S_all, R_all, rho_all],
         outputs_info=V_init,
-        non_sequences=[alpha, gamma, gamma_pow],
+        non_sequences=[alpha, gamma, gamma_powers],
         return_updates=False
     )
     return pytensor.function([S_all, R_all, rho_all, V_init, alpha, gamma], V_per_episode)
@@ -448,40 +1045,35 @@ def make_n_step_predict(env, n, kind="on_policy"):
 Below we sweep the step-size $n$ and $\alpha$ over the nineteen-state random walk and compare state value updates and RMSE over the exact $v_\pi$ computed using our DP oracle.
 
 ```{python}
-N_EPISODES, N_LEARNERS, MAX_STEPS, ALPHA = 1, 500, 500, 0.5
+N_EPISODES_ONE, N_LEARNERS_ONE, MAX_STEPS_ONE, ALPHA_ONE = 1, 500, 500, 0.5
 S_one, A_one, R_one, rho_one, frac_one = episodes_for(rollout_walk, walk19, pi_walk,
-                                                      N_EPISODES, N_LEARNERS, MAX_STEPS)
+                                                      N_EPISODES_ONE, N_LEARNERS_ONE, MAX_STEPS_ONE)
 V_after_one = {}
 for n in (1, 2, 4, 8, 16):
     V = make_n_step_predict(walk19, n)(S_one, R_one, rho_one,
-                                       np.zeros((N_LEARNERS, walk19.n_states)),
-                                       np.full(N_LEARNERS, ALPHA), 1.0)
+                                       np.zeros((N_LEARNERS_ONE, walk19.n_states)),
+                                       np.full(N_LEARNERS_ONE, ALPHA_ONE), GAMMA_WALK)
     V_after_one[n] = V[-1]
 ```
 
 ```{python}
-N_EPISODES_F2, N_RUNS_F2, MAX_STEPS_F2 = 10, 100, 500
-GAMMA = 1.0
+N_EPISODES_SWEEP, N_RUNS_SWEEP, MAX_STEPS_SWEEP = 10, 100, 500
 
-alphas_f2 = np.round(np.arange(0.0, 1.01, 0.1), 2)
-n_values_f2 = [1, 2, 4, 8, 16, 32, 64]
+alphas_sweep = np.round(np.arange(0.0, 1.01, 0.1), 2)
+n_values_sweep = [1, 2, 4, 8, 16, 32, 64]
 
-n_learners_f2 = N_RUNS_F2 * len(alphas_f2)
-alpha_per_learner_f2 = np.repeat(alphas_f2, N_RUNS_F2)
-S_f2, A_f2, R_f2, rho_f2, frac_f2 = episodes_for(rollout_walk, walk19, pi_walk, N_EPISODES_F2,
-                                                 n_learners_f2, MAX_STEPS_F2)
-V_init_f2 = np.zeros((n_learners_f2, walk19.n_states))
+n_learners_sweep = N_RUNS_SWEEP * len(alphas_sweep)
+alpha_per_learner_sweep = np.repeat(alphas_sweep, N_RUNS_SWEEP)
+S_sweep, A_sweep, R_sweep, rho_sweep, frac_sweep = episodes_for(rollout_walk, walk19, pi_walk, N_EPISODES_SWEEP,
+                                                 n_learners_sweep, MAX_STEPS_SWEEP)
+V_init_sweep = np.zeros((n_learners_sweep, walk19.n_states))
 
-inner_states = np.arange(1, 20) # the 19 non-terminal walk states
-pi_walk = np.ones((walk19.n_states, 2)) / 2 # the equiprobable random policy
-v_walk, _ = exact(walk19, GAMMA, pi_walk) # Exact undiscounted solution
-
-curves_f2 = {}
-for n in n_values_f2:
-    V = make_n_step_predict(walk19, n)(S_f2, R_f2, rho_f2, V_init_f2, alpha_per_learner_f2, GAMMA)
+curves_sweep = {}
+for n in n_values_sweep:
+    V = make_n_step_predict(walk19, n)(S_sweep, R_sweep, rho_sweep, V_init_sweep, alpha_per_learner_sweep, GAMMA_WALK)
     rmse = np.sqrt(((V[:, :, inner_states] - v_walk[inner_states]) ** 2).mean(axis=2)).mean(axis=0)
-    curves_f2[n] = np.array([rmse[i * N_RUNS_F2:(i + 1) * N_RUNS_F2].mean()
-                             for i in range(len(alphas_f2))])
+    curves_sweep[n] = np.array([rmse[i * N_RUNS_SWEEP:(i + 1) * N_RUNS_SWEEP].mean()
+                             for i in range(len(alphas_sweep))])
 
 
 ```
@@ -493,7 +1085,7 @@ predict_fig = make_subplots(
     rows=1,
     cols=2,
     subplot_titles=(
-        "How episode updates are effected by n (alpha = 0.5)",
+        "How episode updates are affected by n (alpha = 0.5)",
         "RMSE over the first 10 episodes"
     )
 )
@@ -522,9 +1114,9 @@ predict_fig.add_scatter(
     col=1
 )
 
-for i, (n, curve) in enumerate(curves_f2.items()):
+for i, (n, curve) in enumerate(curves_sweep.items()):
     predict_fig.add_scatter(
-        x=alphas_f2,
+        x=alphas_sweep,
         y=curve,
         mode="lines+markers",
         name=f"n={n}",
@@ -558,7 +1150,7 @@ predict_fig = make_subplots(
     rows=1,
     cols=2,
     subplot_titles=(
-        "How episode updates are effected by n (alpha = 0.5)",
+        "How episode updates are affected by n (alpha = 0.5)",
         "RMSE over the first 10 episodes"
     )
 )
@@ -587,9 +1179,9 @@ predict_fig.add_scatter(
     col=1
 )
 
-for i, (n, curve) in enumerate(curves_f2.items()):
+for i, (n, curve) in enumerate(curves_sweep.items()):
     predict_fig.add_scatter(
-        x=alphas_f2,
+        x=alphas_sweep,
         y=curve,
         mode="lines+markers",
         name=f"n={n}",
@@ -654,60 +1246,155 @@ and the policy is $\varepsilon$-greedy in $Q$.
 
 Now that the behavior policy depends on $Q$, we can no longer pre-generate the whole episode and just slice through it. Instead, we keep a rolling buffer of three arrays $(S, A, R)$ of shape `(n_runs, n)` that slide one column per step, ensuring that after the step at time $t$ they hold $S_\tau\ldots S_{t}$, $A_\tau\ldots A_t$ and $R_{\tau+1}\ldots R_{t+1}$ for $\tau = t-n+1$. That is one column short of the window: the live pair $(S_{t+1}, A_{t+1})$ supplies $S_{\tau+n}$ and $A_{\tau+n}$, which is why $A_{t+1}$ is drawn before the update fires.
 
-The buffers are **initialised to a terminal state**, so the mask that suppresses updates past the end of an episode also suppresses the first $n-1$ steps, when the window has not yet filled. Every $Q$ term in each return is read off the *current* $Q$, which corresponds to the book's $Q_{\tau+n-1}$.
+The buffers are **initialized to a terminal state**, so the mask that suppresses updates past the end of an episode also suppresses the first $n-1$ steps, when the window has not yet filled. Every $Q$ term in each return is read off the *current* $Q$, which corresponds to the book's $Q_{\tau+n-1}$.
 
 The following sections differ **only** in the return, so we write the returns once, as a single function, and let the control loop stay fixed. Only the first two branches are used in this section.
 
 
 ```{python}
-def eps_greedy_probs(env, Q, s, eps):
-    "eps-greedy distribution over the legal actions of s, per run -> (..., n_runs, n_actions)"
-    legal_actions = pt.as_tensor_variable(env.legal_actions)
-    runs = pt.arange(Q.shape[0])
-    legal = legal_actions[s]
-    greedy = pt.argmax(pt.where(legal > 0, Q[runs, s], NEG_INF), axis=-1)
+def eps_greedy_probs(legal, q, eps):
+    """Return the ε-greedy distribution over the legal actions of s, for every run.
+
+        pi(a|s) = 1 - eps + eps / n_legal   for the greedy legal action,
+                  eps / n_legal             for every other legal action,
+                  0                         for an illegal action.
+
+    Ties for the greedy action go to the lowest-numbered action.
+
+    Parameters
+    ----------
+    legal : TensorVariable, shape (..., n_runs, n_actions)
+        1.0 where an action is legal in each run's state, optionally with leading axes (e.g. the
+        levels of a window).
+    q : TensorVariable, shape (..., n_runs, n_actions)
+        The action values in those states.
+    eps : TensorVariable, shape (n_runs,)
+        Each run's ε.
+
+    Returns
+    -------
+    TensorVariable, shape (..., n_runs, n_actions)
+        The action probabilities in each state.
+    """
+    greedy = pt.argmax(pt.where(legal > 0, q, NEG_INF), axis=-1)
     probs = legal * (eps / legal.sum(axis=-1))[..., None]
     one_hot = pt.eq(pt.arange(legal.shape[-1]), greedy[..., None])
     return probs + one_hot * (1.0 - eps)[:, None]
 
 
 def n_step_return(env, kind, n, Q, S_win, A_win, R_win, eps_behavior, eps_target, sigma, gamma):
-    """action-value returns over one window.
+    """Return the n-step action-value return over one window, and the weight on its update.
 
-    S_win / A_win are the stacked windows S_tau..S_{tau+n} and A_tau..A_{tau+n} (n+1, n_runs),
-    and R_win is R_{tau+1}..R_{tau+n}, (n, n_runs).  Every Q term is read off
-    the current Q, which is the book's Q_{h-1}. Returns (G, weight)
+    Every Q term is read off the current Q, which is the book's Q_{h-1}, and a terminal state
+    contributes 0. With ``h = tau + n``:
 
-    kind = 'sarsa' gamma^n Q(S_{tau+n}, A_{tau+n})
-           'expected_sarsa' + gamma^n V-bar(S_{tau+n})
-           'off_policy_sarsa' the same G, scaled by rho_{tau+1:tau+n}
-           'q_sigma' sigma = 0 -> tree backup,
-                     sigma = 1 -> per-decision control variates
+    - 'sarsa': ``G = sum_{k<n} gamma^k R_{tau+k+1} + gamma^n Q(S_h, A_h)``, weight 1.
+    - 'expected_sarsa': the same rewards ``+ gamma^n V-bar(S_h)``, where
+      ``V-bar(s) = sum_a pi(a|s) Q(s, a)`` under the target policy, weight 1.
+    - 'off_policy_sarsa': the Sarsa G, weighted by ``rho_{tau+1:tau+n}``, the product of
+      pi(A|S) / b(A|S) over the window after A_tau.
+    - 'q_sigma': weight 1, and G built backward from ``G_{h:h} = Q(S_h, A_h)`` with
 
+          G_{j-1} = R_j + gamma c_j (G_j - Q(S_j, A_j)) + gamma V-bar(S_j),
+          c_j = sigma rho_j + (1 - sigma) pi(A_j | S_j).
+
+      sigma = 0 gives tree backup, sigma = 1 per-decision importance sampling with control
+      variates.
+
+    The target policy is ``eps_target``-greedy in Q and the behavior policy ``eps_behavior``-greedy.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the terminal states and the legal actions.
+    kind : {'sarsa', 'expected_sarsa', 'off_policy_sarsa', 'q_sigma'}
+        Which return to form.
+    n : int
+        Number of steps in the return.
+    Q : TensorVariable, shape (n_runs, n_states, n_actions)
+        The current action values.
+    S_win, A_win : TensorVariable of int, shape (n + 1, n_runs)
+        The windows S_tau .. S_{tau+n} and A_tau .. A_{tau+n}.
+    R_win : TensorVariable, shape (n, n_runs)
+        The rewards R_{tau+1} .. R_{tau+n}.
+    eps_behavior, eps_target : TensorVariable, shape (n_runs,)
+        Each run's behavior and target ε.
+    sigma : TensorVariable, shape (n_runs,)
+        Each run's degree of sampling, used only by 'q_sigma'.
+    gamma : TensorVariable, scalar
+        Discount factor.
+
+    Returns
+    -------
+    G : TensorVariable, shape (n_runs,)
+        The return.
+    weight : TensorVariable, shape (n_runs,), or float
+        The importance weight on the update: ``rho_{tau+1:tau+n}`` for 'off_policy_sarsa',
+        1.0 otherwise.
     """
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
     runs = pt.arange(Q.shape[0])
-    gamma_pow = (gamma ** pt.arange(n + 1))[:, None]
+    gamma_powers = (gamma ** pt.arange(n + 1))[:, None]
 
     def at(s, a):
+        """Look up every per-level quantity the returns need, for (state, action) pairs.
+
+        Parameters
+        ----------
+        s, a : TensorVariable of int, shape (..., n_runs)
+            States and actions, e.g. one level of the window or several stacked.
+
+        Returns
+        -------
+        dict of {str: TensorVariable of shape (..., n_runs)}
+            - ``'q'``: Q(s, a), 0 at a terminal state.
+            - ``'q_bar'``: V-bar(s) = sum_a' pi(a'|s) Q(s, a') under the target policy, 0 at a
+              terminal state.
+            - ``'pi_a'``: pi(a|s), the target policy's probability of a.
+            - ``'rho'``: pi(a|s) / b(a|s), set to 1 at a terminal state.
+        """
         live = not_terminal[s]
-        pi_probs = eps_greedy_probs(env, Q, s, eps_target)
-        b_probs = eps_greedy_probs(env, Q, s, eps_behavior)
+        pi_probs = eps_greedy_probs(legal_actions[s], Q[runs, s], eps_target)
+        b_probs = eps_greedy_probs(legal_actions[s], Q[runs, s], eps_behavior)
         take = lambda probs: pt.take_along_axis(probs, a[..., None], axis=-1)[..., 0]
         pi_a = take(pi_probs)
-        pi_b = take(b_probs)
+        b_a = take(b_probs)
         return dict(
             q=live * Q[runs, s, a], # Q(S, A)
             q_bar=live * (pi_probs * Q[runs, s]).sum(axis=-1), # V-bar(S)
             pi_a=pi_a, # pi(A | S)
-            rho=1.0 + live * (pi_a / pi_b - 1.0)) # 1 when not live and minus 1 to counter the added 1
+            rho=1.0 + live * (pi_a / b_a - 1.0)) # 1 when not live and minus 1 to counter the added 1
 
     if kind == "q_sigma":
         step = at(S_win[1:], A_win[1:]) # levels tau+1 .. tau+n, valued in one go
         c = sigma * step["rho"] + (1 - sigma) * step["pi_a"]  # control variate
 
         def down_one_level(R_j, c_j, q_j, q_bar_j, G, gamma):
-            "G_{j-1} = R_j + gamma c_j (G_j - Q(S_j, A_j)) + gamma V-bar(S_j)"
+            """One level of the Q(sigma) return, walking backward.
+
+                G_{j-1} = R_j + gamma c_j (G_j - Q(S_j, A_j)) + gamma V-bar(S_j)
+
+            Parameters
+            ----------
+            R_j : TensorVariable, shape (n_runs,)
+                The reward R_j, supplied by the scan sequence.
+            c_j : TensorVariable, shape (n_runs,)
+                ``sigma rho_j + (1 - sigma) pi(A_j | S_j)``, supplied by the scan sequence.
+            q_j : TensorVariable, shape (n_runs,)
+                Q(S_j, A_j), supplied by the scan sequence.
+            q_bar_j : TensorVariable, shape (n_runs,)
+                V-bar(S_j), supplied by the scan sequence.
+            G : TensorVariable, shape (n_runs,)
+                The return one level down, G_j.
+            gamma : TensorVariable, scalar
+                Discount factor.
+
+            Returns
+            -------
+            TensorVariable, shape (n_runs,)
+                The return G_{j-1}.
+            """
             return R_j + gamma * c_j * (G - q_j) + gamma * q_bar_j
 
         G_levels = pytensor.scan(
@@ -726,21 +1413,58 @@ def n_step_return(env, kind, n, Q, S_win, A_win, R_win, eps_behavior, eps_target
         bootstrap = step["q_bar"] if kind == "expected_sarsa" else step["q"]
         weight = 1.0
 
-    return (gamma_pow[:n] * R_win).sum(axis=0) + gamma_pow[n] * bootstrap, weight
+    return (gamma_powers[:n] * R_win).sum(axis=0) + gamma_powers[n] * bootstrap, weight
 ```
 
 
 ```{python}
 def make_n_step_control(env, kind, n, seed):
-    """n-step tabular TD control.  behavior is eps_behavior-greedy in Q and the target policy
-    is eps_target-greedy in Q, so equal epsilons make every method on-policy.  
+    """Compile n-step tabular TD control for many runs at once, with the return chosen by ``kind``.
 
-    alpha, eps_behavior, eps_target and sigma are (n_runs,) vectors, which is how the sweeps below
-    run many settings as one batched call."""
+    The behavior policy is ``eps_behavior``-greedy in Q and the target policy ``eps_target``-greedy
+    in Q, so equal ε make every method on-policy. Rolling buffers of the last n states, actions
+    and rewards slide one column per step; with the live pair (S_{t+1}, A_{t+1}) they make up the
+    window for tau = t - n + 1, and after every step
+
+        Q(S_tau, A_tau) <- Q(S_tau, A_tau) + alpha * weight * [ G - Q(S_tau, A_tau) ],
+
+    with G and weight from `n_step_return`. The buffers start out holding a terminal state, so the
+    first n - 1 steps, before the window fills, and the steps after termination update nothing.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model the agent acts in, the legal actions and the start distribution.
+    kind : {'sarsa', 'expected_sarsa', 'off_policy_sarsa', 'q_sigma'}
+        Which return to use; see `n_step_return`.
+    n : int
+        Number of steps in the return.
+    seed : int
+        Seed for the random generator.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function
+        ``(Q_init, alpha, eps_behavior, eps_target, sigma, gamma, n_episodes, max_steps) -> (Q, reward_sum, step_count, done)``:
+
+        - ``Q_init``: shape (n_runs, n_states, n_actions).
+        - ``alpha``, ``eps_behavior``, ``eps_target``, ``sigma``: shape (n_runs,), which is how
+          the sweeps run many settings as one batched call.
+        - ``gamma``: float, the discount factor.
+        - ``Q``: shape (n_runs, n_states, n_actions), the action values after the last episode.
+        - ``reward_sum``, ``step_count``: shape (n_episodes, n_runs), each episode's sum of
+          rewards and number of steps.
+        - ``done``: shape (n_episodes, n_runs), 1.0 where the episode terminated within
+          ``max_steps``.
+
+        The random generator state carries over between calls.
+    """
     P = pt.as_tensor_variable(env.P)
     reward_mean = pt.as_tensor_variable(env.reward_mean)
     reward_sd = pt.as_tensor_variable(env.reward_sd)
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
+    legal_actions = pt.as_tensor_variable(env.legal_actions)
     start_dist = pt.as_tensor_variable(env.start)
     pad_state = int(np.argmax(env.terminal))   # buffer filler: masks the first n-1 updates
     rng_shared = pt.random.shared_rng(seed=seed, name=f"rng_{kind}{n}_{env.name}")
@@ -755,14 +1479,79 @@ def make_n_step_control(env, kind, n, seed):
     max_steps = pt.iscalar("T")
 
     def pick(rng, Q, s, eps):
-        return rng.categorical(p=eps_greedy_probs(env, Q, s, eps))
+        """Draw one action per run from the ε-greedy policy of Q.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+        eps : TensorVariable, shape (n_runs,)
+            Each run's ε.
+
+        Returns
+        -------
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_runs,)
+            The actions.
+        """
+        runs = pt.arange(Q.shape[0])
+        return rng.categorical(p=eps_greedy_probs(legal_actions[s], Q[runs, s], eps))
 
     def shift_in(buffer, x):
-        "drop the oldest column and append x - the window slides one step"
+        """Slide a buffer one step: drop its oldest column and append x.
+
+        Parameters
+        ----------
+        buffer : TensorVariable, shape (n_runs, n)
+            The last n values, oldest first.
+        x : TensorVariable, shape (n_runs,)
+            The newest value.
+
+        Returns
+        -------
+        TensorVariable, shape (n_runs, n)
+            The buffer after the slide.
+        """
         return pt.concatenate([buffer[:, 1:], x[:, None]], axis=1)
 
     def inner(rng, s, a, live, S_buf, A_buf, R_buf, Q, reward_sum, step_count,
               alpha, eps_behavior, eps_target, sigma, gamma):
+        """Take one step in every run, slide the buffers, and update Q(S_tau, A_tau).
+
+        A_{t+1} is drawn before the update, because the window's last pair is (S_{t+1}, A_{t+1}).
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's state S_t and action A_t.
+        live : TensorVariable, shape (n_runs,)
+            1.0 while the run's episode has not terminated, 0.0 after.
+        S_buf, A_buf : TensorVariable of int, shape (n_runs, n)
+            The last n states and actions, oldest first.
+        R_buf : TensorVariable, shape (n_runs, n)
+            The last n rewards, oldest first.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values before the update.
+        reward_sum, step_count : TensorVariable, shape (n_runs,)
+            The episode's sum of rewards and number of steps so far.
+        alpha, eps_behavior, eps_target, sigma : TensorVariable, shape (n_runs,)
+            Each run's settings.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_next, a_next, live, S_buf, A_buf, R_buf, Q, reward_sum, step_count)`` for the
+            next step.
+        """
         runs = pt.arange(Q.shape[0])
         rng, s_next = rng.categorical(p=P[s, a])
         rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a])
@@ -784,6 +1573,30 @@ def make_n_step_control(env, kind, n, seed):
                 reward_sum + live * r, step_count + live)
 
     def episode(rng, s, a, Q, alpha, eps_behavior, eps_target, sigma, gamma, max_steps):
+        """Run one episode in every run, then draw the next episode's start state and action.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's start state and first action.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values at the start of the episode.
+        alpha, eps_behavior, eps_target, sigma : TensorVariable, shape (n_runs,)
+            Each run's settings.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        max_steps : TensorVariable of int, scalar
+            Steps per episode.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_new, a_new, Q, reward_sum, step_count, done)``: the next episode's start
+            state and first action, the action values after this episode, and this episode's
+            sum of rewards, number of steps and done flag, each of shape (n_runs,).
+        """
         zero = pt.zeros_like(not_terminal[s])
         n_runs = Q.shape[0]
         pad = pt.zeros((n_runs, n), dtype="int64")
@@ -863,8 +1676,30 @@ path_S = S_room[:T_room, chosen]
 path_A = A_room[:T_room, chosen]
 path_R = R_room[:T_room, chosen]
 
-def n_step_sarsa_one_episode(n, alpha=ALPHA_ROOM, gamma=1.0):
-    "Sutton & Barto's n-step Sarsa pseudocode, written out for a single recorded episode. Policy Evaluation only."
+def n_step_sarsa_one_episode(n, alpha=ALPHA_ROOM, gamma=GAMMA_ROOM):
+    """Run Sutton & Barto's n-step Sarsa update over the one recorded room episode.
+
+    Policy evaluation only: the actions are the recorded ones (``path_S``, ``path_A``,
+    ``path_R``), not chosen from Q. Starting from Q = 0, for tau = 0 .. T - 1,
+
+        G = sum_{k=tau}^{min(tau+n, T)-1} gamma^(k-tau) R_{k+1}  +  gamma^n Q(S_{tau+n}, A_{tau+n}) if tau + n < T,
+        Q(S_tau, A_tau) <- Q(S_tau, A_tau) + alpha [ G - Q(S_tau, A_tau) ].
+
+    Parameters
+    ----------
+    n : int
+        Number of steps in the return.
+    alpha : float, default ALPHA_ROOM
+        Step size.
+    gamma : float, default GAMMA_ROOM
+        Discount factor.
+
+    Returns
+    -------
+    ndarray, shape (n_states, n_actions)
+        The action values after the episode. Only the pairs whose return reached the goal's
+        +1 are non-zero.
+    """
     Q = np.zeros((room.n_states, room.n_actions))
     for tau in range(T_room):
         horizon = min(tau + n, T_room)
@@ -880,37 +1715,21 @@ Q_room = {n: n_step_sarsa_one_episode(n) for n in (1, 10)}
 
 ```{python}
 #| classes: light-mode
-n_rows_room, n_cols_room = room.shape
 goal_room = int(np.argmax(room.terminal))
 start_room = int(np.argmax(room.start))
+fills_room = [GRID_TERMINAL if s == goal_room else GRID_LIGHT.floor for s in range(room.n_states)]
+path_xy = np.array([grid_xy(s, room.shape) for s in list(path_S) + [goal_room]])
 
-def room_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_room)
-    return col, n_rows_room - 1 - row
-
-room_fig = make_subplots(
-    rows=1,
-    cols=2,
-    subplot_titles=[f"<b>{n}-step Sarsa</b>: {int((Q > 1e-12).sum())} action values updated"
-                    for n, Q in Q_room.items()],
-    horizontal_spacing=1e-10
+room_fig = grid_panels(
+    [f"{n}-step Sarsa: {int((Q > 1e-12).sum())} action values updated" for n, Q in Q_room.items()],
+    room.shape,
+    title="<b>Updates in one episode</b><br><sup>Orange arrows show updated action values</sup>",
+    cell_px=45,
+    theme=GRID_LIGHT
 )
 
-path_xy = np.array([room_xy(s) for s in list(path_S) + [goal_room]])
-pad = 0.04
-
 for col, (n, Q) in enumerate(Q_room.items(), start=1):
-    for s in range(room.n_states):
-        x, y = room_xy(s)
-        room_fig.add_shape(
-            type="rect",
-            x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
-            fillcolor=colors[-1] if s == goal_room else "#f4f4f4",
-            line_width=0,
-            layer="below",
-            row=1, col=col
-        )
+    draw_cells(room_fig, room, fills_room, {start_room: "S", goal_room: "G"}, row=1, col=col)
 
     room_fig.add_scatter(
         x=path_xy[:, 0],
@@ -924,8 +1743,8 @@ for col, (n, Q) in enumerate(Q_room.items(), start=1):
         row=1, col=col
     )
 
-    for s, a in np.argwhere(Q > 1e-12):
-        x, y = room_xy(int(s))
+    for s, a in np.argwhere(Q > 1e-12): # one arrow per updated pair: a cell crossed twice gets two
+        x, y = grid_xy(s, room.shape)
         dx, dy = STEP[int(a)]
         room_fig.add_annotation(
             x=x + 0.42 * dx,
@@ -940,45 +1759,14 @@ for col, (n, Q) in enumerate(Q_room.items(), start=1):
             arrowhead=2,
             arrowsize=1.1,
             arrowwidth=2.6,
-            arrowcolor=colors[2]
+            arrowcolor=GRID_ARROW
         )
 
-    for s, label in ((start_room, "S"), (goal_room, "G")):
-        x, y = room_xy(s)
-        room_fig.add_annotation(
-            x=x,
-            y=y,
-            text=f"<b>{label}</b>",
-            showarrow=False,
-            font=dict(size=15, color="#4a4a4a"),
-            row=1,
-            col=col
-        )
-
-room_fig.update_xaxes(
-    range=[-0.55, n_cols_room - 0.45],
-    showgrid=False,
-    zeroline=False,
-    showticklabels=False
-)
-
-for col, x_axis in enumerate(["x", "x2"], start=1):
-    room_fig.update_yaxes(
-        range=[-0.55, n_rows_room - 0.45],
-        showgrid=False,
-        zeroline=False,
-        showticklabels=False,
-        scaleanchor=x_axis,
-        row=1,
-        col=col
-    )
-
-room_fig.update_layout(
-    title="<b>Updates in one episode</b><br><sup>Orange arrows show updated action values</sup>",
-    plot_bgcolor="white",
-    template="plotly_white",
-    legend=dict(orientation="h", yanchor="top", y=0.02, x=0),
-    margin=dict(t=100, b=100)
+room_fig.update_layout( # grid_panels hides legends; this one names the path, below the grids
+    showlegend=True,
+    legend=dict(orientation="h", yanchor="top", y=-0.02, x=0),
+    height=room_fig.layout.height + 30,
+    margin_b=40
 )
 
 room_fig.show(config=dict(displayModeBar=False))
@@ -986,37 +1774,21 @@ room_fig.show(config=dict(displayModeBar=False))
 
 ```{python}
 #| classes: dark-mode
-n_rows_room, n_cols_room = room.shape
 goal_room = int(np.argmax(room.terminal))
 start_room = int(np.argmax(room.start))
+fills_room = [GRID_TERMINAL if s == goal_room else GRID_DARK.floor for s in range(room.n_states)]
+path_xy = np.array([grid_xy(s, room.shape) for s in list(path_S) + [goal_room]])
 
-def room_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_room)
-    return col, n_rows_room - 1 - row
-
-room_fig = make_subplots(
-    rows=1,
-    cols=2,
-    subplot_titles=[f"<b>{n}-step Sarsa</b>: {int((Q > 1e-12).sum())} action values updated"
-                    for n, Q in Q_room.items()],
-    horizontal_spacing=1e-10
+room_fig = grid_panels(
+    [f"{n}-step Sarsa: {int((Q > 1e-12).sum())} action values updated" for n, Q in Q_room.items()],
+    room.shape,
+    title="<b>Updates in one episode</b><br><sup>Orange arrows show updated action values</sup>",
+    cell_px=45,
+    theme=GRID_DARK
 )
 
-path_xy = np.array([room_xy(s) for s in list(path_S) + [goal_room]])
-pad = 0.04
-
 for col, (n, Q) in enumerate(Q_room.items(), start=1):
-    for s in range(room.n_states):
-        x, y = room_xy(s)
-        room_fig.add_shape(
-            type="rect",
-            x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
-            fillcolor=colors[-1] if s == goal_room else "#9e9d9d",
-            line_width=0,
-            layer="below",
-            row=1, col=col
-        )
+    draw_cells(room_fig, room, fills_room, {start_room: "S", goal_room: "G"}, row=1, col=col)
 
     room_fig.add_scatter(
         x=path_xy[:, 0],
@@ -1030,8 +1802,8 @@ for col, (n, Q) in enumerate(Q_room.items(), start=1):
         row=1, col=col
     )
 
-    for s, a in np.argwhere(Q > 1e-12):
-        x, y = room_xy(int(s))
+    for s, a in np.argwhere(Q > 1e-12): # one arrow per updated pair: a cell crossed twice gets two
+        x, y = grid_xy(s, room.shape)
         dx, dy = STEP[int(a)]
         room_fig.add_annotation(
             x=x + 0.42 * dx,
@@ -1046,45 +1818,14 @@ for col, (n, Q) in enumerate(Q_room.items(), start=1):
             arrowhead=2,
             arrowsize=1.1,
             arrowwidth=2.6,
-            arrowcolor=colors[2]
+            arrowcolor=GRID_ARROW
         )
 
-    for s, label in ((start_room, "S"), (goal_room, "G")):
-        x, y = room_xy(s)
-        room_fig.add_annotation(
-            x=x,
-            y=y,
-            text=f"<b>{label}</b>",
-            showarrow=False,
-            font=dict(size=15, color="#4a4a4a"),
-            row=1,
-            col=col
-        )
-
-room_fig.update_xaxes(
-    range=[-0.55, n_cols_room - 0.45],
-    showgrid=False,
-    zeroline=False,
-    showticklabels=False
-)
-
-for col, x_axis in enumerate(["x", "x2"], start=1):
-    room_fig.update_yaxes(
-        range=[-0.55, n_rows_room - 0.45],
-        showgrid=False,
-        zeroline=False,
-        showticklabels=False,
-        scaleanchor=x_axis,
-        row=1,
-        col=col
-    )
-
-room_fig.update_layout(
-    title="<b>Updates in one episode</b><br><sup>Orange arrows show updated action values</sup>",
-    plot_bgcolor="black",
-    template="plotly_dark",
-    legend=dict(orientation="h", yanchor="top", y=0.02, x=0),
-    margin=dict(t=100, b=100)
+room_fig.update_layout( # grid_panels hides legends; this one names the path, below the grids
+    showlegend=True,
+    legend=dict(orientation="h", yanchor="top", y=-0.02, x=0),
+    height=room_fig.layout.height + 30,
+    margin_b=40
 )
 
 room_fig.show(config=dict(displayModeBar=False))
@@ -1107,7 +1848,7 @@ n_values_windy = [1, 2, 4, 8, 16]
 n_learners_windy = N_RUNS_WINDY * len(alphas_windy)
 repeat_windy = lambda x: np.full(n_learners_windy, float(x))
 Q_init_windy = np.zeros((n_learners_windy, windy.n_states, windy.n_actions))
-v_star_windy, _ = exact(windy)
+v_star_windy, _ = exact(windy, GAMMA_WINDY)
 start_windy = int(np.argmax(windy.start))
 
 steps_windy = {}
@@ -1119,7 +1860,7 @@ for n in n_values_windy:
         repeat_windy(0.1),
         repeat_windy(0.1),
         repeat_windy(1.0),
-        1.0,
+        GAMMA_WINDY,
         N_EPISODES_WINDY,
         MAX_STEPS_WINDY
     )
@@ -1235,58 +1976,73 @@ We test prediction on the random walk, with $b$ the equiprobable policy and $\pi
 
 
 ```{python}
-b_walk = np.ones((walk19.n_states, 2)) / 2 # behaviour: equiprobable
+b_walk = np.ones((walk19.n_states, 2)) / 2 # behavior: equiprobable
 pi_right = np.tile([0.35, 0.65], (walk19.n_states, 1)) # target: tilted right
-v_pi_right, _ = exact(walk19, GAMMA, pi_right)
+v_pi_right, _ = exact(walk19, GAMMA_WALK, pi_right)
 
-N_EPISODES_OFF = 50
-N_RUNS_OFF = 50
-MAX_STEPS_OFF = 500
-alphas_off = np.array([0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8])
-n_values_off = [1, 4, 8, 16]
+N_EPISODES_OFF_POLICY = 50
+N_RUNS_OFF_POLICY = 50
+MAX_STEPS_OFF_POLICY = 500
+alphas_off_policy = np.array([0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8])
+n_values_off_policy = [1, 4, 8, 16]
 
-n_learners_off = N_RUNS_OFF * len(alphas_off)
-alpha_per_learner_off = np.repeat(alphas_off, N_RUNS_OFF)
-S_off, A_off, R_off, rho_off, frac_off = episodes_for(
+n_learners_off_policy = N_RUNS_OFF_POLICY * len(alphas_off_policy)
+alpha_per_learner_off_policy = np.repeat(alphas_off_policy, N_RUNS_OFF_POLICY)
+S_off_policy, A_off_policy, R_off_policy, rho_off_policy, frac_off_policy = episodes_for(
     rollout_walk,
     walk19,
     b_walk,
-    N_EPISODES_OFF,
-    n_learners_off,
-    MAX_STEPS_OFF,
+    N_EPISODES_OFF_POLICY,
+    n_learners_off_policy,
+    MAX_STEPS_OFF_POLICY,
     pi=pi_right
 )
-V_init_off = np.zeros((n_learners_off, walk19.n_states))
+V_init_off_policy = np.zeros((n_learners_off_policy, walk19.n_states))
 
-print("exact v_pi under the right-tilted target policy:")
-print(" ", np.round(v_pi_right[inner_states], 2))
-print(f"rho takes the values {np.unique(np.round(rho_off[~walk19.terminal[S_off]], 3))}, "
-      f"{frac_off:.2%} of episodes finished within T={MAX_STEPS_OFF}")
+print(f"rho takes the values {np.unique(np.round(rho_off_policy[~walk19.terminal[S_off_policy]], 3))}, "
+      f"{frac_off_policy:.2%} of episodes finished within T={MAX_STEPS_OFF_POLICY}")
 ```
 
 ```{python}
-curves_off = {}
-for n in n_values_off:
+state_columns = [str(s) for s in inner_states]
+v_pi_right_rows = pd.DataFrame([dict(zip(state_columns, v_pi_right[inner_states]))])
+
+v_pi_right_table = (
+    GT(v_pi_right_rows)
+    .tab_header(
+        title=html("<b>Exact <i>v</i><sub>π</sub> under the right-tilted target policy</b>"),
+        subtitle=html(f"<i>π</i>(right) = {pi_right[0, 1]:g}, from the DP oracle.")
+    )
+    .tab_spanner(label="State", columns=state_columns)
+    .fmt_number(columns=state_columns, decimals=2)
+    .cols_align("right", columns=state_columns)
+)
+v_pi_right_table
+```
+
+```{python}
+curves_off_policy = {}
+for n in n_values_off_policy:
     for kind in ("importance_sampling", "control_variates"):
         V = make_n_step_predict(walk19, n, kind)(
-            S_off,
-            R_off,
-            rho_off,
-            V_init_off,
-            alpha_per_learner_off,
-            GAMMA
+            S_off_policy,
+            R_off_policy,
+            rho_off_policy,
+            V_init_off_policy,
+            alpha_per_learner_off_policy,
+            GAMMA_WALK
         )
 
         rmse = np.sqrt(((V[:, :, inner_states] - v_pi_right[inner_states]) ** 2
                         ).mean(axis=(2,0))) # average over states and episodes returns shape (n_learners,)
 
-        curves_off[(n, kind)] = np.array([rmse[i * N_RUNS_OFF:(i + 1) * N_RUNS_OFF].mean() # slice out individual learners and average their RMSE returns (num_alphas,)
-                                          for i in range(len(alphas_off))])
+        curves_off_policy[(n, kind)] = np.array([rmse[i * N_RUNS_OFF_POLICY:(i + 1) * N_RUNS_OFF_POLICY].mean() # slice out individual learners and average their RMSE returns (num_alphas,)
+                                          for i in range(len(alphas_off_policy))])
 
-alpha_columns = [f"{a:g}" for a in alphas_off]
+alpha_columns = [f"{a:g}" for a in alphas_off_policy]
 rmse_rows = pd.DataFrame([
-    {"n": f"n = {n}", "kind": kind.replace("_", " "), **dict(zip(alpha_columns, curves_off[(n, kind)]))}
-    for n in n_values_off
+    {"n": f"n = {n}", "kind": kind.replace("_", " ").capitalize(), **dict(zip(alpha_columns, curves_off_policy[(n, kind)]))}
+    for n in n_values_off_policy
     for kind in ("importance_sampling", "control_variates")
 ])
 
@@ -1295,15 +2051,13 @@ SCIENTIFIC_THRESHOLD = 1e3
 rmse_table = (
     GT(rmse_rows, rowname_col="kind", groupname_col="n")
     .tab_header(
-        title=r"RMSE against \(v_\pi\) (ORACLE)",
-        subtitle=f"over the first {N_EPISODES_OFF} episodes, averaged over {N_RUNS_OFF} runs"
+        title=html("<b>RMSE against <i>v</i><sub>π</sub> from the DP oracle</b>"),
+        subtitle=f"Over the first {N_EPISODES_OFF_POLICY} episodes, averaged over {N_RUNS_OFF_POLICY} runs."
     )
-    .tab_spanner(label=r"\(\alpha\)", columns=alpha_columns)
+    .tab_spanner(label="α", columns=alpha_columns)
     .fmt_number(columns=alpha_columns, decimals=3)
-    .tab_options(
-        quarto_disable_processing=True,
-        row_group_background_color="#F4F4F4"
-    )
+    .cols_align("right", columns=alpha_columns)
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
 )
 
 for column in alpha_columns:
@@ -1334,7 +2088,7 @@ $$
 and the update carries **no** $\rho$ out in front.
 
 The second term is the **control variate** which is a quantity with zero mean (since $\mathbb E_b[\rho_t] = 1$) added to reduce variance. Its effect is
-easiest to see in the extreme case where $\rho_t = 0$, which indicates that the target policy would never have taken the action the behaviour policy just took, this then makes the plain importance sampling zero the update and the estimate *shrinks toward zero*, which is nonsense.
+easiest to see in the extreme case where $\rho_t = 0$, which indicates that the target policy would never have taken the action the behavior policy just took, this then makes the plain importance sampling zero the update and the estimate *shrinks toward zero*, which is nonsense.
 
 On the other hand, when $G_{t:h} = V_{h-1}(S_t)$, the target equals the current estimate, and the update is simply *no change*. Therefore, a step
 $\pi$ would never take tells you nothing, and "nothing" would mean "leave it alone", not "move it to zero".
@@ -1356,44 +2110,67 @@ Applying the ratio only to the part of the return that comes after should reduce
 
 
 ```{python}
-N_CHAINS_VAR = 4000
-MAX_STEPS_VAR = 600
+N_CHAINS_VARIANCE = 4000
+MAX_STEPS_VARIANCE = 600
 
-S_var, A_var, R_var, rho_var, frac_var = episodes_for(rollout_walk, walk19, b_walk, 1, N_CHAINS_VAR, MAX_STEPS_VAR, pi=pi_right)
-S_var, R_var, rho_var = S_var[0], R_var[0], rho_var[0] # (max_steps, n_chains)
+S_variance, A_variance, R_variance, rho_variance, frac_variance = episodes_for(rollout_walk, walk19, b_walk, 1, N_CHAINS_VARIANCE, MAX_STEPS_VARIANCE, pi=pi_right)
+S_variance, R_variance, rho_variance = S_variance[0], R_variance[0], rho_variance[0] # (max_steps, n_chains)
 
 V_pinned = v_pi_right.copy() # the fixed point: both targets are unbiased
-value = np.where(walk19.terminal[S_var], 0.0, V_pinned[S_var])
+value = np.where(walk19.terminal[S_variance], 0.0, V_pinned[S_variance])
 
 def updates_at_the_fixed_point(n):
-    "the increment each scheme would apply to V(S_tau), over every window in the batch"
-    horizon = MAX_STEPS_VAR - n
-    window = lambda X, k: X[k:k + horizon]
+    """Return the increment each off-policy scheme would apply to V(S_tau), with V pinned at v_pi.
 
-    G_is = value[n:n + horizon] # plain IS: sum the rewards then bootstrap
-    weight = np.ones_like(G_is)
-    for k in range(n - 1, -1, -1):
-        G_is = window(R_var, k) + GAMMA * G_is
-        weight = weight * window(rho_var, k)
+    Over every window of the batch (``S_variance``, ``R_variance``, ``rho_variance``) whose S_tau is not
+    terminal, with V = v_pi (the fixed point, where both targets are unbiased):
 
-    G_cv = value[n:n + horizon]# control variates
-    for k in range(n - 1, -1, -1):
-        G_cv = window(rho_var, k) * (window(R_var, k) + GAMMA * G_cv) + (1 - window(rho_var, k)) * value[k:k + horizon]
+    - plain importance sampling: ``rho_{tau:tau+n-1} [ G_{tau:tau+n} - V(S_tau) ]``;
+    - control variates: ``G^cv_{tau:tau+n} - V(S_tau)``, with the per-decision return
+      ``G^cv_{j:h} = rho_j (R_{j+1} + gamma G^cv_{j+1:h}) + (1 - rho_j) V(S_j)`` and
+      ``G^cv_{h:h} = V(S_h)``.
 
-    live = ~walk19.terminal[S_var[:horizon]]
-    return (weight * (G_is - value[:horizon]))[live], (G_cv - value[:horizon])[live]
+    Both have mean 0 in expectation, so their spread is the variance each scheme adds.
+
+    Parameters
+    ----------
+    n : int
+        Number of steps in the return.
+
+    Returns
+    -------
+    increment_importance_sampling : ndarray, shape (n_windows,)
+        The plain importance-sampling increments.
+    increment_control_variates : ndarray, shape (n_windows,)
+        The control-variate increments, for the same windows.
+    """
+    horizon = MAX_STEPS_VARIANCE - n
+    window = lambda block, offset: block[offset:offset + horizon]
+
+    G_importance_sampling = value[n:n + horizon] # plain IS: sum the rewards then bootstrap
+    weight = np.ones_like(G_importance_sampling)
+    for offset in range(n - 1, -1, -1):
+        G_importance_sampling = window(R_variance, offset) + GAMMA_WALK * G_importance_sampling
+        weight = weight * window(rho_variance, offset)
+
+    G_control_variates = value[n:n + horizon]# control variates
+    for offset in range(n - 1, -1, -1):
+        G_control_variates = window(rho_variance, offset) * (window(R_variance, offset) + GAMMA_WALK * G_control_variates) + (1 - window(rho_variance, offset)) * value[offset:offset + horizon]
+
+    live = ~walk19.terminal[S_variance[:horizon]]
+    return (weight * (G_importance_sampling - value[:horizon]))[live], (G_control_variates - value[:horizon])[live]
 
 variance_ratio = {}
 increment_rows = []
 for n in (1, 2, 4, 8, 16, 32):
-    increment_is, increment_cv = updates_at_the_fixed_point(n)
-    variance_ratio[n] = increment_is.var() / increment_cv.var()
+    increment_importance_sampling, increment_control_variates = updates_at_the_fixed_point(n)
+    variance_ratio[n] = increment_importance_sampling.var() / increment_control_variates.var()
     increment_rows.append({
         "n": n,
-        "mean_is": increment_is.mean(),
-        "mean_cv": increment_cv.mean(),
-        "sd_is": increment_is.std(),
-        "sd_cv": increment_cv.std(),
+        "mean_importance_sampling": increment_importance_sampling.mean(),
+        "mean_control_variates": increment_control_variates.mean(),
+        "sd_importance_sampling": increment_importance_sampling.std(),
+        "sd_control_variates": increment_control_variates.std(),
         "ratio": variance_ratio[n]
     })
 ```
@@ -1401,27 +2178,28 @@ for n in (1, 2, 4, 8, 16, 32):
 ```{python}
 increment_rows = pd.DataFrame(increment_rows)
 
-(
+increment_table = (
     GT(increment_rows, rowname_col="n")
     .tab_header(
-        title=r"the update applied to \(V(S_\tau)\) with \(V\) pinned at \(v_\pi\)",
-        subtitle=f"over every window in {N_CHAINS_VAR} episodes ({frac_var:.2%} finished)"
+        title=html("<b>The update applied to <i>V</i>(<i>S</i><sub>τ</sub>) with <i>V</i> pinned at <i>v</i><sub>π</sub></b>"),
+        subtitle=f"Over every window in {N_CHAINS_VARIANCE:,} episodes ({frac_variance:.2%} finished)."
     )
-    .tab_stubhead(label=r"\(n\)")
-    .tab_spanner(label="mean", columns=["mean_is", "mean_cv"])
-    .tab_spanner(label="sd", columns=["sd_is", "sd_cv"])
+    .tab_stubhead(label=html("<i>n</i>"))
+    .tab_spanner(label="Mean", columns=["mean_importance_sampling", "mean_control_variates"])
+    .tab_spanner(label="Standard deviation", columns=["sd_importance_sampling", "sd_control_variates"])
     .cols_label(
-        mean_is="importance sampling",
-        mean_cv="control variates",
-        sd_is="importance sampling",
-        sd_cv="control variates",
-        ratio="variance ratio"
+        mean_importance_sampling="Importance sampling",
+        mean_control_variates="Control variates",
+        sd_importance_sampling="Importance sampling",
+        sd_control_variates="Control variates",
+        ratio="Variance ratio"
     )
-    .fmt_number(columns=["mean_is", "mean_cv"], decimals=4)
-    .fmt_number(columns=["sd_is", "sd_cv"], decimals=3)
-    .fmt_number(columns="ratio", decimals=1, pattern="{x}x")
-    .tab_options(quarto_disable_processing=True)
+    .fmt_number(columns=["mean_importance_sampling", "mean_control_variates"], decimals=4)
+    .fmt_number(columns=["sd_importance_sampling", "sd_control_variates"], decimals=3)
+    .fmt_number(columns="ratio", decimals=1, pattern="{x}×")
+    .cols_align("right", columns=["mean_importance_sampling", "mean_control_variates", "sd_importance_sampling", "sd_control_variates", "ratio"])
 )
+increment_table
 ```
 
 
@@ -1442,14 +2220,14 @@ offpolicy_fig = make_subplots(
 )
 
 n_variance = list(variance_ratio)
-sd_is, sd_cv = [], []
+sd_importance_sampling, sd_control_variates = [], []
 for n in n_variance:
-    increment_is, increment_cv = updates_at_the_fixed_point(n)
-    sd_is.append(increment_is.std())
-    sd_cv.append(increment_cv.std())
+    increment_importance_sampling, increment_control_variates = updates_at_the_fixed_point(n)
+    sd_importance_sampling.append(increment_importance_sampling.std())
+    sd_control_variates.append(increment_control_variates.std())
 
-for label, y, color, dash in (("importance sampling", sd_is, colors[2], "dot"),
-                              ("control variates", sd_cv, colors[0], "solid")):
+for label, y, color, dash in (("importance sampling", sd_importance_sampling, colors[2], "dot"),
+                              ("control variates", sd_control_variates, colors[0], "solid")):
     offpolicy_fig.add_scatter(
         x=n_variance,
         y=y,
@@ -1462,11 +2240,11 @@ for label, y, color, dash in (("importance sampling", sd_is, colors[2], "dot"),
         row=1, col=1
     )
 
-for i, n in enumerate(n_values_off):
+for i, n in enumerate(n_values_off_policy):
     for kind, dash in (("importance_sampling", "dot"), ("control_variates", "solid")):
         offpolicy_fig.add_scatter(
-            x=alphas_off,
-            y=curves_off[(n, kind)],
+            x=alphas_off_policy,
+            y=curves_off_policy[(n, kind)],
             mode="lines+markers",
             name=f"n={n}",
             legendgroup=f"n{n}",
@@ -1507,14 +2285,14 @@ offpolicy_fig = make_subplots(
 )
 
 n_variance = list(variance_ratio)
-sd_is, sd_cv = [], []
+sd_importance_sampling, sd_control_variates = [], []
 for n in n_variance:
-    increment_is, increment_cv = updates_at_the_fixed_point(n)
-    sd_is.append(increment_is.std())
-    sd_cv.append(increment_cv.std())
+    increment_importance_sampling, increment_control_variates = updates_at_the_fixed_point(n)
+    sd_importance_sampling.append(increment_importance_sampling.std())
+    sd_control_variates.append(increment_control_variates.std())
 
-for label, y, color, dash in (("importance sampling", sd_is, colors[2], "dot"),
-                              ("control variates", sd_cv, colors[0], "solid")):
+for label, y, color, dash in (("importance sampling", sd_importance_sampling, colors[2], "dot"),
+                              ("control variates", sd_control_variates, colors[0], "solid")):
     offpolicy_fig.add_scatter(
         x=n_variance,
         y=y,
@@ -1527,11 +2305,11 @@ for label, y, color, dash in (("importance sampling", sd_is, colors[2], "dot"),
         row=1, col=1
     )
 
-for i, n in enumerate(n_values_off):
+for i, n in enumerate(n_values_off_policy):
     for kind, dash in (("importance_sampling", "dot"), ("control_variates", "solid")):
         offpolicy_fig.add_scatter(
-            x=alphas_off,
-            y=curves_off[(n, kind)],
+            x=alphas_off_policy,
+            y=curves_off_policy[(n, kind)],
             mode="lines+markers",
             name=f"n={n}",
             legendgroup=f"n{n}",
@@ -1562,7 +2340,7 @@ offpolicy_fig.show(config=dict(displayModeBar=False))
 
 As you can clearly see in the table above, **both schemes are unbiased**. The difference lies in the variance and how much that variance increases as $n$ increases. Plain importance sampling's standard deviation keeps climbing with $n$ while the control-variate version *saturates*, because each $\rho_k$ multiplies only the increment contributed after step $k$, never the accumulated estimate.
 
-The variance explosing is made very clearly in the right-hand panel of the plot above, the dotted importance-sampling curves for $n=8$ and $n=16$ simply leave the top of the plot at large $\alpha$.
+The variance explosion is made very clearly in the right-hand panel of the plot above, the dotted importance-sampling curves for $n=8$ and $n=16$ simply leave the top of the plot at large $\alpha$.
 
 It is important to keep in mind that this is still importance sampling, so it still needs $b$ to cover $\pi$, and it still degrades as the policies separate. And the whole construction assumes we can *evaluate* $\frac{\pi(A_k\mid S_k)}{b(A_k\mid S_k)}$. However, as you will see shortly it is possible to get rid of the ratios entirely.
 
@@ -1589,7 +2367,7 @@ Drag nodes around, or scroll to zoom.
 
 ```{python}
 #| classes: light-mode
-g = nx.DiGraph()
+graph = nx.DiGraph()
 
 STEP_X = 390      # state -> next state along the trajectory
 ACTION_DX = 230   # state -> its row of actions
@@ -1600,8 +2378,8 @@ states = ["Sₜ", "Sₜ₊₁", "Sₜ₊₂", "Sₜ₊₃"]
 takens = ["Aₜ", "Aₜ₊₁", "Aₜ₊₂"]
 rewards = ["Rₜ₊₁", "Rₜ₊₂", "Rₜ₊₃"]
 
-for k, s in enumerate(states):
-    g.add_node(
+for level, s in enumerate(states):
+    graph.add_node(
         s,
         label=s,
         shape="circle",
@@ -1610,18 +2388,18 @@ for k, s in enumerate(states):
         border_color="#0b0b0b",
         border_size=3,
         label_size=30,
-        x=X0 + k * STEP_X, y=0,
+        x=X0 + level * STEP_X, y=0,
     )
 
-for k, s in enumerate(states):
-    x = X0 + k * STEP_X + ACTION_DX
-    horizon = k == len(states) - 1  # past the horizon nothing continues, every action is a leaf
+for level, s in enumerate(states):
+    x = X0 + level * STEP_X + ACTION_DX
+    horizon = level == len(states) - 1  # past the horizon nothing continues, every action is a leaf
 
     # the actions not taken: root has none, we are backing up q(Sₜ, Aₜ) itself
-    sides = (-1, 0, 1) if horizon else ((-1, 1) if k > 0 else ())
+    sides = (-1, 0, 1) if horizon else ((-1, 1) if level > 0 else ())
     for side in sides:
-        leaf = f"leaf {k} {side}"
-        g.add_node(
+        leaf = f"leaf {level} {side}"
+        graph.add_node(
             leaf,
             label=f"Q({s}, a)",
             shape="rectangle",
@@ -1632,11 +2410,11 @@ for k, s in enumerate(states):
             label_size=21,
             x=x, y=side * FAN_DY,
         )
-        g.add_edge(s, leaf, label=f"π(a|{s})", color="#999999", size=1.5, label_color=colors[6])
+        graph.add_edge(s, leaf, label=f"π(a|{s})", color="#999999", size=1.5, label_color=colors[6])
 
     if not horizon:
-        A = takens[k]
-        g.add_node(
+        A = takens[level]
+        graph.add_node(
             A,
             label=A,
             shape="rectangle",
@@ -1648,13 +2426,13 @@ for k, s in enumerate(states):
             x=x, y=0,
         )
         # the root action carries no weight, every later one is weighted by π(A|S)
-        g.add_edge(s, A, label="" if k == 0 else f"π({A}|{s})", color="#999999", size=2.5,
+        graph.add_edge(s, A, label="" if level == 0 else f"π({A}|{s})", color="#999999", size=2.5,
                    label_color=colors[6])
-        g.add_edge(A, states[k + 1], label=rewards[k], color="#999999", size=2.5,
+        graph.add_edge(A, states[level + 1], label=rewards[level], color="#999999", size=2.5,
                    label_color=colors[6])
 
 gv.d3(
-    g,
+    graph,
     graph_height=440,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -1668,19 +2446,19 @@ gv.d3(
 
 ```{python}
 #| classes: dark-mode
-g = nx.DiGraph()
+graph = nx.DiGraph()
 
 STEP_X = 390      # state -> next state along the trajectory
 ACTION_DX = 230   # state -> its row of actions
 FAN_DY = 175      # actions not taken, above and below the one taken
-X0 = -(3 * STEP_X + ACTION_DX) / 2  # centre the tree on the canvas
+X0 = -(3 * STEP_X + ACTION_DX) / 2  # center the tree on the canvas
 
 states = ["Sₜ", "Sₜ₊₁", "Sₜ₊₂", "Sₜ₊₃"]
 takens = ["Aₜ", "Aₜ₊₁", "Aₜ₊₂"]
 rewards = ["Rₜ₊₁", "Rₜ₊₂", "Rₜ₊₃"]
 
-for k, s in enumerate(states):
-    g.add_node(
+for level, s in enumerate(states):
+    graph.add_node(
         s,
         label=s,
         label_color="#faf8f8",
@@ -1690,18 +2468,18 @@ for k, s in enumerate(states):
         border_color="#faf8f8",
         border_size=3,
         label_size=30,
-        x=X0 + k * STEP_X, y=0,
+        x=X0 + level * STEP_X, y=0,
     )
 
-for k, s in enumerate(states):
-    x = X0 + k * STEP_X + ACTION_DX
-    horizon = k == len(states) - 1  # past the horizon nothing continues, every action is a leaf
+for level, s in enumerate(states):
+    x = X0 + level * STEP_X + ACTION_DX
+    horizon = level == len(states) - 1  # past the horizon nothing continues, every action is a leaf
 
     # the actions not taken: root has none, we are backing up q(Sₜ, Aₜ) itself
-    sides = (-1, 0, 1) if horizon else ((-1, 1) if k > 0 else ())
+    sides = (-1, 0, 1) if horizon else ((-1, 1) if level > 0 else ())
     for side in sides:
-        leaf = f"leaf {k} {side}"
-        g.add_node(
+        leaf = f"leaf {level} {side}"
+        graph.add_node(
             leaf,
             label=f"Q({s}, a)",
             label_color="#faf8f8",
@@ -1713,11 +2491,11 @@ for k, s in enumerate(states):
             label_size=21,
             x=x, y=side * FAN_DY,
         )
-        g.add_edge(s, leaf, label=f"π(a|{s})", color="#999999", size=1.5, label_color=colors[6])
+        graph.add_edge(s, leaf, label=f"π(a|{s})", color="#999999", size=1.5, label_color=colors[6])
 
     if not horizon:
-        A = takens[k]
-        g.add_node(
+        A = takens[level]
+        graph.add_node(
             A,
             label=A,
             label_color="#faf8f8",
@@ -1730,15 +2508,15 @@ for k, s in enumerate(states):
             x=x, y=0,
         )
         # the root action carries no weight, every later one is weighted by π(A|S)
-        g.add_edge(s, A, label="" if k == 0 else f"π({A}|{s})", color="#999999", size=2.5,
+        graph.add_edge(s, A, label="" if level == 0 else f"π({A}|{s})", color="#999999", size=2.5,
                    label_color=colors[6])
-        g.add_edge(A, states[k + 1], label=rewards[k], color="#999999", size=2.5,
+        graph.add_edge(A, states[level + 1], label=rewards[level], color="#999999", size=2.5,
                    label_color=colors[6])
 
-g.graph['background_color'] = 'black'
+graph.graph['background_color'] = 'black'
 
 gv.d3(
-    g,
+    graph,
     graph_height=440,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -1752,7 +2530,7 @@ gv.d3(
 
 Notice that no sampling takes place and therefore no importance ratios are used anywhere. We only use the target policy's probabilities, which we already know. The backup simply takes the expectation over actions and continues down only the branch it has data for.
 
-The catch is in that last coefficient. Each level multiplies the continuation by $\pi(A_{k}\mid S_{k})$, so if the behaviour policy takes an action the target policy considers unlikely, the backup is **cut short**. With a greedy target policy, $\pi(A\mid S)$ is either 1 or 0, so a single exploratory action truncates the return.
+The catch is in that last coefficient. Each level multiplies the continuation by $\pi(A_{k}\mid S_{k})$, so if the behavior policy takes an action the target policy considers unlikely, the backup is **cut short**. With a greedy target policy, $\pi(A\mid S)$ is either 1 or 0, so a single exploratory action truncates the return.
 
 Let's test it on the cliff walking environment in the off-policy framework. We will set the behavior policy to follow a $\varepsilon$-greedy with $\varepsilon = 0.3$, so a good amount of exploration, while learning about the
 **greedy** policy, whose exact answer $q_*$ the oracle gives us. Remember that at $n=1$ this is Q-learning, which
@@ -1760,7 +2538,7 @@ gives us a fixed point to check against.
 
 
 ```{python}
-v_star_cliff, q_star_cliff = exact(cliff)
+v_star_cliff, q_star_cliff = exact(cliff, GAMMA_CLIFF)
 start_cliff = int(np.argmax(cliff.start))
 
 optimal_path = [] # the states the optimal policy actually occupies
@@ -1770,81 +2548,94 @@ while not cliff.terminal[s] and len(optimal_path) < 60:
     s = int(cliff.P[s, q_star_cliff[s].argmax()].argmax())
 
 def gap_to_q_star(Q):
-    "worst error in the greedy action value along the optimal path - where the learner has data"
+    """Return the worst error in the optimal action's value along the optimal path.
+
+        max over s on the optimal path of | Q(s, a*) - q_*(s, a*) |,   a* = argmax_a q_*(s, a)
+
+    The optimal path is where the learner has data; elsewhere its values can stay rough.
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values on the cliff.
+
+    Returns
+    -------
+    float
+        The worst error.
+    """
     errors = []
     for s in optimal_path:
         a_star = q_star_cliff[s].argmax()
         errors.append(abs(Q[s, a_star] - q_star_cliff[s, a_star]))
     return max(errors)
 
-N_RUNS_TB = 50
-N_EPISODES_TB = 1000
-MAX_STEPS_TB = 150
+N_RUNS_CLIFF = 50
+N_EPISODES_CLIFF = 1000
+MAX_STEPS_CLIFF = 150
 
-EPS_BEHAVIOUR = 0.3
+EPS_BEHAVIOR = 0.3
 EPS_TARGET = 0.0
-ALPHA_TB = 0.1
+ALPHA_CLIFF = 0.1
 
-n_values_tb = [1, 2, 4, 8]
-repeat_tb = lambda x: np.full(N_RUNS_TB, float(x))
-Q_init_tb = np.zeros((N_RUNS_TB, cliff.n_states, cliff.n_actions))
+n_values_cliff = [1, 2, 4, 8]
+repeat_cliff = lambda x: np.full(N_RUNS_CLIFF, float(x))
+Q_init_cliff = np.zeros((N_RUNS_CLIFF, cliff.n_states, cliff.n_actions))
 
-methods_tb = { # label -> (kind, sigma)
-    "off-policy Sarsa (IS)": ("off_policy_sarsa", 1.0),
-    "per-decision + control variates": ("q_sigma", 1.0),
-    "tree backup": ("q_sigma", 0.0),
+methods_cliff = { # label -> (kind, sigma)
+    "Off-policy Sarsa (IS)": ("off_policy_sarsa", 1.0),
+    "Per-decision + control variates": ("q_sigma", 1.0),
+    "Tree backup": ("q_sigma", 0.0),
 }
 
-results_tb = {}
-for label, (kind, sigma) in methods_tb.items():
-    for n in n_values_tb:
+results_cliff = {}
+for label, (kind, sigma) in methods_cliff.items():
+    for n in n_values_cliff:
         learner = make_n_step_control(cliff, kind, n, seed=n)
         Q, reward_sum, step_count, done = learner(
-            Q_init_tb,
-            repeat_tb(ALPHA_TB),
-            repeat_tb(EPS_BEHAVIOUR),
-            repeat_tb(EPS_TARGET),
-            repeat_tb(sigma),
-            GAMMA,
-            N_EPISODES_TB,
-            MAX_STEPS_TB
+            Q_init_cliff,
+            repeat_cliff(ALPHA_CLIFF),
+            repeat_cliff(EPS_BEHAVIOR),
+            repeat_cliff(EPS_TARGET),
+            repeat_cliff(sigma),
+            GAMMA_CLIFF,
+            N_EPISODES_CLIFF,
+            MAX_STEPS_CLIFF
         )
         Q_mean = Q.mean(axis=0) # Average over runs/learners
-        results_tb[(label, n)] = (Q_mean[start_cliff].max(), gap_to_q_star(Q_mean), reward_sum[-100:].mean(), done.mean())
+        results_cliff[(label, n)] = (Q_mean[start_cliff].max(), gap_to_q_star(Q_mean), reward_sum[-100:].mean(), done.mean())
 
 ```
 
 ```{python}
-metrics_tb = ( # heading -> (which entry of results_tb, decimals)
-    (rf"\(\max_a Q(\text{{start}}, a)\) - exact \(v_* = {v_star_cliff[start_cliff]:.0f}\)", 0, 2),
-    (r"worst \(|Q - q_*|\) along the optimal path", 1, 2),
-    ("online return over the last 100 episodes", 2, 1),
+v_star_start = f"{v_star_cliff[start_cliff]:.0f}".replace("-", "−") # with a true minus sign
+metrics_cliff = ( # heading -> (which entry of results_cliff, decimals)
+    (f"max<sub><i>a</i></sub> <i>Q</i>(start, <i>a</i>), exact <i>v</i><sub>*</sub> = {v_star_start}", 0, 2),
+    ("Worst |<i>Q</i> − <i>q</i><sub>*</sub>| along the optimal path", 1, 2),
+    ("Online return over the last 100 episodes", 2, 1),
 )
 
-n_columns = [str(n) for n in n_values_tb]
+n_columns = [str(n) for n in n_values_cliff]
 control_rows = pd.DataFrame([
     {"metric": heading, "method": label,
-     **{column: results_tb[(label, n)][entry] for column, n in zip(n_columns, n_values_tb)}}
-    for heading, entry, _ in metrics_tb
-    for label in methods_tb
+     **{column: results_cliff[(label, n)][entry] for column, n in zip(n_columns, n_values_cliff)}}
+    for heading, entry, _ in metrics_cliff
+    for label in methods_cliff
 ])
 
 control_table = (
     GT(control_rows, rowname_col="method", groupname_col="metric")
     .tab_header(
-        title="cliff walking off-policy: learning the greedy policy",
-        subtitle=(rf"behaviour \(\varepsilon = {EPS_BEHAVIOUR}\), \(\alpha = {ALPHA_TB}\), "
-                  f"{N_EPISODES_TB} episodes x {N_RUNS_TB} runs")
+        title=md("**Cliff walking off-policy: learning the greedy policy**"),
+        subtitle=f"Behavior ε = {EPS_BEHAVIOR}, α = {ALPHA_CLIFF}, {N_EPISODES_CLIFF:,} episodes × {N_RUNS_CLIFF} runs."
     )
-    .tab_spanner(label=r"\(n\)", columns=n_columns)
-    .tab_options(
-        quarto_disable_processing=True,
-        row_group_background_color="#F4F4F4"
-    )
+    .tab_spanner(label=html("<i>n</i>"), columns=n_columns)
+    .cols_align("right", columns=n_columns)
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
 )
 
-for block, (_, _, decimals) in enumerate(metrics_tb): # each metric carries its own precision
-    metric_rows = list(range(block * len(methods_tb), (block + 1) * len(methods_tb)))
+for block, (_, _, decimals) in enumerate(metrics_cliff): # each metric carries its own precision
+    metric_rows = list(range(block * len(methods_cliff), (block + 1) * len(methods_cliff)))
     control_table = control_table.fmt_number(columns=n_columns, rows=metric_rows, decimals=decimals)
 control_table
 ```
@@ -1852,13 +2643,13 @@ control_table
 At $n=1$ all three methods estimate $-13.00$, matching the oracle exactly. Past that the three separate, where importance sampling degrades fastest as the window lengthens, control variates slow down the degradation, and tree backup stays closest to $q_*$.
 
 :::{.callout-important}
-Be careful how you interpret the online-return results, because the more accurate $Q$ on the cliff walking environment the worse the return. Remember that the first two metrics grade the **target** policy, but the online return is collected by the **behaviour** policy, which is $\varepsilon$-greedy at
-$\varepsilon = 0.3$. That exploration happens right along the cliff, which means many exploration steps will fall and incurr a $-100$ reward, exactly what we saw in the prior chapter with Q-learning.
+Be careful how you interpret the online-return results, because the more accurate $Q$ on the cliff walking environment the worse the return. Remember that the first two metrics grade the **target** policy, but the online return is collected by the **behavior** policy, which is $\varepsilon$-greedy at
+$\varepsilon = 0.3$. That exploration happens right along the cliff, which means many exploration steps will fall and incur a $-100$ reward, exactly what we saw in the prior chapter with Q-learning.
 :::
 
 # A unifying algorithm: $n$-step $Q(\sigma)$
 
-Notice how $n$-step Sarsa at one extreme samples the action at every step, whereas Tree backup on the other end takes the expectation over actions at every step (no sampling). The intermediary is $n$-step Expected Sarsa samples all the way and then takes an expectation at the last step. In this section we introduce $n$-step $Q(\sigma)$, the genarilization of these algorithms
+Notice how $n$-step Sarsa at one extreme samples the action at every step, whereas Tree backup on the other end takes the expectation over actions at every step (no sampling). The intermediary is $n$-step Expected Sarsa samples all the way and then takes an expectation at the last step. In this section we introduce $n$-step $Q(\sigma)$, the generalization of these algorithms
 
 Let $\sigma_t \in [0,1]$ decide, at each step, how much to *sample* rather than take the expectation. Then
 
@@ -1894,11 +2685,11 @@ for n in n_values_sigma:
     learner = make_n_step_control(cliff, "q_sigma", n, seed = n)
     Q, reward_sum, step_count, done = learner(
         Q_init_sigma,
-        repeat_sigma(ALPHA_TB),
-        repeat_sigma(EPS_BEHAVIOUR),
+        repeat_sigma(ALPHA_CLIFF),
+        repeat_sigma(EPS_BEHAVIOR),
         repeat_sigma(EPS_TARGET),
         np.repeat(sigmas, N_RUNS_SIGMA),
-        GAMMA,
+        GAMMA_CLIFF,
         N_EPISODES_SIGMA,
         MAX_STEPS_SIGMA
     )
@@ -1961,7 +2752,7 @@ sigma_fig.update_yaxes(title_text="online return (last 100 episodes)", row=1, co
 sigma_fig.update_layout(
     title=dict(
         text=r"$\textbf{n-step }Q(\sigma)\text{: off-policy cliff walking}$",
-        subtitle=dict(text = fr"$\epsilon_b = {EPS_BEHAVIOUR}\text{{, greedy target, }}\alpha = {ALPHA_TB}\text{{, {N_RUNS_SIGMA} runs per point}}$"),
+        subtitle=dict(text = fr"$\epsilon_b = {EPS_BEHAVIOR}\text{{, greedy target, }}\alpha = {ALPHA_CLIFF}\text{{, {N_RUNS_SIGMA} runs per point}}$"),
     ),
     template="plotly_white",
     hovermode="x unified",
@@ -2023,7 +2814,7 @@ sigma_fig.update_yaxes(title_text="online return (last 100 episodes)", row=1, co
 sigma_fig.update_layout(
     title=dict(
         text=r"$\textbf{n-step }Q(\sigma)\text{: off-policy cliff walking}$",
-        subtitle=dict(text = fr"$\epsilon_b = {EPS_BEHAVIOUR}\text{{, greedy target, }}\alpha = {ALPHA_TB}\text{{, {N_RUNS_SIGMA} runs per point}}$"),
+        subtitle=dict(text = fr"$\epsilon_b = {EPS_BEHAVIOR}\text{{, greedy target, }}\alpha = {ALPHA_CLIFF}\text{{, {N_RUNS_SIGMA} runs per point}}$"),
     ),
     template="plotly_dark",
     hovermode="x unified",
@@ -2034,7 +2825,7 @@ sigma_fig.update_layout(
 sigma_fig.show(config=dict(displayModeBar=False))
 ```
 
-Notice how $\sigma$ behaves as a conrtol knob, instead of a switch. In *this* example the gap to $q_*$ grows monotonically from tree backup
+Notice how $\sigma$ behaves as a control knob, instead of a switch. In *this* example the gap to $q_*$ grows monotonically from tree backup
 at $\sigma=0$ to full per-decision importance sampling at $\sigma=1$, with the intermediate settings in between.
 
 # Summary & Recap
@@ -2079,12 +2870,12 @@ $$
 
 - **The $n$-step return** $G_{t:t+n} = \sum_{k=1}^{n}\gamma^{k-1}R_{t+k} + \gamma^n V(S_{t+n})$ interpolates between TD(0) ($n=1$) and Monte Carlo ($n \ge T-t$).
 
-- **The error reduction property** ($\gamma^n$ times the worst error in $V$) is why longer lookaheads are less contaminated by a wrong current estimate and the the variance of $n$ sampled rewards is why they are not free.
+- **The error reduction property** ($\gamma^n$ times the worst error in $V$) is why longer lookaheads are less contaminated by a wrong current estimate and the variance of $n$ sampled rewards is why they are not free.
 
 - **Plain importance sampling multiplies the whole update by $\rho_{t:t+n-1}$**, and at large $n$ completely diverges.
 
 - **Control variates** move the ratios inside the return. Ensuring that each ratio only applies to the return that comes after it, thereby reducing the variance and reducing the chance for divergences.
 
-- **Tree backup** does not use importance sampling. It takes the expectation over the actions not taken and follows only the branch it has data for, at the price of cutting the backup short whenever behaviour policy departs from the target policy.
+- **Tree backup** does not use importance sampling. It takes the expectation over the actions not taken and follows only the branch it has data for, at the price of cutting the backup short whenever behavior policy departs from the target policy.
 
 - **$n$-step $Q(\sigma)$** blends the algorithms above by tuning $\sigma$

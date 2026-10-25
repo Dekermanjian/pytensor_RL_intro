@@ -28,7 +28,7 @@ $$
 Both are $\gamma$-contractions, which is *why* iterating them converges.
 
 
-## Gridworld
+# Gridworld
 
 As an example we will use the **Gridworld** example, introduced in the chapter as the following:
 
@@ -40,13 +40,15 @@ As in the previous chapter the whole MDP lives in two arrays $P[s,a,s']=p(s'\mid
 
 ```{python}
 import numpy as np
+import pandas as pd
 import pytensor
 import pytensor.tensor as pt
-import matplotlib.pyplot as plt
+from dataclasses import dataclass
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.io as pio
 from plotly.subplots import make_subplots
+from great_tables import GT, loc, md, html
 
 colors = px.colors.qualitative.Pastel
 pio.renderers.default = "notebook_connected"
@@ -55,32 +57,287 @@ print("pytensor", pytensor.__version__)
 ```
 
 ```{python}
-#| classes: light-mode
-nS, nA = 16, 4
-pad = 0.04
-TERMINALS = [0, 15]
-terminal = np.zeros(nS, dtype=bool)
-terminal[TERMINALS] = True
+n_states, n_actions = 16, 4
+TERMINAL_STATES = [0, 15]
+terminal = np.zeros(n_states, dtype=bool)
+terminal[TERMINAL_STATES] = True
+UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
+STEP_REWARD_GRID = -1.0 # reward on every move until a terminal corner is reached
+GAMMA_GRID = 1.0 # undiscounted
+```
 
-def cell_xy(s):
-    "Maps State id to (x, y) in plot coordinates where grid row 0 is drawn at the top left."
-    r, c = divmod(s, 4)
-    return c, 3 - r
+```{python}
+GRID_SHAPE = (4, 4) # (n_rows, n_cols) of the gridworld
+STEP = {UP: (0, 1), DOWN: (0, -1), LEFT: (-1, 0), RIGHT: (1, 0)} # action -> (dx, dy) when drawn
+
+@dataclass(frozen=True)
+class GridTheme:
+    template: str    # plotly template
+    background: str  # plot background, which shows in the gaps between cells
+    floor: str       # fill of a non-terminal cell
+
+GRID_LIGHT = GridTheme(template="plotly_white", background="white", floor="#f2f2f2")
+GRID_DARK = GridTheme(template="plotly_dark", background="black", floor="#9e9d9d")
+GRID_TERMINAL = colors[4] # terminal cell fill, the same in both themes
+GRID_INK, GRID_ARROW = "#4a4a4a", colors[2] # labels and policy arrows, drawn on the cells in both themes
+
+def grid_xy(s, shape):
+    """Convert a state id to (x, y) plot coordinates, with grid row 0 drawn at the top.
+
+    Parameters
+    ----------
+    s : int
+        The state, numbered ``row * n_cols + col``.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+
+    Returns
+    -------
+    x, y : int
+        The column, and the row counted up from the bottom.
+    """
+    n_rows, n_cols = shape
+    row, col = divmod(int(s), n_cols)
+    return col, n_rows - 1 - row
+
+def grid_panels(panel_titles, shape, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Make an empty figure with one subplot per panel, each holding a grid of square cells.
+
+    The figure is tall enough for every cell to be ``cell_px`` pixels high and takes the page
+    width; the cells stay square. The panels are laid out left to right, then top to bottom.
+
+    Parameters
+    ----------
+    panel_titles : list of str
+        One title per panel.
+    shape : tuple of (int, int)
+        The (n_rows, n_cols) of the grid. Every panel shares it.
+    title : str, default ""
+        The figure title. Plotly HTML (<b>, <br>, <sup>) works.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        The figure, with the axes of every panel hidden and scaled so the cells are square.
+    """
+    n_rows, n_cols = shape
+    n_panels = len(panel_titles)
+    n_panel_cols = n_panel_cols or n_panels
+    n_panel_rows = -(-n_panels // n_panel_cols) # ceiling division
+    gap_x_px, gap_y_px = 20, 40 # between panels
+    plot_width = n_panel_cols * n_cols * cell_px + (n_panel_cols - 1) * gap_x_px
+    plot_height = n_panel_rows * n_rows * cell_px + (n_panel_rows - 1) * gap_y_px
+
+    fig = make_subplots(
+        rows=n_panel_rows,
+        cols=n_panel_cols,
+        subplot_titles=[f"<b>{t}</b>" for t in panel_titles],
+        horizontal_spacing=gap_x_px / plot_width,
+        vertical_spacing=gap_y_px / plot_height
+    )
+
+    for row in range(1, n_panel_rows + 1):
+        for col in range(1, n_panel_cols + 1):
+            x_axis = fig.get_subplot(row, col).xaxis.plotly_name.replace("axis", "")
+            fig.update_xaxes(range=[-0.55, n_cols - 0.45], visible=False, constrain="domain",
+                             row=row, col=col)
+            fig.update_yaxes(range=[-0.55, n_rows - 0.45], visible=False, scaleanchor=x_axis,
+                             constrain="domain", row=row, col=col)
+
+    margin = dict(l=10, r=10, b=10, t=(80 if title else 0) + 30)
+    fig.update_layout(
+        title=title,
+        height=plot_height + margin["t"] + margin["b"],
+        margin=margin,
+        template=theme.template,
+        plot_bgcolor=theme.background,
+        showlegend=False
+    )
+    return fig
+
+def draw_cells(fig, shape, fills, labels, row=1, col=1, pad=0.04):
+    """Draw one filled square per state into a subplot, with an optional label on top.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    fills : list of str, length n_rows * n_cols
+        The fill color of each state's cell.
+    labels : dict of {int: str}
+        Text drawn in the middle of a cell, by state, e.g. ``{0: "T"}``.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    pad : float, default 0.04
+        Gap around each cell, in cell widths.
+    """
+    n_rows, n_cols = shape
+    for s in range(n_rows * n_cols):
+        x, y = grid_xy(s, shape)
+        fig.add_shape(
+            type="rect",
+            x0=x - 0.5 + pad,
+            x1=x + 0.5 - pad,
+            y0=y - 0.5 + pad,
+            y1=y + 0.5 - pad,
+            fillcolor=fills[s],
+            line_width=0,
+            layer="below",
+            row=row, col=col
+        )
+    for s, label in labels.items():
+        x, y = grid_xy(s, shape)
+        fig.add_annotation(x=x, y=y, text=f"<b>{label}</b>", showarrow=False,
+                           font=dict(size=14, color=GRID_INK), row=row, col=col)
+
+def draw_arrows(fig, shape, actions, states, row=1, col=1, color=GRID_ARROW):
+    """Draw an arrow in each of the given states, pointing the way its action moves.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    actions : array_like of int, shape (n_rows * n_cols,)
+        The action in each state. Only the entries for ``states`` are drawn.
+    states : array_like of int
+        The states that get an arrow.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    color : str, default GRID_ARROW
+        The arrow color.
+    """
+    subplot = fig.get_subplot(row, col)
+    x_ref = subplot.xaxis.plotly_name.replace("axis", "")
+    y_ref = subplot.yaxis.plotly_name.replace("axis", "")
+    for s in states:
+        x, y = grid_xy(s, shape)
+        dx, dy = STEP[int(actions[s])]
+        fig.add_annotation(
+            x=x + 0.34 * dx,
+            y=y + 0.34 * dy,
+            ax=x - 0.22 * dx,
+            ay=y - 0.22 * dy,
+            xref=x_ref, yref=y_ref,
+            axref=x_ref, ayref=y_ref,
+            showarrow=True,
+            arrowhead=2, arrowsize=1.0, arrowwidth=2.2, arrowcolor=color
+        )
+
+def values_figure(values, shape, title="", fmt=".1f", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one number per state, laid out as the grid and colored by size.
+
+    Each panel has its own color scale, so the colors compare states within a panel; the printed
+    numbers carry the values.
+
+    Parameters
+    ----------
+    values : dict of {str: array_like of shape (n_rows * n_cols,)}
+        One panel per entry: its title, and the number for each state (e.g. a state-value
+        function).
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    title : str, default ""
+        The figure title.
+    fmt : str, default ".1f"
+        d3 format spec for the numbers printed in the cells.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    n_rows, n_cols = shape
+    fig = grid_panels(list(values), shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(values)
+    for i, v in enumerate(values.values()):
+        grid = np.asarray(v, dtype=float).reshape(n_rows, n_cols)
+        state = np.arange(n_rows * n_cols).reshape(n_rows, n_cols)
+        fig.add_heatmap(
+            x=np.arange(n_cols),
+            y=np.arange(n_rows),
+            z=grid[::-1], # grid row 0 at the top
+            customdata=state[::-1],
+            colorscale="Teal",
+            showscale=False,
+            texttemplate=f"%{{z:{fmt}}}",
+            xgap=3,
+            ygap=3,
+            hovertemplate=f"state %{{customdata}}: <b>%{{z:{fmt}}}</b><extra></extra>",
+            row=i // n_panel_cols + 1, col=i % n_panel_cols + 1
+        )
+    return fig
+
+def policy_figure(policies, shape, terminal, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one arrow per state for each deterministic policy, laid out as the grid.
+
+    Terminal states are the terminal color and labeled "T"; every other state gets an arrow.
+
+    Parameters
+    ----------
+    policies : dict of {str: array_like of int, shape (n_rows * n_cols,)}
+        One panel per entry: its title, and the action taken in each state.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    terminal : ndarray of bool, shape (n_rows * n_cols,)
+        True for the terminal states.
+    title : str, default ""
+        The figure title.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The template, background and floor fill. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    n_rows, n_cols = shape
+    fills = [GRID_TERMINAL if terminal[s] else theme.floor for s in range(n_rows * n_cols)]
+    labels = {int(s): "T" for s in np.flatnonzero(terminal)}
+    fig = grid_panels(list(policies), shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(policies)
+    for i, actions in enumerate(policies.values()):
+        row, col = i // n_panel_cols + 1, i % n_panel_cols + 1
+        draw_cells(fig, shape, fills, labels, row, col)
+        draw_arrows(fig, shape, actions, np.flatnonzero(~terminal), row, col)
+    return fig
+```
+
+```{python}
+#| classes: light-mode
+pad = 0.04
 
 grid_world_fig = go.Figure()
-for st in range(nS):
-    x, y = cell_xy(st)
+for s in range(n_states):
+    x, y = grid_xy(s, GRID_SHAPE)
     grid_world_fig.add_shape(
         type="rect",
         x0=x-0.5+pad,
         x1=x+0.5-pad,
         y0=y-0.5+pad,
         y1=y+0.5-pad,
-        fillcolor=colors[-1] if terminal[st] else colors[0],
+        fillcolor=colors[-1] if terminal[s] else colors[0],
         line_width=0,
         layer="below"
     )
-    grid_world_fig.add_annotation(x=x, y=y, text=str(st), showarrow=False)
+    grid_world_fig.add_annotation(x=x, y=y, text=str(s), showarrow=False)
 
 grid_world_fig.update_layout(
     title = "<b>Grid World</b>: Terminal States Shown in Grey",
@@ -96,31 +353,22 @@ grid_world_fig.show(config=dict(displayModeBar=False))
 
 ```{python}
 #| classes: dark-mode
-nS, nA = 16, 4
 pad = 0.04
-TERMINALS = [0, 15]
-terminal = np.zeros(nS, dtype=bool)
-terminal[TERMINALS] = True
-
-def cell_xy(s):
-    "Maps State id to (x, y) in plot coordinates where grid row 0 is drawn at the top left."
-    r, c = divmod(s, 4)
-    return c, 3 - r
 
 grid_world_fig = go.Figure()
-for st in range(nS):
-    x, y = cell_xy(st)
+for s in range(n_states):
+    x, y = grid_xy(s, GRID_SHAPE)
     grid_world_fig.add_shape(
         type="rect",
         x0=x-0.5+pad,
         x1=x+0.5-pad,
         y0=y-0.5+pad,
         y1=y+0.5-pad,
-        fillcolor=colors[-1] if terminal[st] else colors[0],
+        fillcolor=colors[-1] if terminal[s] else colors[0],
         line_width=0,
         layer="below"
     )
-    grid_world_fig.add_annotation(x=x, y=y, text=str(st), font_color="black", showarrow=False)
+    grid_world_fig.add_annotation(x=x, y=y, text=str(s), font_color="black", showarrow=False)
 
 grid_world_fig.update_layout(
     title = "<b>Grid World</b>: Terminal States Shown in Grey",
@@ -136,47 +384,52 @@ grid_world_fig.show(config=dict(displayModeBar=False))
 
 
 ```{python}
-UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-action_names  = ["up", "down", "left", "right"]
-action_arrows = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
+def grid_step(s, a):
+    """Return the state that action `a` leads to from state `s`.
 
-def step(s, a):
-    "Where action a takes you from state s (clamped to the grid)."
-    if s in TERMINALS:
+    Moves are deterministic. A move that would step off the grid leaves the agent where it is,
+    and a terminal state is absorbing: every action leaves the agent in it.
+
+    Parameters
+    ----------
+    s : int
+        The current state, numbered ``row * n_cols + col`` on the grid.
+    a : {UP, DOWN, LEFT, RIGHT}
+        The action.
+
+    Returns
+    -------
+    int
+        The next state.
+    """
+    if s in TERMINAL_STATES:
         return s # terminal = absorbing self-loop
-    r, c = divmod(s, 4)
-    if a == UP: r = max(r - 1, 0)
-    elif a == DOWN: r = min(r + 1, 3)
-    elif a == LEFT: c = max(c - 1, 0)
-    elif a == RIGHT: c = min(c + 1, 3)
-    return r * 4 + c
+    n_rows, n_cols = GRID_SHAPE
+    row, col = divmod(s, n_cols)
+    if a == UP: row = max(row - 1, 0)
+    elif a == DOWN: row = min(row + 1, n_rows - 1)
+    elif a == LEFT: col = max(col - 1, 0)
+    elif a == RIGHT: col = min(col + 1, n_cols - 1)
+    return row * n_cols + col
 
-P = np.zeros((nS, nA, nS))
-R = np.zeros((nS, nA, nS))
-for s in range(nS):
-    for a in range(nA):
-        sp = step(s, a)
-        P[s, a, sp] = 1.0
-        if s not in TERMINALS:
-            R[s, a, sp] = -1.0 # -1 per move until you reach a corner
+P = np.zeros((n_states, n_actions, n_states))
+R = np.zeros((n_states, n_actions, n_states))
+for s in range(n_states):
+    for a in range(n_actions):
+        s_next = grid_step(s, a)
+        P[s, a, s_next] = 1.0
+        if s not in TERMINAL_STATES:
+            R[s, a, s_next] = STEP_REWARD_GRID # every move costs this until you reach a corner
 
 # convert into PyTensor
-P_t = pt.as_tensor_variable(P) # (16, 4, 16)
-R_t = pt.as_tensor_variable(R) # (16, 4, 16)
-nonterminal = pt.as_tensor_variable((~terminal).astype("float64")) # 1 if not terminal
-r_sa = (P_t * R_t).sum(axis=2) # (16, 4)
+P_sym = pt.as_tensor_variable(P) # (16, 4, 16)
+R_sym = pt.as_tensor_variable(R) # (16, 4, 16)
+not_terminal = pt.as_tensor_variable((~terminal).astype("float64")) # 1 if not terminal
+reward_mean = (P_sym * R_sym).sum(axis=2) # (16, 4)
 gamma = pt.scalar("gamma")
-
-def show_grid(v, title=""):
-    "Pretty-print a length-16 value vector on the 4x4 grid."
-    if title: print(title)
-    grid = np.asarray(v).reshape(4, 4)
-    for row in grid:
-        print("  " + "  ".join(f"{x:6.1f}" for x in row))
-
 ```
 
-## Policy evaluation
+# Policy evaluation
 
 Given a fixed policy $\pi$, **policy evaluation** computes its value function $v_\pi$ by turning the Bellman *expectation* equation into an update rule and iterating it to its fixed point:
 
@@ -196,31 +449,75 @@ We evaluate the **equiprobable random policy** $\pi(a\mid s)=\tfrac14$.
 
 
 ```{python}
-pi_t = pt.matrix("pi") # (16, 4)
+pi_sym = pt.matrix("pi") # (16, 4)
 
 # collapse MDP to MRP
-P_pi = (pi_t[:, :, None] * P_t).sum(axis=1) # (16, 16)
-r_pi = (pi_t * r_sa).sum(axis=1) # (16,)
+P_pi = (pi_sym[:, :, None] * P_sym).sum(axis=1) # (16, 16)
+r_pi = (pi_sym * reward_mean).sum(axis=1) # (16,)
 
-def eval_step(v_prev, r_pi, P_pi, g, mask):
-    return mask * (r_pi + g * pt.dot(P_pi, v_prev)) # mask pins terminals to 0
+def eval_step(v_prev, r_pi, P_pi, gamma, mask):
+    """One sweep of iterative policy evaluation on the collapsed Markov reward process.
+
+    Applies the Bellman expectation backup to every state at once,
+
+        v_{k+1}(s) = sum_a pi(a|s) sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v_k(s') ],
+
+    which, with the policy folded into ``r_pi`` and ``P_pi``, is the linear map
+    ``v_{k+1} = r^pi + gamma * P^pi v_k``. Here every reward is -1 until a terminal state is
+    reached, and the mask pins the two terminal states to 0.
+
+    Parameters
+    ----------
+    v_prev : TensorVariable, shape (16,)
+        The values v_k from the previous sweep.
+    r_pi : TensorVariable, shape (16,)
+        Expected one-step reward under pi, ``r^pi(s) = sum_a pi(a|s) r(s, a)``.
+    P_pi : TensorVariable, shape (16, 16)
+        State-to-state transition matrix under pi, ``P^pi[s, s'] = sum_a pi(a|s) p(s'|s, a)``.
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+    mask : TensorVariable, shape (16,)
+        1.0 for a non-terminal state, 0.0 for a terminal one.
+
+    Returns
+    -------
+    TensorVariable, shape (16,)
+        The values v_{k+1}.
+    """
+    return mask * (r_pi + gamma * pt.dot(P_pi, v_prev)) # mask pins terminals to 0
 
 v_eval_seq = pytensor.scan(
     fn=eval_step,
-    outputs_info=pt.zeros((nS,)), # v_0 = 0
-    non_sequences=[r_pi, P_pi, gamma, nonterminal], # nonterminal is our mask in eval_step
+    outputs_info=pt.zeros((n_states,)), # v_0 = 0
+    non_sequences=[r_pi, P_pi, gamma, not_terminal], # not_terminal is our mask in eval_step
     n_steps=600,
     return_updates=False
 )
 v_eval = v_eval_seq[-1]
-eval_fn = pytensor.function([pi_t, gamma], v_eval)
+evaluate_policy = pytensor.function([pi_sym, gamma], v_eval)
 
-pi_random = np.ones((nS, nA)) / nA
-v_random  = eval_fn(pi_random, 1.0)
-show_grid(v_random, "v_pi for the equiprobable random policy:")
+pi_random = np.ones((n_states, n_actions)) / n_actions
+v_random  = evaluate_policy(pi_random, GAMMA_GRID)
 ```
 
-## Policy improvement
+```{python}
+#| classes: light-mode
+values_figure(
+    {"v<sub>π</sub> for the equiprobable random policy": v_random},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"v<sub>π</sub> for the equiprobable random policy": v_random},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+# Policy improvement
 
 Now that we can score a policy, how do we get a *better* one?
 
@@ -238,28 +535,69 @@ Below we make one greedy policy from the random-policy values. Even this single 
 
 ```{python}
 v_sym = pt.vector("v")
-q_sa  = (P_t * (R_t + gamma * v_sym[None, None, :])).sum(axis=2) # (16, 4)
-greedy_sym = q_sa.argmax(axis=1)
-q_fn = pytensor.function([v_sym, gamma], [q_sa, greedy_sym])
+q_sym  = (P_sym * (R_sym + gamma * v_sym[None, None, :])).sum(axis=2) # (16, 4)
+greedy_sym = q_sym.argmax(axis=1)
+q_fn = pytensor.function([v_sym, gamma], [q_sym, greedy_sym])
 
-def greedy_policy(v_val, g):
-    "Deterministic greedy policy (as a one-hot matrix) and its action ids."
-    _, a_star = q_fn(v_val, g)
-    pi_new = np.zeros((nS, nA))
-    pi_new[np.arange(nS), a_star] = 1.0
+def greedy_policy(v_val, gamma):
+    """Return the deterministic greedy policy with respect to a state-value function.
+
+    Looks one step ahead with the compiled ``q_fn``,
+
+        q(s, a) = sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v(s') ],
+
+    and picks ``argmax_a q(s, a)`` in every state. On this gridworld the moves are deterministic,
+    so the sum has a single term. Ties go to the lowest-numbered action.
+
+    Parameters
+    ----------
+    v_val : ndarray, shape (16,)
+        State values v(s).
+    gamma : float
+        Discount factor gamma.
+
+    Returns
+    -------
+    pi_new : ndarray, shape (16, 4)
+        The policy as a one-hot matrix: 1.0 on the greedy action of each state, 0.0 elsewhere.
+    a_star : ndarray of int, shape (16,)
+        The greedy action of each state.
+    """
+    _, a_star = q_fn(v_val, gamma)
+    pi_new = np.zeros((n_states, n_actions))
+    pi_new[np.arange(n_states), a_star] = 1.0
     return pi_new, a_star
 
-def show_policy(a_ids, title=""):
-    if title: print(title)
-    chars = [action_arrows[int(a)] if not terminal[s] else "T"
-             for s, a in enumerate(a_ids)]
-    for r in range(4):
-        print("   " + "  ".join(chars[r*4:(r+1)*4]))
+pi_greedy, a_greedy = greedy_policy(v_random, GAMMA_GRID)
+v_greedy = evaluate_policy(pi_greedy, GAMMA_GRID)
+```
 
-pi_greedy, a_greedy = greedy_policy(v_random, 1.0)
-show_policy(a_greedy, "Greedy policy w.r.t. the random-policy values:")
-print()
-show_grid(eval_fn(pi_greedy, 1.0), "...and its (better) value function:")
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Greedy policy w.r.t. the random-policy values": a_greedy},
+    GRID_SHAPE,
+    terminal
+).show(config=dict(displayModeBar=False))
+values_figure(
+    {"...and its (better) value function": v_greedy},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Greedy policy w.r.t. the random-policy values": a_greedy},
+    GRID_SHAPE,
+    terminal,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+values_figure(
+    {"...and its (better) value function": v_greedy},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 Below we play out an episode using our `a_greedy`
@@ -269,10 +607,10 @@ Below we play out an episode using our `a_greedy`
 s = 6 # Starting position
 path = [s]
 while not terminal[s]:
-    s = step(s, int(a_greedy[s]))
+    s = grid_step(s, int(a_greedy[s]))
     path.append(s)
 
-xs, ys = map(np.array, zip(*(cell_xy(s) for s in path)))
+xs, ys = map(np.array, zip(*(grid_xy(s, GRID_SHAPE) for s in path)))
 ```
 
 
@@ -308,14 +646,14 @@ episode_fig.add_scatter(
 
 episode_fig.frames = [
     go.Frame(
-        name=str(k),
+        name=str(frame_index),
         data=[
-            go.Scatter(x=xs[:k+1], y=ys[:k+1]),
-            go.Scatter(x=xs[k:k+1], y=ys[k:k+1])
+            go.Scatter(x=xs[:frame_index+1], y=ys[:frame_index+1]),
+            go.Scatter(x=xs[frame_index:frame_index+1], y=ys[frame_index:frame_index+1])
         ],
         traces=[0, 1]
     )
-    for k in range(len(path))
+    for frame_index in range(len(path))
 ]
 
 updatemenus = [
@@ -347,10 +685,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(len(path))
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(len(path))
         ]
     )
 ]
@@ -401,14 +739,14 @@ episode_fig.add_scatter(
 
 episode_fig.frames = [
     go.Frame(
-        name=str(k),
+        name=str(frame_index),
         data=[
-            go.Scatter(x=xs[:k+1], y=ys[:k+1]),
-            go.Scatter(x=xs[k:k+1], y=ys[k:k+1])
+            go.Scatter(x=xs[:frame_index+1], y=ys[:frame_index+1]),
+            go.Scatter(x=xs[frame_index:frame_index+1], y=ys[frame_index:frame_index+1])
         ],
         traces=[0, 1]
     )
-    for k in range(len(path))
+    for frame_index in range(len(path))
 ]
 
 updatemenus = [
@@ -443,10 +781,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(len(path))
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(len(path))
         ]
     )
 ]
@@ -465,7 +803,7 @@ episode_fig.update_layout(
 episode_fig.show(config=dict(displayModeBar=False))
 ```
 
-## Policy iteration
+# Policy iteration
 
 **Policy iteration** simply alternates the two steps until the greedy policy stops changing:
 
@@ -478,22 +816,48 @@ $$
 Because there are finitely many deterministic policies and each round strictly improves (or we stop), it converges to an **optimal** policy in a handful of iterations. On this gridworld the random policy already points roughly the right way, so it lands on $\pi_*$ almost immediately.
 
 ```{python}
-pi = np.ones((nS, nA)) / nA  # start from the random policy
-for it in range(50):
-    v_val = eval_fn(pi, 1.0) # evaluation (to convergence)
-    pi_new, a_ids = greedy_policy(v_val, 1.0) # improvement (greedy)
+pi = np.ones((n_states, n_actions)) / n_actions  # start from the random policy
+for iteration in range(50):
+    v_val = evaluate_policy(pi, GAMMA_GRID) # evaluation (to convergence)
+    pi_new, a_star = greedy_policy(v_val, GAMMA_GRID) # improvement (greedy)
 
     if np.array_equal(pi_new, pi):
-        print(f"policy stable after {it} improvement step(s)")
+        print(f"policy stable after {iteration} improvement step(s)")
         break
     pi = pi_new
 
-v_star_pi = eval_fn(pi, 1.0)
-show_policy(a_ids, "Optimal policy pi_* (shortest path to a terminal state):")
-show_grid(v_star_pi, "\nOptimal value v_* (negative distance to nearest corner):")
+v_star_pi = evaluate_policy(pi, GAMMA_GRID)
 ```
 
-## Value iteration
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Optimal policy π<sub>*</sub> (shortest path to a terminal state)": a_star},
+    GRID_SHAPE,
+    terminal
+).show(config=dict(displayModeBar=False))
+values_figure(
+    {"Optimal value v<sub>*</sub> (negative distance to nearest corner)": v_star_pi},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Optimal policy π<sub>*</sub> (shortest path to a terminal state)": a_star},
+    GRID_SHAPE,
+    terminal,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+values_figure(
+    {"Optimal value v<sub>*</sub> (negative distance to nearest corner)": v_star_pi},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+# Value iteration
 
 Policy iteration runs evaluation to convergence inside every step - often overkill. **Value iteration** truncates evaluation to a **single sweep** and folds the improvement straight into it by using the Bellman *optimality* backup (a `max` instead of the policy average):
 
@@ -505,27 +869,71 @@ It is the same `max`-backup we used for the recycling robot. On the gridworld it
 
 
 ```{python}
-def vi_step(v_prev, P_t, R_t, g, mask):
-    q = (P_t * (R_t + g * v_prev[None, None, :])).sum(axis=2) # (16, 4)
+def vi_step(v_prev, P_sym, R_sym, gamma, mask):
+    """One synchronous sweep of value iteration.
+
+    Applies the Bellman optimality backup to every state at once, computed from the old values
+    v_k only:
+
+        v_{k+1}(s) = max_a sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v_k(s') ].
+
+    Here every reward is -1 until a terminal state is reached, and the mask pins the two
+    terminal states to 0.
+
+    Parameters
+    ----------
+    v_prev : TensorVariable, shape (16,)
+        The values v_k from the previous sweep.
+    P_sym : TensorVariable, shape (16, 4, 16)
+        Transition probabilities p(s'|s, a).
+    R_sym : TensorVariable, shape (16, 4, 16)
+        Rewards r(s, a, s').
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+    mask : TensorVariable, shape (16,)
+        1.0 for a non-terminal state, 0.0 for a terminal one.
+
+    Returns
+    -------
+    TensorVariable, shape (16,)
+        The values v_{k+1}.
+    """
+    q = (P_sym * (R_sym + gamma * v_prev[None, None, :])).sum(axis=2) # (16, 4)
     return mask * q.max(axis=1)
 
 v_vi_seq = pytensor.scan(
     fn=vi_step,
-    outputs_info=pt.zeros((nS,)),
-    non_sequences=[P_t, R_t, gamma, nonterminal],
+    outputs_info=pt.zeros((n_states,)),
+    non_sequences=[P_sym, R_sym, gamma, not_terminal],
     n_steps=100,
     return_updates=False
 )
 
 # how many sweeps until the value stops moving?
-all_v = v_vi_seq.eval({gamma: 1.0}) # Just a single scan no outer loop
-deltas = np.abs(np.diff(all_v, axis=0)).max(axis=1)
-converged = int(np.argmax(deltas < 1e-9)) + 1
-print(f"value iteration converged in {converged} sweeps")
-show_grid(all_v[-1], "v_* from value iteration:")
+v_per_sweep = v_vi_seq.eval({gamma: GAMMA_GRID}) # Just a single scan no outer loop
+deltas = np.abs(np.diff(v_per_sweep, axis=0)).max(axis=1)
+sweeps_synchronous = int(np.argmax(deltas < 1e-9)) + 1
+print(f"value iteration converged in {sweeps_synchronous} sweeps")
 ```
 
-## A richer test: the Gambler's Problem
+```{python}
+#| classes: light-mode
+values_figure(
+    {"v<sub>*</sub> from value iteration": v_per_sweep[-1]},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"v<sub>*</sub> from value iteration": v_per_sweep[-1]},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+# A richer test: the Gambler's Problem
 
 The gridworld is so easy that policy iteration finishes in one step.
 
@@ -546,88 +954,181 @@ The cap on the stake is due to having no benefit to exceeding $100.
 
 
 ```{python}
-ph_val = 0.4
+P_HEADS = 0.4
 GOAL = 100
-nS_g = GOAL + 1
+n_states_gambler = GOAL + 1
 stakes = np.arange(0, GOAL // 2 + 1) # possible stakes 0 through 50
 
-S = np.arange(nS_g)[:, None] # (101, 1) capital
+S = np.arange(n_states_gambler)[:, None] # (101, 1) capital
 A = stakes[None, :] # (1, 51) stake
-win_idx = np.clip(S + A, 0, GOAL) # next capital on heads
-lose_idx = np.clip(S - A, 0, GOAL) # next capital on tails
+next_if_heads = np.clip(S + A, 0, GOAL) # next capital on heads
+next_if_tails = np.clip(S - A, 0, GOAL) # next capital on tails
 valid = (A >= 1) & (A <= np.minimum(S, GOAL - S)) # non-zero stakes
 
-win_t = pt.as_tensor_variable(win_idx)
-lose_t = pt.as_tensor_variable(lose_idx)
-valid_t = pt.as_tensor_variable(valid.astype("float64"))
-ph = pt.scalar("ph")
+next_if_heads_sym = pt.as_tensor_variable(next_if_heads)
+next_if_tails_sym = pt.as_tensor_variable(next_if_tails)
+valid_sym = pt.as_tensor_variable(valid.astype("float64"))
+p_h_sym = pt.scalar("p_h")
 
-is_term = (np.arange(nS_g) == 0) | (np.arange(nS_g) == GOAL) # terminal states are $0 and $100
-term_mask = pt.as_tensor_variable(is_term.astype("float64"))
-V_term = np.zeros(nS_g)
-V_term[GOAL] = 1.0  # All values 0 except when capital is $100
-V_term_t = pt.as_tensor_variable(V_term)
-NEG = -1e9
+terminal_gambler = (np.arange(n_states_gambler) == 0) | (np.arange(n_states_gambler) == GOAL) # terminal states are $0 and $100
+terminal_gambler_sym = pt.as_tensor_variable(terminal_gambler.astype("float64"))
+V_terminal = np.zeros(n_states_gambler)
+V_terminal[GOAL] = 1.0  # All values 0 except when capital is $100
+V_terminal_sym = pt.as_tensor_variable(V_terminal)
+NEG_INF = -1e30 # stand-in for -inf when masking illegal stakes
 
-def gambler_vi(V_prev, win, lose, valid, ph_, Vterm, tmask):
-    q = ph_ * V_prev[win] + (1.0 - ph_) * V_prev[lose] # (101, 51)
-    q = pt.where(valid > 0, q, NEG) # mask illegal stakes
-    Vmax = q.max(axis=1)
-    return tmask * Vterm + (1.0 - tmask) * Vmax # keep terminals pinned
+def gambler_vi(V_prev, next_if_heads, next_if_tails, valid, p_h, V_terminal, terminal_mask):
+    """One synchronous sweep of value iteration on the gambler's problem.
 
-Vg_seq = pytensor.scan(
+    The Bellman optimality backup is
+
+        V_{k+1}(s) = max_a sum_s' p(s'|s, a) [ r(s, a, s') + gamma * V_k(s') ].
+
+    Here gamma = 1, a stake a leads to s + a with probability p_h and to s - a otherwise, and
+    the reward is 0 on every flip: the +1 for reaching $100 is stored as the terminal value
+    V(100) = 1 instead. So the backup becomes
+
+        V_{k+1}(s) = max_a [ p_h * V_k(s + a) + (1 - p_h) * V_k(s - a) ],
+
+    with the max taken over the legal stakes ``1 <= a <= min(s, 100 - s)`` only. The terminal
+    capitals $0 and $100 keep their fixed values.
+
+    Parameters
+    ----------
+    V_prev : TensorVariable, shape (101,)
+        The values V_k from the previous sweep, one per capital 0..100.
+    next_if_heads, next_if_tails : TensorVariable of int, shape (101, 51)
+        The next capital after heads (``s + a``) and after tails (``s - a``), by capital and stake.
+    valid : TensorVariable, shape (101, 51)
+        1.0 where the stake is legal in that capital, 0.0 elsewhere.
+    p_h : TensorVariable, scalar
+        Probability of heads, p_h.
+    V_terminal : TensorVariable, shape (101,)
+        The fixed terminal values: 1.0 at $100, 0.0 everywhere else.
+    terminal_mask : TensorVariable, shape (101,)
+        1.0 at the terminal capitals $0 and $100, 0.0 elsewhere.
+
+    Returns
+    -------
+    TensorVariable, shape (101,)
+        The values V_{k+1}.
+    """
+    q = p_h * V_prev[next_if_heads] + (1.0 - p_h) * V_prev[next_if_tails] # (101, 51)
+    q = pt.where(valid > 0, q, NEG_INF) # mask illegal stakes
+    V_max = q.max(axis=1)
+    return terminal_mask * V_terminal + (1.0 - terminal_mask) * V_max # keep terminals pinned
+
+V_gambler_seq = pytensor.scan(
     fn=gambler_vi,
-    outputs_info=V_term_t, # start with terminals set
-    non_sequences=[win_t, lose_t, valid_t, ph, V_term_t, term_mask],
+    outputs_info=V_terminal_sym, # start with terminals set
+    non_sequences=[next_if_heads_sym, next_if_tails_sym, valid_sym, p_h_sym, V_terminal_sym, terminal_gambler_sym],
     n_steps=500,
     return_updates=False
 )
-Vg_all = Vg_seq.eval({ph: ph_val})
-Vg = Vg_all[-1]
+V_gambler_per_sweep = V_gambler_seq.eval({p_h_sym: P_HEADS})
+V_gambler = V_gambler_per_sweep[-1]
 
-deltas_g = np.abs(np.diff(Vg_all, axis=0)).max(axis=1)
-print("gambler VI converged in", int(np.argmax(deltas_g < 1e-11)) + 1, "sweeps")
-print(f"V(50) = {Vg[50]:.4f}  (equal to p_h: the one-flip win chance)")
+deltas_gambler = np.abs(np.diff(V_gambler_per_sweep, axis=0)).max(axis=1)
+sweeps_gambler = int(np.argmax(deltas_gambler < 1e-11)) + 1
 
 # extract the optimal policy (smallest optimal stake)
-q_final = ph_val * Vg[win_idx] + (1 - ph_val) * Vg[lose_idx]
+q_final = P_HEADS * V_gambler[next_if_heads] + (1 - P_HEADS) * V_gambler[next_if_tails]
 q_final = np.where(valid, np.round(q_final, 5), -np.inf)
-opt_stake = stakes[q_final.argmax(axis=1)]
-opt_stake[is_term] = 0
-print("optimal stakes at s=25,50,51,75:",
-      opt_stake[25], opt_stake[50], opt_stake[51], opt_stake[75])
+optimal_stake = stakes[q_final.argmax(axis=1)]
+optimal_stake[terminal_gambler] = 0
+```
+
+```{python}
+CONVERGENCE_GROUP = "Value iteration"
+STAKE_GROUP = "Optimal stake at capital <i>s</i>"
+STAKE_CAPITALS = [25, 50, 51, 75]
+gambler_rows = pd.DataFrame(
+    [
+        dict(group=CONVERGENCE_GROUP, quantity="Sweeps to converge", value=sweeps_gambler),
+        dict(group=CONVERGENCE_GROUP, quantity="<i>V</i>(50)", value=V_gambler[50]),
+    ]
+    + [dict(group=STAKE_GROUP, quantity=f"<i>s</i> = {capital}", value=optimal_stake[capital]) for capital in STAKE_CAPITALS]
+)
+rows_value = [1] # V(50); every other row is a count
+rows_count = [row for row in range(len(gambler_rows)) if row not in rows_value]
+
+gambler_table = (
+    GT(gambler_rows, rowname_col="quantity", groupname_col="group")
+    .tab_header(
+        title=md("**Value iteration on the gambler's problem**"),
+        subtitle=html(f"<i>p</i><sub>h</sub> = {P_HEADS}, undiscounted (γ = 1).")
+    )
+    .cols_label(value="")
+    .fmt_markdown(columns="quantity")
+    .fmt_integer(columns="value", rows=rows_count)
+    .fmt_number(columns="value", rows=rows_value, decimals=4)
+    .cols_align("right", columns="value")
+    .tab_footnote(html("Equal to <i>p</i><sub>h</sub>: the one-flip win chance."), loc.stub(rows=rows_value))
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
+)
+gambler_table
 ```
 
 
 ```{python}
 #| classes: light-mode
-ph_steps = [0.2, 0.4, 0.5, 0.6, 0.8]
-DEFAULT_IDX = ph_steps.index(ph_val)
-sweep_ids = [1, 2, 3, 32]
+p_h_values = [0.2, 0.4, 0.5, 0.6, 0.8]
+DEFAULT_P_H_INDEX = p_h_values.index(P_HEADS)
+sweeps_shown = [1, 2, 3, 32]
 
-def gambler_results(p):
-    "Value-iteration trajectory and (smallest) optimal stake for a given p_h."
-    Vall = Vg_seq.eval({ph: p})
-    q = p * Vall[-1][win_idx] + (1 - p) * Vall[-1][lose_idx]
+def gambler_results(p_h):
+    """Run value iteration on the gambler's problem for one p_h, and extract the optimal stakes.
+
+    The optimal stake in capital s is ``argmax_a [ p_h * V(s + a) + (1 - p_h) * V(s - a) ]`` over the
+    legal stakes, using the final values V. The action values are rounded to 5 decimals first, so
+    that stakes whose values differ only by floating-point error count as tied and the smallest
+    of them is picked.
+
+    Parameters
+    ----------
+    p_h : float
+        Probability of heads, p_h.
+
+    Returns
+    -------
+    V_per_sweep : ndarray, shape (500, 101)
+        The values after every sweep of value iteration, one row per sweep.
+    stake : ndarray of int, shape (101,)
+        The smallest optimal stake in each capital, with 0 in the terminal capitals $0 and $100.
+    """
+    V_per_sweep = V_gambler_seq.eval({p_h_sym: p_h})
+    q = p_h * V_per_sweep[-1][next_if_heads] + (1 - p_h) * V_per_sweep[-1][next_if_tails]
     q = np.where(valid, np.round(q, 5), -np.inf)
     stake = stakes[q.argmax(axis=1)]
-    stake[is_term] = 0
-    return Vall, stake
+    stake[terminal_gambler] = 0
+    return V_per_sweep, stake
 
-results = {p: gambler_results(p) for p in ph_steps}
+results = {p_h: gambler_results(p_h) for p_h in p_h_values}
 
-def title_for(p):
-    return r"$\text{Gambler's problem with }" + f"P_h = {p:g}$"
+def title_for(p_h):
+    """Return the figure title for one p_h, as a LaTeX string.
+
+    Parameters
+    ----------
+    p_h : float
+        Probability of heads, p_h.
+
+    Returns
+    -------
+    str
+        The title, e.g. ``$\\text{Gambler's problem with }P_h = 0.4$``.
+    """
+    return r"$\text{Gambler's problem with }" + f"P_h = {p_h:g}$"
 
 gambler_fig = make_subplots(rows=2, cols=1, subplot_titles=["Value Estimates", "Final Optimal Policy"])
 
-Vg_all0, opt_stake0 = results[ph_val]
+V_per_sweep_default, optimal_stake_default = results[P_HEADS]
 
-for i, k in enumerate(sweep_ids):
+for i, sweep in enumerate(sweeps_shown):
     gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = Vg_all0[k],
-        name = f"sweep {k}",
+        x = np.arange(n_states_gambler),
+        y = V_per_sweep_default[sweep],
+        name = f"sweep {sweep}",
         mode = "lines",
         marker_color = colors[i],
         row = 1,
@@ -635,8 +1136,8 @@ for i, k in enumerate(sweep_ids):
     )
 
 gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = Vg_all0[-1],
+        x = np.arange(n_states_gambler),
+        y = V_per_sweep_default[-1],
         name = "final",
         mode = "lines",
         marker_color = colors[i+1],
@@ -645,8 +1146,8 @@ gambler_fig.add_scatter(
     )
 
 gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = opt_stake0,
+        x = np.arange(n_states_gambler),
+        y = optimal_stake_default,
         name = "optimal policy",
         showlegend=False,
         mode="lines",
@@ -657,21 +1158,21 @@ gambler_fig.add_scatter(
     )
 
 slider_steps = []
-for p in ph_steps:
-    Vall, stake = results[p]
+for p_h in p_h_values:
+    V_per_sweep, stake = results[p_h]
     slider_steps.append(
         dict(
             method="update",
-            label=f"{p:g}",
+            label=f"{p_h:g}",
             args=[
-                {"y": [Vall[k] for k in sweep_ids] + [Vall[-1], stake]},
-                {"title.text": title_for(p)},
+                {"y": [V_per_sweep[sweep] for sweep in sweeps_shown] + [V_per_sweep[-1], stake]},
+                {"title.text": title_for(p_h)},
             ],
         )
     )
 
 gambler_fig.update_layout(
-    title = title_for(ph_val),
+    title = title_for(P_HEADS),
     xaxis1_title = "Capital",
     xaxis2_title = "Capital",
     yaxis1=dict(title = "Value"),
@@ -687,7 +1188,7 @@ gambler_fig.update_layout(
     ),
     sliders=[
         dict(
-            active=DEFAULT_IDX,
+            active=DEFAULT_P_H_INDEX,
             steps=slider_steps,
             pad=dict(t=35),
             currentvalue=dict(
@@ -705,33 +1206,63 @@ gambler_fig.show(config=dict(displayModeBar=False))
 
 ```{python}
 #| classes: dark-mode
-ph_steps = [0.2, 0.4, 0.5, 0.6, 0.8]
-DEFAULT_IDX = ph_steps.index(ph_val)
-sweep_ids = [1, 2, 3, 32]
+p_h_values = [0.2, 0.4, 0.5, 0.6, 0.8]
+DEFAULT_P_H_INDEX = p_h_values.index(P_HEADS)
+sweeps_shown = [1, 2, 3, 32]
 
-def gambler_results(p):
-    "Value-iteration trajectory and (smallest) optimal stake for a given p_h."
-    Vall = Vg_seq.eval({ph: p})
-    q = p * Vall[-1][win_idx] + (1 - p) * Vall[-1][lose_idx]
+def gambler_results(p_h):
+    """Run value iteration on the gambler's problem for one p_h, and extract the optimal stakes.
+
+    The optimal stake in capital s is ``argmax_a [ p_h * V(s + a) + (1 - p_h) * V(s - a) ]`` over the
+    legal stakes, using the final values V. The action values are rounded to 5 decimals first, so
+    that stakes whose values differ only by floating-point error count as tied and the smallest
+    of them is picked.
+
+    Parameters
+    ----------
+    p_h : float
+        Probability of heads, p_h.
+
+    Returns
+    -------
+    V_per_sweep : ndarray, shape (500, 101)
+        The values after every sweep of value iteration, one row per sweep.
+    stake : ndarray of int, shape (101,)
+        The smallest optimal stake in each capital, with 0 in the terminal capitals $0 and $100.
+    """
+    V_per_sweep = V_gambler_seq.eval({p_h_sym: p_h})
+    q = p_h * V_per_sweep[-1][next_if_heads] + (1 - p_h) * V_per_sweep[-1][next_if_tails]
     q = np.where(valid, np.round(q, 5), -np.inf)
     stake = stakes[q.argmax(axis=1)]
-    stake[is_term] = 0
-    return Vall, stake
+    stake[terminal_gambler] = 0
+    return V_per_sweep, stake
 
-results = {p: gambler_results(p) for p in ph_steps}
+results = {p_h: gambler_results(p_h) for p_h in p_h_values}
 
-def title_for(p):
-    return r"$\text{Gambler's problem with }" + f"P_h = {p:g}$"
+def title_for(p_h):
+    """Return the figure title for one p_h, as a LaTeX string.
+
+    Parameters
+    ----------
+    p_h : float
+        Probability of heads, p_h.
+
+    Returns
+    -------
+    str
+        The title, e.g. ``$\\text{Gambler's problem with }P_h = 0.4$``.
+    """
+    return r"$\text{Gambler's problem with }" + f"P_h = {p_h:g}$"
 
 gambler_fig = make_subplots(rows=2, cols=1, subplot_titles=["Value Estimates", "Final Optimal Policy"])
 
-Vg_all0, opt_stake0 = results[ph_val]
+V_per_sweep_default, optimal_stake_default = results[P_HEADS]
 
-for i, k in enumerate(sweep_ids):
+for i, sweep in enumerate(sweeps_shown):
     gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = Vg_all0[k],
-        name = f"sweep {k}",
+        x = np.arange(n_states_gambler),
+        y = V_per_sweep_default[sweep],
+        name = f"sweep {sweep}",
         mode = "lines",
         marker_color = colors[i],
         row = 1,
@@ -739,8 +1270,8 @@ for i, k in enumerate(sweep_ids):
     )
 
 gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = Vg_all0[-1],
+        x = np.arange(n_states_gambler),
+        y = V_per_sweep_default[-1],
         name = "final",
         mode = "lines",
         marker_color = colors[i+1],
@@ -749,8 +1280,8 @@ gambler_fig.add_scatter(
     )
 
 gambler_fig.add_scatter(
-        x = np.arange(nS_g),
-        y = opt_stake0,
+        x = np.arange(n_states_gambler),
+        y = optimal_stake_default,
         name = "optimal policy",
         showlegend=False,
         mode="lines",
@@ -761,21 +1292,21 @@ gambler_fig.add_scatter(
     )
 
 slider_steps = []
-for p in ph_steps:
-    Vall, stake = results[p]
+for p_h in p_h_values:
+    V_per_sweep, stake = results[p_h]
     slider_steps.append(
         dict(
             method="update",
-            label=f"{p:g}",
+            label=f"{p_h:g}",
             args=[
-                {"y": [Vall[k] for k in sweep_ids] + [Vall[-1], stake]},
-                {"title.text": title_for(p)},
+                {"y": [V_per_sweep[sweep] for sweep in sweeps_shown] + [V_per_sweep[-1], stake]},
+                {"title.text": title_for(p_h)},
             ],
         )
     )
 
 gambler_fig.update_layout(
-    title = title_for(ph_val),
+    title = title_for(P_HEADS),
     xaxis1_title = "Capital",
     xaxis2_title = "Capital",
     yaxis1=dict(title = "Value"),
@@ -791,7 +1322,7 @@ gambler_fig.update_layout(
     ),
     sliders=[
         dict(
-            active=DEFAULT_IDX,
+            active=DEFAULT_P_H_INDEX,
             steps=slider_steps,
             pad=dict(t=35),
             currentvalue=dict(
@@ -807,7 +1338,7 @@ gambler_fig.update_annotations(yshift=20)
 gambler_fig.show(config=dict(displayModeBar=False))
 ```
 
-## Asynchronous DP
+# Asynchronous DP
 
 The methods above do **synchronous (Jacobi)** sweeps where we compute every $v_{k+1}(s)$ from the *old* $v_k$, using two copies of the array.
 
@@ -817,37 +1348,123 @@ Here is the **in-place (Gauss-Seidel)** version of value iteration where we use 
 
 
 ```{python}
-def inplace_state_update(s, V, P_t, R_t, g, mask):
-    q_s = (P_t[s] * (R_t[s] + g * V[None, :])).sum(axis=1) # (nA,)
-    new_val = mask[s] * q_s.max()
-    return pt.set_subtensor(V[s], new_val) # write back in place
+def inplace_state_update(s, V, P_sym, R_sym, gamma, mask):
+    """Apply the Bellman optimality backup to one state and write the result back into V.
 
-def inplace_sweep(V_in, P_t, R_t, g, mask):
+        V(s) <- max_a sum_s' p(s'|s, a) [ r(s, a, s') + gamma * V(s') ]
+
+    ``V`` already holds the new values of the states updated earlier in this sweep, so the
+    backup uses the freshest value of every next state. Here every reward is -1 until a terminal
+    state is reached, and the mask pins the two terminal states to 0.
+
+    Parameters
+    ----------
+    s : TensorVariable of int, scalar
+        The state to update, supplied by the scan sequence.
+    V : TensorVariable, shape (16,)
+        The current values, partly updated this sweep.
+    P_sym : TensorVariable, shape (16, 4, 16)
+        Transition probabilities p(s'|s, a).
+    R_sym : TensorVariable, shape (16, 4, 16)
+        Rewards r(s, a, s').
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+    mask : TensorVariable, shape (16,)
+        1.0 for a non-terminal state, 0.0 for a terminal one.
+
+    Returns
+    -------
+    TensorVariable, shape (16,)
+        ``V`` with entry ``s`` replaced by its new value.
+    """
+    q_s = (P_sym[s] * (R_sym[s] + gamma * V[None, :])).sum(axis=1) # (n_actions,)
+    new_value = mask[s] * q_s.max()
+    return pt.set_subtensor(V[s], new_value) # write back in place
+
+def inplace_sweep(V_in, P_sym, R_sym, gamma, mask):
+    """One in-place (Gauss-Seidel) sweep of value iteration.
+
+    Updates the states one at a time, in the order 0, 1, ..., 15, with `inplace_state_update`.
+    Each new value is written into the same vector straight away, so a state updated late in the
+    sweep already sees the new values of the states updated before it.
+
+    Parameters
+    ----------
+    V_in : TensorVariable, shape (16,)
+        The values at the start of the sweep.
+    P_sym : TensorVariable, shape (16, 4, 16)
+        Transition probabilities p(s'|s, a).
+    R_sym : TensorVariable, shape (16, 4, 16)
+        Rewards r(s, a, s').
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+    mask : TensorVariable, shape (16,)
+        1.0 for a non-terminal state, 0.0 for a terminal one.
+
+    Returns
+    -------
+    TensorVariable, shape (16,)
+        The values after every state has been updated once.
+    """
     V_seq = pytensor.scan(
         fn=inplace_state_update,
-        sequences=[pt.arange(nS)],
+        sequences=[pt.arange(n_states)],
         outputs_info=V_in,
-        non_sequences=[P_t, R_t, g, mask],
+        non_sequences=[P_sym, R_sym, gamma, mask],
         return_updates=False
     )
     return V_seq[-1]
 
 V_in = pt.vector("V_in")
-one_sweep = pytensor.function([V_in, gamma], inplace_sweep(V_in, P_t, R_t, gamma, nonterminal))
+one_sweep = pytensor.function([V_in, gamma], inplace_sweep(V_in, P_sym, R_sym, gamma, not_terminal))
 
-V = np.zeros(nS)
+V = np.zeros(n_states)
 for sweeps in range(1, 200):
-    V_next = one_sweep(V, 1.0)
+    V_next = one_sweep(V, GAMMA_GRID)
     if np.max(np.abs(V_next - V)) < 1e-9:
         break
     V = V_next
-print(f"in-place (Gauss-Seidel) value iteration: {sweeps - 1} sweeps")
-print(f"synchronous (Jacobi) value iteration: {converged} sweeps")
-
-show_grid(V_next, "v_* from in-place value iteration:")
+sweeps_inplace = sweeps - 1
 ```
 
-## Generalized Policy Iteration (GPI)
+```{python}
+sweep_rows = pd.DataFrame([
+    dict(method="In-place (Gauss-Seidel)", sweeps=sweeps_inplace),
+    dict(method="Synchronous (Jacobi)", sweeps=sweeps_synchronous),
+])
+
+sweeps_table = (
+    GT(sweep_rows, rowname_col="method")
+    .tab_header(
+        title=md("**In-place against synchronous value iteration**"),
+        subtitle="Sweeps until the values stop changing on the 4×4 gridworld, with γ = 1."
+    )
+    .tab_stubhead(label="Value iteration")
+    .cols_label(sweeps="Sweeps")
+    .fmt_integer(columns="sweeps")
+    .cols_align("right", columns="sweeps")
+)
+sweeps_table
+```
+
+```{python}
+#| classes: light-mode
+values_figure(
+    {"v<sub>*</sub> from in-place value iteration": V_next},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"v<sub>*</sub> from in-place value iteration": V_next},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+# Generalized Policy Iteration (GPI)
 
 Step back and notice everything we built is the same dance between two processes:
 
@@ -865,9 +1482,9 @@ Step back and notice everything we built is the same dance between two processes
 
 They all chase the same fixed point - the single $(v_*, \pi_*)$ where *both* consistency conditions hold at once.
 
-## Recap
+# Summary & Recap
 
-We implemented the chapter material on top of the same PyTensor MDP machinery from the previous notebook:
+We implemented the chapter material on top of the same PyTensor MDP machinery from the previous chapter:
 
 - **policy evaluation**: iterate the expectation backup to $v_\pi$
 - **policy improvement**: greedy step, justified by the improvement theorem

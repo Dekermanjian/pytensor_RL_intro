@@ -65,14 +65,15 @@ with warnings.catch_warnings():
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 import pytensor
 import pytensor.tensor as pt
 from dataclasses import dataclass
-from collections import Counter
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.io as pio
 from plotly.subplots import make_subplots
+from great_tables import GT, loc, style, md, html
 
 colors = px.colors.qualitative.Pastel
 pio.renderers.default = "notebook_connected"
@@ -113,7 +114,37 @@ class Env:
 
 ```{python}
 def make_env(name, n_states, n_actions, step_fn, terminals, starts, shape=(), legal_actions=None):
-    "step_fn(s, a) returns (s_next, reward_mean, reward_sd); terminals absorb with reward 0."
+    """Build a tabular `Env` by asking a step function about every (s, a) pair.
+
+    Terminal states absorb: every action leaves a terminal state where it is, with reward 0.
+    The reachable states are found by a breadth-first search from the start states that
+    follows only legal actions.
+
+    Parameters
+    ----------
+    name : str
+        Label for the environment. It also keys the DP oracle and names random generators.
+    n_states, n_actions : int
+        Number of states and of actions.
+    step_fn : callable
+        ``step_fn(s, a)`` returns ``(s_next, reward_mean, reward_sd)`` for one deterministic
+        transition. It is never called on a terminal state.
+    terminals : iterable of int
+        The terminal states.
+    starts : iterable of int
+        The start states. Each episode starts in one of them, chosen uniformly.
+    shape : tuple of int, default ()
+        ``(n_rows, n_cols)`` of the grid. Used only for drawing.
+    legal_actions : ndarray, shape (n_states, n_actions), optional
+        1.0 where an action is allowed, 0.0 where it is not. By default every action is legal.
+
+    Returns
+    -------
+    Env
+        The model ``P`` (n_states, n_actions, n_states), the reward mean and standard
+        deviation (n_states, n_actions), and the terminal, start, legal-action and
+        reachable arrays.
+    """
     P = np.zeros((n_states, n_actions, n_states))
     reward_mean = np.zeros((n_states, n_actions))
     reward_sd = np.zeros((n_states, n_actions))
@@ -166,28 +197,286 @@ UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
 ARROWS = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
 
 def _move(row, col, action, n_rows, n_cols):
+    """Move one cell on a grid. A move off the edge leaves the agent where it is.
+
+    Parameters
+    ----------
+    row, col : int
+        The current cell. Row 0 is the top row.
+    action : {UP, DOWN, LEFT, RIGHT}
+        The direction to move.
+    n_rows, n_cols : int
+        Size of the grid.
+
+    Returns
+    -------
+    row, col : int
+        The cell after the move.
+    """
     if action == UP: row = max(row - 1, 0)
     elif action == DOWN: row = min(row + 1, n_rows - 1)
     elif action == LEFT: col = max(col - 1, 0)
     elif action == RIGHT: col = min(col + 1, n_cols - 1)
     return row, col
+```
 
-def show_grid(values, env, title="", fmt="6.1f"):
-    if title: print(title)
-    n_rows, n_cols = env.shape
-    for row in np.asarray(values, dtype=float).reshape(n_rows, n_cols):
-        print("  " + "  ".join(f"{x:{fmt}}" for x in row))
+```{python}
+STEP = {UP: (0, 1), DOWN: (0, -1), LEFT: (-1, 0), RIGHT: (1, 0)} # action -> (dx, dy) when drawn
 
-def show_policy(actions, env, title="", extra=None):
-    "extra: dict cell -> character, drawn on top (terminals, cliff, start, ...)"
-    if title: print(title)
+@dataclass(frozen=True)
+class GridTheme:
+    template: str    # plotly template
+    background: str  # plot background, which shows in the gaps between cells
+    floor: str       # fill of a non-terminal cell the agent can stand on
+    wall: str        # fill of a cell the agent can never stand on
+
+GRID_LIGHT = GridTheme(template="plotly_white", background="white", floor="#f2f2f2", wall="#9a9a9a")
+GRID_DARK = GridTheme(template="plotly_dark", background="black", floor="#9e9d9d", wall="#4f4f4f")
+GRID_TERMINAL = colors[4] # terminal cell fill, the same in both themes
+GRID_INK, GRID_ARROW = "#4a4a4a", colors[2] # labels and policy arrows, drawn on the cells in both themes
+
+def grid_xy(s, shape):
+    """Convert a state id to (x, y) plot coordinates, with grid row 0 drawn at the top.
+
+    Parameters
+    ----------
+    s : int
+        The state, numbered ``row * n_cols + col``.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+
+    Returns
+    -------
+    x, y : int
+        The column, and the row counted up from the bottom.
+    """
+    n_rows, n_cols = shape
+    row, col = divmod(int(s), n_cols)
+    return col, n_rows - 1 - row
+
+def grid_panels(panel_titles, shape, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Make an empty figure with one subplot per panel, each holding a grid of square cells.
+
+    The figure is tall enough for every cell to be ``cell_px`` pixels high and takes the page
+    width; the cells stay square. The panels are laid out left to right, then top to bottom.
+
+    Parameters
+    ----------
+    panel_titles : list of str
+        One title per panel.
+    shape : tuple of (int, int)
+        The (n_rows, n_cols) of the grid. Every panel shares it.
+    title : str, default ""
+        The figure title. Plotly HTML (<b>, <br>, <sup>) works.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        The figure, with the axes of every panel hidden and scaled so the cells are square.
+    """
+    n_rows, n_cols = shape
+    n_panels = len(panel_titles)
+    n_panel_cols = n_panel_cols or n_panels
+    n_panel_rows = -(-n_panels // n_panel_cols) # ceiling division
+    gap_x_px, gap_y_px = 20, 40 # between panels
+    plot_width = n_panel_cols * n_cols * cell_px + (n_panel_cols - 1) * gap_x_px
+    plot_height = n_panel_rows * n_rows * cell_px + (n_panel_rows - 1) * gap_y_px
+
+    fig = make_subplots(
+        rows=n_panel_rows,
+        cols=n_panel_cols,
+        subplot_titles=[f"<b>{t}</b>" for t in panel_titles],
+        horizontal_spacing=gap_x_px / plot_width,
+        vertical_spacing=gap_y_px / plot_height
+    )
+
+    for row in range(1, n_panel_rows + 1):
+        for col in range(1, n_panel_cols + 1):
+            x_axis = fig.get_subplot(row, col).xaxis.plotly_name.replace("axis", "")
+            fig.update_xaxes(range=[-0.55, n_cols - 0.45], visible=False, constrain="domain",
+                             row=row, col=col)
+            fig.update_yaxes(range=[-0.55, n_rows - 0.45], visible=False, scaleanchor=x_axis,
+                             constrain="domain", row=row, col=col)
+
+    margin = dict(l=10, r=10, b=10, t=(80 if title else 0) + 30)
+    fig.update_layout(
+        title=title,
+        height=plot_height + margin["t"] + margin["b"],
+        margin=margin,
+        template=theme.template,
+        plot_bgcolor=theme.background,
+        showlegend=False
+    )
+    return fig
+
+def draw_cells(fig, env, fills, labels, row=1, col=1, pad=0.04):
+    """Draw one filled square per state into a subplot, with an optional label on top.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    env : Env
+        Supplies the grid shape.
+    fills : list of str, length n_states
+        The fill color of each state's cell.
+    labels : dict of {int: str}
+        Text drawn in the middle of a cell, by state, e.g. ``{start: "S"}``.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    pad : float, default 0.04
+        Gap around each cell, in cell widths.
+    """
+    for s in range(env.n_states):
+        x, y = grid_xy(s, env.shape)
+        fig.add_shape(
+            type="rect",
+            x0=x - 0.5 + pad,
+            x1=x + 0.5 - pad,
+            y0=y - 0.5 + pad,
+            y1=y + 0.5 - pad,
+            fillcolor=fills[s],
+            line_width=0,
+            layer="below",
+            row=row, col=col
+        )
+    for s, label in labels.items():
+        x, y = grid_xy(s, env.shape)
+        fig.add_annotation(x=x, y=y, text=f"<b>{label}</b>", showarrow=False,
+                           font=dict(size=14, color=GRID_INK), row=row, col=col)
+
+def draw_arrows(fig, env, actions, states, row=1, col=1, color=GRID_ARROW):
+    """Draw an arrow in each of the given states, pointing the way its action moves.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    env : Env
+        Supplies the grid shape.
+    actions : array_like of int, shape (n_states,)
+        The action in each state. Only the entries for ``states`` are drawn.
+    states : array_like of int
+        The states that get an arrow.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    color : str, default GRID_ARROW
+        The arrow color.
+    """
+    subplot = fig.get_subplot(row, col)
+    x_ref = subplot.xaxis.plotly_name.replace("axis", "")
+    y_ref = subplot.yaxis.plotly_name.replace("axis", "")
+    for s in states:
+        x, y = grid_xy(s, env.shape)
+        dx, dy = STEP[int(actions[s])]
+        fig.add_annotation(
+            x=x + 0.34 * dx,
+            y=y + 0.34 * dy,
+            ax=x - 0.22 * dx,
+            ay=y - 0.22 * dy,
+            xref=x_ref, yref=y_ref,
+            axref=x_ref, ayref=y_ref,
+            showarrow=True,
+            arrowhead=2, arrowsize=1.0, arrowwidth=2.2, arrowcolor=color
+        )
+
+def values_figure(values, env, title="", fmt=".1f", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one number per state, laid out as the grid and colored by size.
+
+    Each panel has its own color scale, so the colors compare states within a panel; the printed
+    numbers carry the values. Unreachable states are left blank.
+
+    Parameters
+    ----------
+    values : dict of {str: array_like of shape (n_states,)}
+        One panel per entry: its title, and the number for each state (e.g. a state-value
+        function).
+    env : Env
+        Supplies the grid shape and the reachable states.
+    title : str, default ""
+        The figure title.
+    fmt : str, default ".1f"
+        d3 format spec for the numbers printed in the cells.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
     n_rows, n_cols = env.shape
-    chars = [ARROWS[int(a)] for a in actions]
-    for s in np.flatnonzero(env.terminal): chars[s] = "T"
-    for s in np.flatnonzero(~env.reachable): chars[s] = "."
-    for s, ch in (extra or {}).items(): chars[s] = ch
-    for row in range(n_rows):
-        print("   " + " ".join(chars[row * n_cols:(row + 1) * n_cols]))
+    fig = grid_panels(list(values), env.shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(values)
+    for i, v in enumerate(values.values()):
+        grid = np.where(env.reachable, np.asarray(v, dtype=float), np.nan).reshape(n_rows, n_cols)
+        state = np.arange(env.n_states).reshape(n_rows, n_cols)
+        fig.add_heatmap(
+            x=np.arange(n_cols),
+            y=np.arange(n_rows),
+            z=grid[::-1], # grid row 0 at the top
+            customdata=state[::-1],
+            colorscale="Teal",
+            showscale=False,
+            texttemplate=f"%{{z:{fmt}}}",
+            xgap=3,
+            ygap=3,
+            hovertemplate=f"state %{{customdata}}: <b>%{{z:{fmt}}}</b><extra></extra>",
+            row=i // n_panel_cols + 1, col=i % n_panel_cols + 1
+        )
+    return fig
+
+def policy_figure(policies, env, title="", extra=None, n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one arrow per state for each deterministic policy, laid out as the grid.
+
+    Unreachable states get the wall color, and terminal states the terminal color with the
+    label "T". A state in ``extra`` shows its label instead of an arrow.
+
+    Parameters
+    ----------
+    policies : dict of {str: array_like of int, shape (n_states,)}
+        One panel per entry: its title, and the action taken in each state.
+    env : Env
+        Supplies the grid shape and the terminal and reachable states.
+    title : str, default ""
+        The figure title.
+    extra : dict of {int: str}, optional
+        Labels drawn in place of the arrows, by state, e.g. ``{start: "S"}``.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The template, background and floor and wall fills. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    extra = extra or {}
+    fills = [
+        theme.wall if not env.reachable[s] else GRID_TERMINAL if env.terminal[s] else theme.floor
+        for s in range(env.n_states)
+    ]
+    labels = {**{int(s): "T" for s in np.flatnonzero(env.terminal)}, **extra}
+    has_arrow = env.reachable & ~env.terminal
+    has_arrow[list(extra)] = False
+    fig = grid_panels(list(policies), env.shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(policies)
+    for i, actions in enumerate(policies.values()):
+        row, col = i // n_panel_cols + 1, i % n_panel_cols + 1
+        draw_cells(fig, env, fills, labels, row, col)
+        draw_arrows(fig, env, actions, np.flatnonzero(has_arrow), row, col)
+    return fig
 ```
 
 The five environments are all undiscounted ($\gamma = 1$) with $-1$ reward per step unless noted.
@@ -195,7 +484,7 @@ The five environments are all undiscounted ($\gamma = 1$) with $-1$ reward per s
 | Env | Shape | What it is |
 |:-------|:------|:-----------------------------------------------------------------------|
 | **`grid4`** | $4\times4$ | Terminal corners `0` and `15`, episodes start uniformly on a non-terminal cell. Our workbench for prediction, because we know $v_\pi$ and $v_*$ exactly. |
-| **`walk5`** | $1\times5$ | Five states in a row, absorbing ends, reward $+1$ only on stepping off the right end, always starting in the centre. Under the random policy $v_\pi(i) = i/6$ - values small enough that TD and MC can be compared cleanly. |
+| **`walk5`** | $1\times5$ | Five states in a row, absorbing ends, reward $+1$ only on stepping off the right end, always starting in the center. Under the random policy $v_\pi(i) = i/6$ - values small enough that TD and MC can be compared cleanly. |
 | **`cliff`** | $4\times12$ | Stepping into the bottom-row cliff costs $-100$ and teleports you back to the start (the episode does *not* end). |
 | **`windy`** | $7\times10$ | An upward wind displaces you by 0-2 cells depending on the column you leave from. |
 | **`maxbias`** | 2 decision states | From `A` you may go `left` into `B` or `right` to terminate; every one of `B`'s ten actions terminates with reward $\mathcal N(-0.1, 1)$. Going left is *always* a mistake in expectation, which is what makes it a trap for a learner that maximizes over noisy estimates. |
@@ -206,48 +495,232 @@ The five environments are all undiscounted ($\gamma = 1$) with $-1$ reward per s
 # name, n_states, n_actions, step_fn, terminals, starts, shape=(), legal_actions=None
 # as arguments
 
-def grid4_env():
-    def step(s, a):
-        "return next_state, reward_mean, reward_sd"
-        row, col = _move(*divmod(s, 4), a, 4, 4)
-        return row * 4 + col, -1.0, 0.0
-    return make_env("grid4", 16, 4, step, [0, 15],
-                    [s for s in range(16) if s not in (0, 15)], shape=(4, 4))
+def grid4_env(n_rows=4, n_cols=4, step_reward=-1.0):
+    """Build the 4x4 gridworld.
 
-def walk5_env():
+    The corners 0 and 15 are terminal, and episodes start uniformly on a non-terminal cell. Moves
+    are deterministic, a move off the grid leaves the agent where it is, and every step earns
+    ``step_reward`` without noise.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 4, 4
+        Size of the grid.
+    step_reward : float, default -1.0
+        Reward on every step.
+
+    Returns
+    -------
+    Env
+        The gridworld, with 16 states and 4 actions (UP, DOWN, LEFT, RIGHT).
+    """
+    n_states = n_rows * n_cols
+    corners = [0, n_states - 1]
+    def step(s, a):
+        """The step function for `make_env`: one deterministic move.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``step_reward`` on every step.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
+        row, col = _move(*divmod(s, n_cols), a, n_rows, n_cols)
+        return row * n_cols + col, step_reward, 0.0
+    return make_env("grid4", n_states, 4, step, corners,
+                    [s for s in range(n_states) if s not in corners], shape=(n_rows, n_cols))
+
+def walk5_env(right_end_reward=1.0):
+    """Build the 5-state random walk.
+
+    The five inner states 1-5 sit in a row between the terminal ends 0 and 6, and every episode
+    starts in the center, state 3. Every reward is 0 except ``right_end_reward`` for stepping off
+    the right end into state 6.
+
+    Parameters
+    ----------
+    right_end_reward : float, default 1.0
+        Reward for the step off the right end.
+
+    Returns
+    -------
+    Env
+        The walk, with 7 states (the two ends included) and 2 actions: 0 steps left, 1 right.
+    """
     def step(s, a): # a = 0 left, a = 1 right
+        """The step function for `make_env`: one step left or right.
+
+        Parameters
+        ----------
+        s : int
+            The current state, 1 to 5.
+        a : {0, 1}
+            0 steps left, 1 steps right.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``right_end_reward`` for the step into state 6, 0.0 otherwise.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         s_next = s - 1 if a == 0 else s + 1
-        return s_next, 1.0 if s_next == 6 else 0.0, 0.0
+        return s_next, right_end_reward if s_next == 6 else 0.0, 0.0
     return make_env("walk5", 7, 2, step, [0, 6], [3], shape=(1, 7))
 
-def cliff_env(n_rows=4, n_cols=12):
+def cliff_env(n_rows=4, n_cols=12, step_reward=-1.0, cliff_reward=-100.0):
+    """Build the cliff-walking gridworld.
+
+    The start and the goal are the two bottom corners, and the cells between them are the cliff.
+    Stepping into the cliff earns ``cliff_reward`` and sends the agent back to the start, without
+    ending the episode, so the cliff cells themselves are never occupied. Every other step earns
+    ``step_reward``. Rewards have no noise.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 4, 12
+        Size of the grid.
+    step_reward : float, default -1.0
+        Reward for a step that does not enter the cliff.
+    cliff_reward : float, default -100.0
+        Reward for stepping into the cliff.
+
+    Returns
+    -------
+    Env
+        The gridworld, with 4 actions.
+    """
     start_state = (n_rows - 1) * n_cols
     goal = (n_rows - 1) * n_cols + n_cols - 1
     cliff_cells = {(n_rows - 1) * n_cols + col for col in range(1, n_cols - 1)}
     def step(s, a):
+        """The step function for `make_env`: one move, or a fall into the cliff.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state: the start state after a fall.
+        reward_mean : float
+            ``cliff_reward`` for a fall into the cliff, ``step_reward`` otherwise.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         row, col = _move(*divmod(s, n_cols), a, n_rows, n_cols)
         s_next = row * n_cols + col
-        return (start_state, -100.0, 0.0) if s_next in cliff_cells else (s_next, -1.0, 0.0)
+        return (start_state, cliff_reward, 0.0) if s_next in cliff_cells else (s_next, step_reward, 0.0)
     return make_env("cliff", n_rows * n_cols, 4, step, [goal], [start_state],
                     shape=(n_rows, n_cols))
 
 WIND = np.array([0, 0, 0, 1, 1, 1, 2, 2, 1, 0])
 
-def windy_env(n_rows=7, n_cols=10):
+def windy_env(n_rows=7, n_cols=10, step_reward=-1.0):
+    """Build the windy gridworld.
+
+    After each move, the wind of the column the agent leaves, ``WIND[col]``, pushes it that many
+    rows up, stopping at the top edge. Episodes start at row 3, column 0, and the goal is row 3,
+    column 7. Every step earns ``step_reward``, without noise.
+
+    Parameters
+    ----------
+    n_rows, n_cols : int, default 7, 10
+        Size of the grid.
+    step_reward : float, default -1.0
+        Reward on every step.
+
+    Returns
+    -------
+    Env
+        The gridworld, with 4 actions.
+    """
     def step(s, a):
+        """The step function for `make_env`: one move, then the wind.
+
+        Parameters
+        ----------
+        s : int
+            The current state, numbered ``row * n_cols + col``.
+        a : {UP, DOWN, LEFT, RIGHT}
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            ``step_reward`` on every step.
+        reward_sd : float
+            0.0: the reward has no noise.
+        """
         row, col = divmod(s, n_cols)
         row_next, col_next = _move(row, col, a, n_rows, n_cols)
         row_next = max(row_next - WIND[col], 0)   # wind of the column you leave, blowing up
-        return row_next * n_cols + col_next, -1.0, 0.0
+        return row_next * n_cols + col_next, step_reward, 0.0
     return make_env("windy", n_rows * n_cols, 4, step, [3 * n_cols + 7], [3 * n_cols],
                     shape=(n_rows, n_cols))
 
 def maxbias_env(n_B_actions=10, mean=-0.1, sd=1.0):
+    """Build the maximization-bias MDP.
+
+    State 0 is A, the start, state 1 is B, and state 2 is terminal. In A only two actions are
+    legal: 0 (left) leads to B and 1 (right) terminates, both with reward 0. Every action in B
+    terminates, with reward drawn from N(mean, sd).
+
+    Parameters
+    ----------
+    n_B_actions : int, default 10
+        Number of actions in B, which is also the size of the action space.
+    mean : float, default -0.1
+        Mean reward of every action in B.
+    sd : float, default 1.0
+        Standard deviation of that reward.
+
+    Returns
+    -------
+    Env
+        The MDP, with 3 states and ``n_B_actions`` actions.
+    """
     # 0 = A (start), 1 = B, 2 = terminal. A: 0 = left -> B, 1 = right -> terminal
     legal_actions = np.zeros((3, n_B_actions))
     legal_actions[0, :2] = 1.0 # only left(0) and right(1) are legal
     legal_actions[1:, :] = 1.0 # B: all n_B_actions and terminal are legal
     def step(s, a):
+        """The step function for `make_env`: one transition out of A or B.
+
+        Parameters
+        ----------
+        s : {0, 1}
+            The current state, A or B.
+        a : int
+            The action.
+
+        Returns
+        -------
+        s_next : int
+            B (1) after left in A, the terminal state (2) otherwise.
+        reward_mean : float
+            0.0 out of A, ``mean`` out of B.
+        reward_sd : float
+            0.0 out of A, ``sd`` out of B.
+        """
         if s == 0:
             return (1, 0.0, 0.0) if a == 0 else (2, 0.0, 0.0)
         return 2, mean, sd
@@ -268,6 +741,34 @@ that turns any state-value vector into action values. Illegal actions are masked
 
 ```{python}
 def make_dp(env, n_iters=2000):
+    """Compile exact dynamic programming for one environment: the "DP oracle".
+
+    Both solvers start from v = 0 and apply ``n_iters`` synchronous sweeps, with terminal
+    states held at 0. Policy evaluation applies the Bellman expectation backup,
+
+        v(s) <- sum_a pi(a|s) [ r(s, a) + gamma * sum_s' p(s'|s, a) v(s') ],
+
+    and value iteration applies the Bellman optimality backup, a max over the legal actions
+    in place of the sum over pi.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model: ``P``, ``reward_mean``, ``terminal`` and ``legal_actions``.
+    n_iters : int, default 2000
+        Number of sweeps for each solver.
+
+    Returns
+    -------
+    evaluate_policy : callable
+        ``evaluate_policy(pi, gamma) -> v_pi``, with ``pi`` of shape (n_states, n_actions)
+        and ``v_pi`` of shape (n_states,).
+    optimal_values : callable
+        ``optimal_values(gamma) -> v_*``, shape (n_states,).
+    action_values_of : callable
+        ``action_values_of(v, gamma) -> q``, the one-step lookahead
+        ``q(s, a) = r(s, a) + gamma * sum_s' p(s'|s, a) v(s')``, shape (n_states, n_actions).
+    """
     P = pt.as_tensor_variable(env.P)
     reward = pt.as_tensor_variable(env.reward_mean)
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
@@ -277,12 +778,58 @@ def make_dp(env, n_iters=2000):
     v_in = pt.vector("v")
 
     def q_from(v, gamma):
+        """One-step lookahead: turn state values into action values.
+
+            q(s, a) = r(s, a) + gamma * sum_s' p(s'|s, a) v(s')
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            State values.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states, n_actions)
+            The action values q(s, a).
+        """
         return reward + gamma * (P * v[None, None, :]).sum(axis=2)
 
-    def expectation_step(v, pi, gamma): # v_{k+1}(s) = sum_a pi(a|s) q_k(s, a)
+    def expectation_step(v, pi, gamma):
+        """One sweep of policy evaluation: v_{k+1}(s) = sum_a pi(a|s) q_k(s, a), terminals held at 0.
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            The values v_k from the previous sweep.
+        pi : TensorVariable, shape (n_states, n_actions)
+            The policy pi(a|s).
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states,)
+            The values v_{k+1}.
+        """
         return not_terminal * (pi * q_from(v, gamma)).sum(axis=1)
 
-    def optimality_step(v, gamma): # v_{k+1}(s) = max over the legal a of q_k(s, a)
+    def optimality_step(v, gamma):
+        """One sweep of value iteration: v_{k+1}(s) = max over the legal a of q_k(s, a), terminals held at 0.
+
+        Parameters
+        ----------
+        v : TensorVariable, shape (n_states,)
+            The values v_k from the previous sweep.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_states,)
+            The values v_{k+1}.
+        """
         q = pt.where(legal_actions > 0, q_from(v, gamma), NEG_INF)
         return not_terminal * q.max(axis=1)
 
@@ -308,23 +855,62 @@ def make_dp(env, n_iters=2000):
 
 
 ```{python}
+GAMMA_GRID4 = 1.0 # every environment in this chapter is undiscounted
+GAMMA_WALK = 1.0
+GAMMA_CLIFF = 1.0
+GAMMA_WINDY = 1.0
+GAMMA_MAXBIAS = 1.0
+
 ORACLE = {e.name: make_dp(e) for e in (grid4, walk5, cliff, windy, maxbias)}
 
-def exact(env, gamma=1.0, pi=None):
-    "v_pi if a policy is given, else v_*; always with the matching action values."
+def exact(env, gamma, pi=None):
+    """Return the exact state and action values from the DP oracle in ``ORACLE[env.name]``.
+
+    Parameters
+    ----------
+    env : Env
+        The environment. Its oracle must already be in ``ORACLE``.
+    gamma : float
+        Discount factor.
+    pi : ndarray, shape (n_states, n_actions), optional
+        A policy, as pi(a|s). If given, return v_pi and q_pi; otherwise v_* and q_*.
+
+    Returns
+    -------
+    v : ndarray, shape (n_states,)
+        v_pi or v_*.
+    q : ndarray, shape (n_states, n_actions)
+        The matching action values, ``r(s, a) + gamma * sum_s' p(s'|s, a) v(s')``, set to 0
+        in terminal states.
+    """
     evaluate_policy, optimal_values, action_values_of = ORACLE[env.name]
     v = evaluate_policy(pi, gamma) if pi is not None else optimal_values(gamma)
     q = action_values_of(v, gamma)
     q[env.terminal] = 0.0
     return v, q
 
-pi_random_g4 = np.ones((grid4.n_states, grid4.n_actions)) / grid4.n_actions
-v_pi_g4, q_pi_g4 = exact(grid4, 1.0, pi_random_g4)
-v_star_g4, q_star_g4 = exact(grid4)
+pi_random_grid4 = np.ones((grid4.n_states, grid4.n_actions)) / grid4.n_actions
+v_pi_grid4, q_pi_grid4 = exact(grid4, GAMMA_GRID4, pi_random_grid4)
+v_star_grid4, q_star_grid4 = exact(grid4, GAMMA_GRID4)
+```
 
-show_grid(v_pi_g4, grid4, "exact v_pi, equiprobable random policy:")
-print()
-show_grid(v_star_g4, grid4, "exact v_* :")
+```{python}
+#| classes: light-mode
+values_figure(
+    {"Exact v<sub>π</sub>, equiprobable random policy": v_pi_grid4,
+     "Exact v<sub>*</sub>": v_star_grid4},
+    grid4
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"Exact v<sub>π</sub>, equiprobable random policy": v_pi_grid4,
+     "Exact v<sub>*</sub>": v_star_grid4},
+    grid4,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 ## Simulator
@@ -352,6 +938,29 @@ The rollout returns aligned $(T,B)$ tensors, each row $t$ holding $(S_t, A_t, R_
 
 ```{python}
 def make_rollout(env, seed):
+    """Compile a batched episode simulator for one environment.
+
+    Rolls out many episodes in parallel for ``max_steps`` steps each. At every step,
+
+        A_t ~ pi(. | S_t),    S_{t+1} ~ p(. | S_t, A_t),    R_{t+1} ~ N(r_mu(S_t, A_t), r_sigma(S_t, A_t)).
+
+    Terminal states absorb with reward 0, so the steps after an episode ends are padding. The
+    random generator state carries over between calls.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model: ``P``, ``reward_mean`` and ``reward_sd``.
+    seed : int
+        Seed for the simulator's random generator.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(pi, s_start, max_steps) -> (S, A, R, S_next)``. ``pi`` has
+        shape (n_states, n_actions) and ``s_start`` is int64 of shape (n_episodes,). Each output
+        has shape (max_steps, n_episodes), and row t holds S_t, A_t, R_{t+1} and S_{t+1}.
+    """
     P = pt.as_tensor_variable(env.P)
     reward_mean = pt.as_tensor_variable(env.reward_mean)
     reward_sd = pt.as_tensor_variable(env.reward_sd)
@@ -361,6 +970,28 @@ def make_rollout(env, seed):
     max_steps = pt.iscalar("T")
 
     def step(s, rng, pi):
+        """Advance every episode by one time step: draw A_t, then S_{t+1} and R_{t+1}.
+
+        Parameters
+        ----------
+        s : TensorVariable of int, shape (n_episodes,)
+            The current states S_t.
+        rng : RandomGeneratorSharedVariable
+            The random generator state, threaded through the scan.
+        pi : TensorVariable, shape (n_states, n_actions)
+            The policy being rolled out, pi(a|s).
+
+        Returns
+        -------
+        s_next : TensorVariable of int, shape (n_episodes,)
+            The next states S_{t+1}.
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_episodes,)
+            The actions A_t.
+        r : TensorVariable, shape (n_episodes,)
+            The rewards R_{t+1}.
+        """
         rng, a = rng.categorical(p=pi[s]) # A_t ~ pi(.|S_t)
         rng, s_next = rng.categorical(p=P[s, a]) # S_{t+1} ~ p(.|S_t,A_t)
         rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a]) # R_{t+1}
@@ -377,11 +1008,36 @@ def make_rollout(env, seed):
     return pytensor.function([pi, s_start, max_steps], [S, A, R, S_next], updates={rng_shared: rng_final})
 
 def make_returns():
-    "G_t = R_{t+1} + gamma * G_{t+1}, backward updates."
+    """Compile the discounted returns of a block of episodes, computed backward.
+
+        G_t = R_{t+1} + gamma * G_{t+1},  with the return after the last step 0.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(R, gamma) -> G``. ``R`` and ``G`` have shape
+        (max_steps, n_episodes), and row t of ``R`` holds R_{t+1}.
+    """
     R = pt.matrix("R")
     gamma = pt.scalar("g")
 
     def accumulate_return(r, G_next, gamma):
+        """One step of the backward return recursion, for every episode at once.
+
+        Parameters
+        ----------
+        r : TensorVariable, shape (n_episodes,)
+            The rewards R_{t+1}: one row of the reward block, supplied by the scan sequence.
+        G_next : TensorVariable, shape (n_episodes,)
+            The returns G_{t+1} from the following time step.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_episodes,)
+            The returns G_t.
+        """
         return r + gamma * G_next # R_{t+1} + gamma * G_{t+1}
 
     G = pytensor.scan(
@@ -394,7 +1050,7 @@ def make_returns():
     return pytensor.function([R, gamma], G[::-1])
 
 returns_fn = make_returns()
-rollout_g4 = make_rollout(grid4, 2026)
+rollout_grid4 = make_rollout(grid4, 2026)
 rollout_walk = make_rollout(walk5, 4242)
 np_rng = np.random.default_rng(0)
 ```
@@ -443,8 +1099,35 @@ In the previous chapter MC ran thousands of episodes *in parallel* along a batch
 
 ```{python}
 def make_predict(env, kind):
-    """TD(0) (kind='td0') or constant-alpha every-visit MC (kind='mc') prediction.
-    Episodes come in as (n_episodes, max_steps, n_learners); returns V after each episode."""
+    """Compile online TD(0) or constant-α every-visit MC prediction, for many learners at once.
+
+    Each learner walks through its own episodes in order and updates V after every transition,
+
+        V(S_t) <- V(S_t) + alpha [ target - V(S_t) ],
+
+    where the target is ``R_{t+1} + gamma * V(S_{t+1})`` for TD(0), with V of a terminal state
+    counted as 0, and the return ``G_t`` for MC. Padded steps after termination leave V unchanged.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the terminal states.
+    kind : {'td0', 'mc'}
+        Which target to use.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(S, targets, S_next, V_init, alpha, gamma) -> V``:
+
+        - ``S``, ``S_next``: int64, shape (n_episodes, max_steps, n_learners).
+        - ``targets``: shape (n_episodes, max_steps, n_learners). The rewards R_{t+1} for
+          TD(0), the returns G_t for MC.
+        - ``V_init``: shape (n_learners, n_states).
+        - ``alpha``: shape (n_learners,), each learner's step size.
+        - ``gamma``: float, the discount factor.
+        - ``V``: shape (n_episodes, n_learners, n_states), the values after each episode.
+    """
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
     S_all = pt.ltensor3("S")
     targets_all = pt.dtensor3("X")
@@ -453,16 +1136,58 @@ def make_predict(env, kind):
     alpha = pt.dvector("alpha")
     gamma = pt.scalar("g")
 
-    def transition(s, x, s_next, V, alpha, gamma):
+    def transition(s, reward_or_return, s_next, V, alpha, gamma):
+        """Update every learner's V for one transition.
+
+        Parameters
+        ----------
+        s : TensorVariable of int, shape (n_learners,)
+            The states S_t, supplied by the scan sequence.
+        reward_or_return : TensorVariable, shape (n_learners,)
+            R_{t+1} for TD(0), or G_t for MC, supplied by the scan sequence.
+        s_next : TensorVariable of int, shape (n_learners,)
+            The next states S_{t+1}, supplied by the scan sequence.
+        V : TensorVariable, shape (n_learners, n_states)
+            The values before the update.
+        alpha : TensorVariable, shape (n_learners,)
+            Each learner's step size.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_learners, n_states)
+            The values after the update. Only V(S_t) changes, and not at all on a padded step.
+        """
         learners = pt.arange(V.shape[0])
         still_running = not_terminal[s] # skip padding after termination
-        # x is R_{t+1} for TD(0) (bootstrap off V(S_{t+1})), and G_t for MC
-        target = (x + gamma * not_terminal[s_next] * V[learners, s_next]
-                  if kind == "td0" else x)
+        # reward_or_return is R_{t+1} for TD(0) (bootstrap off V(S_{t+1})), and G_t for MC
+        target = (reward_or_return + gamma * not_terminal[s_next] * V[learners, s_next]
+                  if kind == "td0" else reward_or_return)
         return pt.inc_subtensor(V[learners, s],
                                 alpha * still_running * (target - V[learners, s]))
 
     def episode(S_ep, targets_ep, S_next_ep, V, alpha, gamma):
+        """Run `transition` over every step of one episode, in order.
+
+        Parameters
+        ----------
+        S_ep, S_next_ep : TensorVariable of int, shape (max_steps, n_learners)
+            One episode's states and next states, supplied by the outer scan sequence.
+        targets_ep : TensorVariable, shape (max_steps, n_learners)
+            Its rewards (TD(0)) or returns (MC).
+        V : TensorVariable, shape (n_learners, n_states)
+            The values before this episode.
+        alpha : TensorVariable, shape (n_learners,)
+            Each learner's step size.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_learners, n_states)
+            The values after this episode.
+        """
         V_steps = pytensor.scan(fn=transition, sequences=[S_ep, targets_ep, S_next_ep],
                                 outputs_info=V, non_sequences=[alpha, gamma],
                                 return_updates=False)
@@ -474,15 +1199,43 @@ def make_predict(env, kind):
     return pytensor.function([S_all, targets_all, S_next_all, V_init, alpha, gamma],
                              V_per_episode)
 
-td0_g4 = make_predict(grid4, "td0")
-mc_g4 = make_predict(grid4, "mc")
+td0_grid4 = make_predict(grid4, "td0")
+mc_grid4 = make_predict(grid4, "mc")
 ```
 
 
 ```{python}
-def episodes_for(rollout, env, pi, n_episodes, n_learners, max_steps, gamma=1.0):
-    """One rollout call, reshaped into (n_episodes, max_steps, n_learners) so that learner r
-    sees its own stream of n_episodes episodes in order."""
+def episodes_for(rollout, env, pi, n_episodes, n_learners, max_steps, gamma):
+    """Simulate a stream of episodes for every learner, in one rollout call.
+
+    Start states are drawn from ``env.start``. The (max_steps, n_episodes * n_learners) rollout is
+    reshaped to (n_episodes, max_steps, n_learners), so that learner r sees its own stream of
+    ``n_episodes`` episodes in order.
+
+    Parameters
+    ----------
+    rollout : callable
+        A simulator from `make_rollout` for ``env``.
+    env : Env
+        Supplies the start-state distribution and the terminal states.
+    pi : ndarray, shape (n_states, n_actions)
+        The policy to roll out.
+    n_episodes : int
+        Episodes per learner.
+    n_learners : int
+        Number of independent learners.
+    max_steps : int
+        Steps per episode. An episode that has not terminated by then is cut off.
+    gamma : float
+        Discount factor for the returns.
+
+    Returns
+    -------
+    S, A, R, S_next, G : ndarray, shape (n_episodes, max_steps, n_learners)
+        The states, actions, rewards R_{t+1}, next states and returns G_t at every step.
+    frac_finished : float
+        The fraction of episodes that reached a terminal state within ``max_steps``.
+    """
     n_chains = n_episodes * n_learners
     s_start = np_rng.choice(np.flatnonzero(env.start > 0), size=n_chains,
                             p=env.start[env.start > 0]).astype("int64")
@@ -496,65 +1249,121 @@ def episodes_for(rollout, env, pi, n_episodes, n_learners, max_steps, gamma=1.0)
 
 
 ```{python}
-N_EPISODES, N_RUNS, MAX_STEPS_G4 = 3000, 10, 80
-alphas_g4 = [0.02, 0.05, 0.10]
-n_learners_g4 = N_RUNS * len(alphas_g4)
-alpha_per_learner = np.repeat(alphas_g4, N_RUNS)
+N_EPISODES_GRID4, N_RUNS_GRID4, MAX_STEPS_GRID4 = 3000, 10, 80
+alphas_grid4 = [0.02, 0.05, 0.10]
+n_learners_grid4 = N_RUNS_GRID4 * len(alphas_grid4)
+alpha_per_learner_grid4 = np.repeat(alphas_grid4, N_RUNS_GRID4)
 
-S_g4, A_g4, R_g4, S_next_g4, G_g4, frac_finished = episodes_for(rollout_g4, grid4, pi_random_g4, N_EPISODES, n_learners_g4, MAX_STEPS_G4)
+S_grid4, A_grid4, R_grid4, S_next_grid4, G_grid4, frac_finished = episodes_for(rollout_grid4, grid4, pi_random_grid4, N_EPISODES_GRID4, n_learners_grid4, MAX_STEPS_GRID4, GAMMA_GRID4)
 
-print(f"{N_EPISODES} episodes x {n_learners_g4} learners, {frac_finished:.2%} of episodes "
-      f"terminated within T={MAX_STEPS_G4}")
+print(f"{N_EPISODES_GRID4} episodes x {n_learners_grid4} learners, {frac_finished:.2%} of episodes "
+      f"terminated within T={MAX_STEPS_GRID4}")
 ```
 
 
 ```{python}
-V_init_g4 = np.zeros((n_learners_g4, grid4.n_states))
-V_td = td0_g4(S_g4, R_g4, S_next_g4, V_init_g4, alpha_per_learner, 1.0)   # (n_episodes, n_learners, n_states)
-V_mc = mc_g4(S_g4, G_g4, S_next_g4, V_init_g4, alpha_per_learner, 1.0)
+V_init_grid4 = np.zeros((n_learners_grid4, grid4.n_states))
+V_td = td0_grid4(S_grid4, R_grid4, S_next_grid4, V_init_grid4, alpha_per_learner_grid4, GAMMA_GRID4)   # (n_episodes, n_learners, n_states)
+V_mc = mc_grid4(S_grid4, G_grid4, S_next_grid4, V_init_grid4, alpha_per_learner_grid4, GAMMA_GRID4)
 
-non_terminal_g4 = ~grid4.terminal
+non_terminal_grid4 = ~grid4.terminal
 
 def rmse_over_states(V, v_true, states):
-    "V: (n_episodes, n_learners, n_states) -> (n_episodes, n_learners) RMSE over `states`."
+    """Return the RMSE of value estimates against the true values, over a subset of the states.
+
+        RMSE = sqrt( mean over the chosen s of ( V(s) - v_true(s) )^2 )
+
+    Parameters
+    ----------
+    V : ndarray, shape (n_episodes, n_learners, n_states)
+        The estimates after each episode, for every learner.
+    v_true : ndarray, shape (n_states,)
+        The true values.
+    states : ndarray of bool, shape (n_states,), or ndarray of int
+        The states to average over.
+
+    Returns
+    -------
+    ndarray, shape (n_episodes, n_learners)
+        The RMSE after each episode, for every learner.
+    """
     return np.sqrt(((V[:, :, states] - v_true[states]) ** 2).mean(axis=2))
 
-rms_td = rmse_over_states(V_td, v_pi_g4, non_terminal_g4)
-rms_mc = rmse_over_states(V_mc, v_pi_g4, non_terminal_g4)
-smallest_alpha = slice(0, N_RUNS) # the alpha = 0.02 block
-show_grid(V_td[-1, smallest_alpha].mean(axis=0), grid4,
-          f"TD(0) estimate of v_pi after {N_EPISODES} episodes (alpha = {alphas_g4[0]}):")
-print()
-show_grid(v_pi_g4, grid4, "exact v_pi from the DP oracle:")
+rmse_td = rmse_over_states(V_td, v_pi_grid4, non_terminal_grid4)
+rmse_mc = rmse_over_states(V_mc, v_pi_grid4, non_terminal_grid4)
+smallest_alpha = slice(0, N_RUNS_GRID4) # the alpha = 0.02 block
+```
+
+```{python}
+#| classes: light-mode
+values_figure(
+    {f"TD(0) estimate of v<sub>π</sub> after {N_EPISODES_GRID4:,} episodes (α = {alphas_grid4[0]})":
+         V_td[-1, smallest_alpha].mean(axis=0),
+     "Exact v<sub>π</sub> from the DP oracle": v_pi_grid4},
+    grid4
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {f"TD(0) estimate of v<sub>π</sub> after {N_EPISODES_GRID4:,} episodes (α = {alphas_grid4[0]})":
+         V_td[-1, smallest_alpha].mean(axis=0),
+     "Exact v<sub>π</sub> from the DP oracle": v_pi_grid4},
+    grid4,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 
 ```{python}
-for i, alpha in enumerate(alphas_g4):
-    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
-    td_curve = rms_td[:, block].mean(axis=1)
-    mc_curve = rms_mc[:, block].mean(axis=1)
+checkpoint_episodes = [100, 500, 3000]
+rmse_rows = []
+for i, alpha in enumerate(alphas_grid4):
+    block = slice(i * N_RUNS_GRID4, (i + 1) * N_RUNS_GRID4)
+    td_curve = rmse_td[:, block].mean(axis=1)
+    mc_curve = rmse_mc[:, block].mean(axis=1)
 
     crossing = np.flatnonzero(td_curve < mc_curve)
 
-    print(f"\nRMSE at alpha = {alpha}")
-    for ep in [100, 500, 3000]:
-        print(f"  after {ep} episodes: TD(0) {td_curve[ep-1]:.2f} | "
-              f"constant-alpha MC {mc_curve[ep-1]:.2f}")
-    print(f"  TD overtakes MC at episode {crossing[0] + 1}" if crossing.size
-          else "  TD never overtakes MC")
+    row = dict(alpha=f"α = {alpha}")
+    for episode in checkpoint_episodes:
+        row[f"td_{episode}"] = td_curve[episode - 1]
+        row[f"mc_{episode}"] = mc_curve[episode - 1]
+    row["overtakes"] = crossing[0] + 1 if crossing.size else None
+    rmse_rows.append(row)
+
+rmse_columns = [f"{method}_{episode}" for episode in checkpoint_episodes for method in ("td", "mc")]
+rmse_table = (
+    GT(pd.DataFrame(rmse_rows), rowname_col="alpha")
+    .tab_header(
+        title=md("**RMSE of TD(0) and constant-α MC on the 4×4 gridworld**"),
+        subtitle=html(f"Against the exact <i>v</i><sub>π</sub>, mean of {N_RUNS_GRID4} runs per step size.")
+    )
+    .tab_stubhead(label="Step size")
+    .cols_label(**{f"td_{episode}": "TD(0)" for episode in checkpoint_episodes},
+                **{f"mc_{episode}": "Constant-α MC" for episode in checkpoint_episodes},
+                overtakes="TD overtakes MC at episode")
+    .fmt_number(columns=rmse_columns, decimals=2)
+    .fmt_integer(columns="overtakes")
+    .sub_missing(columns="overtakes", missing_text="never")
+    .cols_align("right", columns=[*rmse_columns, "overtakes"])
+)
+for episode in checkpoint_episodes:
+    rmse_table = rmse_table.tab_spanner(label=f"After {episode:,} episodes", columns=[f"td_{episode}", f"mc_{episode}"])
+rmse_table
 ```
 
 
 ```{python}
 #| classes: light-mode
 pred_fig = go.Figure()
-for i, alpha in enumerate(alphas_g4):
-    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
+for i, alpha in enumerate(alphas_grid4):
+    block = slice(i * N_RUNS_GRID4, (i + 1) * N_RUNS_GRID4)
 
     pred_fig.add_scatter(
-        x=np.arange(1, N_EPISODES + 1),
-        y=rms_td[:, block].mean(axis=1), # avg over learners
+        x=np.arange(1, N_EPISODES_GRID4 + 1),
+        y=rmse_td[:, block].mean(axis=1), # avg over learners
         mode="lines",
         name=f"TD(0), alpha={alpha}",
         line=dict(color=colors[i], width=2),
@@ -562,8 +1371,8 @@ for i, alpha in enumerate(alphas_g4):
     )
 
     pred_fig.add_scatter(
-        x=np.arange(1, N_EPISODES + 1),
-        y=rms_mc[:, block].mean(axis=1),
+        x=np.arange(1, N_EPISODES_GRID4 + 1),
+        y=rmse_mc[:, block].mean(axis=1),
         mode="lines",
         name=f"MC, alpha={alpha}",
         line=dict(color=colors[i], width=2, dash="dot"),
@@ -572,7 +1381,7 @@ for i, alpha in enumerate(alphas_g4):
 
 pred_fig.update_layout(
     title="<b>TD(0) vs constant-alpha MC on the 4x4 gridworld</b>"
-          f"<br><sup>RMSE against exact v_pi, {N_RUNS} runs per step size</sup>",
+          f"<br><sup>RMSE against exact v_pi, {N_RUNS_GRID4} runs per step size</sup>",
     xaxis=dict(title="episodes (log scale)", type="log"),
     yaxis=dict(title="RMSE over states"),
     template="plotly_white",
@@ -586,12 +1395,12 @@ pred_fig.show(config=dict(displayModeBar=False))
 ```{python}
 #| classes: dark-mode
 pred_fig = go.Figure()
-for i, alpha in enumerate(alphas_g4):
-    block = slice(i * N_RUNS, (i + 1) * N_RUNS)
+for i, alpha in enumerate(alphas_grid4):
+    block = slice(i * N_RUNS_GRID4, (i + 1) * N_RUNS_GRID4)
 
     pred_fig.add_scatter(
-        x=np.arange(1, N_EPISODES + 1),
-        y=rms_td[:, block].mean(axis=1), # avg over learners
+        x=np.arange(1, N_EPISODES_GRID4 + 1),
+        y=rmse_td[:, block].mean(axis=1), # avg over learners
         mode="lines",
         name=f"TD(0), alpha={alpha}",
         line=dict(color=colors[i], width=2),
@@ -599,8 +1408,8 @@ for i, alpha in enumerate(alphas_g4):
     )
 
     pred_fig.add_scatter(
-        x=np.arange(1, N_EPISODES + 1),
-        y=rms_mc[:, block].mean(axis=1),
+        x=np.arange(1, N_EPISODES_GRID4 + 1),
+        y=rmse_mc[:, block].mean(axis=1),
         mode="lines",
         name=f"MC, alpha={alpha}",
         line=dict(color=colors[i], width=2, dash="dot"),
@@ -609,7 +1418,7 @@ for i, alpha in enumerate(alphas_g4):
 
 pred_fig.update_layout(
     title="<b>TD(0) vs constant-alpha MC on the 4x4 gridworld</b>"
-          f"<br><sup>RMSE against exact v_pi, {N_RUNS} runs per step size</sup>",
+          f"<br><sup>RMSE against exact v_pi, {N_RUNS_GRID4} runs per step size</sup>",
     xaxis=dict(title="episodes (log scale)", type="log"),
     yaxis=dict(title="RMSE over states"),
     template="plotly_dark",
@@ -623,11 +1432,11 @@ pred_fig.show(config=dict(displayModeBar=False))
 
 - Every curve **plateaus** rather than converging to zero. With a fixed $\alpha$ the estimate keeps chasing the most recent samples, so it settles into a noise band around $v_\pi$ whose width grows with $\alpha$.
 
-- **Monte Carlo descends first, but TD ends up more accurate.** This is the bias-variance off, where MC's target is an unbiased sample of the right magnitude, so from the cold start $V=0$ it lands in the right ballpark almost immediately. Whereas, TD which bootstraps off its own wrong values, has to *diffuse* the terminal-state information outward roughly one state per visit. However, when TD's estimates are in the right ballpark the situation reverses because returns on this gridworld are wildly variable (the random policy's episode lengths range from a couple of steps to dozens), MC keeps jumping toward noisy targets and never settles, but TD's target is anchored by an estimate that is already nearly right.
+- **Monte Carlo descends first, but TD ends up more accurate.** This is the bias-variance trade-off, where MC's target is an unbiased sample of the right magnitude, so from the cold start $V=0$ it lands in the right ballpark almost immediately. Whereas, TD which bootstraps off its own wrong values, has to *diffuse* the terminal-state information outward roughly one state per visit. However, when TD's estimates are in the right ballpark the situation reverses because returns on this gridworld are wildly variable (the random policy's episode lengths range from a couple of steps to dozens), MC keeps jumping toward noisy targets and never settles, but TD's target is anchored by an estimate that is already nearly right.
 
 - **Larger $\alpha$ is faster early and worse late** - and it hurts MC much more than TD, for the same reason.
 
-TD learning faster is not unconditional. MC pays for varianc while TD pays for bias, however, the bias is transient as TD will eventually convegerge on the correct estimate, but the variance is not as MC will continue jumping toward noisy targets.
+TD learning faster is not unconditional. MC pays for variance while TD pays for bias, however, the bias is transient as TD will eventually converge on the correct estimate, but the variance is not as MC will continue jumping toward noisy targets.
 
 # Advantages of TD prediction methods
 
@@ -662,11 +1471,29 @@ V_drive = time_to_go.copy() # value = predicted time to go
 V_drive_mc = V_drive + 1.0 * ((elapsed[-1] - elapsed) - V_drive) # alpha = 1: target G_t
 V_drive_td = V_drive.copy()
 V_drive_td[:-1] = leg_cost + V_drive[1:] # alpha = 1: target R + V(next)
+```
 
-print(f"{'state':>22} {'predicted total':>16} {'after MC':>10} {'after TD':>10}")
-for i, leg in enumerate(legs):
-    print(f"{leg:>22} {predicted_total[i]:16.0f} "
-          f"{elapsed[i] + V_drive_mc[i]:10.0f} {elapsed[i] + V_drive_td[i]:10.0f}")
+```{python}
+drive_update_rows = pd.DataFrame({
+    "state": legs,
+    "predicted_total": predicted_total,
+    "after_mc": elapsed + V_drive_mc,
+    "after_td": elapsed + V_drive_td,
+})
+drive_update_columns = ["predicted_total", "after_mc", "after_td"]
+
+drive_update_table = (
+    GT(drive_update_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Driving home: predicted total time, before and after one update**"),
+        subtitle="α = 1. Times in minutes."
+    )
+    .tab_stubhead(label="State")
+    .cols_label(predicted_total="Predicted total", after_mc="After MC", after_td="After TD")
+    .fmt_number(columns=drive_update_columns, decimals=0)
+    .cols_align("right", columns=drive_update_columns)
+)
+drive_update_table
 ```
 
 
@@ -839,7 +1666,7 @@ Two branching scenarios make the trip stochastic:
 
 Each leg's duration is itself noisy, so no two commutes are alike.
 
-Both learners are initialised with the static example's own table, $[30, 30, 35, 15, 10, 3, 0]$.
+Both learners are initialized with the static example's own table, $[30, 30, 35, 15, 10, 3, 0]$.
 
 
 ```{python}
@@ -849,6 +1676,7 @@ DRIVE_STATES = ["leaving office", "at car, dry", "at car, raining",
                 "exiting highway", "behind truck", "home street", "home"]
 
 P_RAIN, P_TRUCK = 0.3, 0.4
+GAMMA_DRIVE = 1.0 # undiscounted: a state's value is the expected time to go
 
 DRIVE_LEGS = { # (state, scenario/branch) -> (next state, mean minutes, sd)
     (OFFICE, 0): (CAR_DRY, 5.0, 1.0),
@@ -862,7 +1690,37 @@ DRIVE_LEGS = { # (state, scenario/branch) -> (next state, mean minutes, sd)
 }
 
 def drive_env():
+    """Build the stochastic drive-home commute as an MDP.
+
+    Each leg's duration in minutes is a reward, drawn from N(mean, sd) as listed in
+    ``DRIVE_LEGS``. The "action" is which branch of the scenario happens: at the office it is
+    whether it rains, and on the highway whether you end up behind the truck. A fixed policy
+    (``pi_drive``) supplies those probabilities, so the value of a state is the expected time to go.
+
+    Returns
+    -------
+    Env
+        The commute, with 7 states, 2 actions (the branches) and home as the terminal state.
+    """
     def step(s, a):
+        """The step function for `make_env`: look up the leg for this state and branch.
+
+        Parameters
+        ----------
+        s : int
+            The current state.
+        a : {0, 1}
+            The branch. Where a state has only one leg, branch 1 takes the same leg as branch 0.
+
+        Returns
+        -------
+        s_next : int
+            The next state.
+        reward_mean : float
+            Mean duration of the leg, in minutes.
+        reward_sd : float
+            Standard deviation of that duration.
+        """
         return DRIVE_LEGS.get((s, a), DRIVE_LEGS[(s, 0)]) # branch 1 == branch 0 where unbranched
     return make_env("drive", 7, 2, step, [HOME], [OFFICE], shape=(1, 7))
 
@@ -873,69 +1731,139 @@ pi_drive[OFFICE] = [1 - P_RAIN,  P_RAIN]
 pi_drive[EXIT_HWY] = [1 - P_TRUCK, P_TRUCK]
 
 ORACLE[drive.name] = make_dp(drive)
-v_drive_true, _ = exact(drive, 1.0, pi_drive)
+v_drive_true, _ = exact(drive, GAMMA_DRIVE, pi_drive)
 rollout_drive = make_rollout(drive, 606)
 td0_drive = make_predict(drive, "td0")
 mc_drive = make_predict(drive, "mc")
 
 MAX_STEPS_DRIVE = 6
-S_peek, _, _, _, G_peek, frac_drive = episodes_for(rollout_drive, drive, pi_drive, 6, 1, MAX_STEPS_DRIVE)
+S_peek, _, _, _, G_peek, frac_drive = episodes_for(rollout_drive, drive, pi_drive, 6, 1, MAX_STEPS_DRIVE, GAMMA_DRIVE)
+```
 
-print(f"exact E[time to go], from the DP oracle ({frac_drive:.0%} of trips reach home):")
-for s, name in enumerate(DRIVE_STATES):
-    print(f"  {name:>16}  {v_drive_true[s]:6.2f} min")
+```{python}
+exact_drive_rows = pd.DataFrame({"state": DRIVE_STATES, "time_to_go": v_drive_true})
 
-print("\nsix sampled commutes:")
-for e in range(6):
-    route = [DRIVE_STATES[s] for s in S_peek[e, :, 0]]
+exact_drive_table = (
+    GT(exact_drive_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Exact expected time to go, from the DP oracle**"),
+        subtitle=f"{frac_drive:.0%} of the sampled trips reach home."
+    )
+    .tab_stubhead(label="State")
+    .cols_label(time_to_go="E[time to go] (min)")
+    .fmt_number(columns="time_to_go", decimals=2)
+    .cols_align("right", columns="time_to_go")
+)
+exact_drive_table
+```
+
+```{python}
+commute_rows = []
+for commute in range(6):
+    route = [DRIVE_STATES[s] for s in S_peek[commute, :, 0]]
     route = route[:1] + [r for r in route[1:] if r != "home"]
-    print(f"  {G_peek[e, 0, 0]:5.1f} min " + " -> ".join(route))
+    commute_rows.append(dict(total=G_peek[commute, 0, 0], route=" → ".join(route)))
+
+commutes_table = (
+    GT(pd.DataFrame(commute_rows))
+    .tab_header(title=md("**Six sampled commutes**"))
+    .cols_label(total="Total (min)", route="Route")
+    .fmt_number(columns="total", decimals=1)
+    .cols_align("right", columns="total")
+)
+commutes_table
 ```
 
 
 
 ```{python}
-N_EPISODES_D = 1000
-N_RUNS_D = 50
-alphas_d = [0.01, 0.05, 0.20]
-n_learners_d = N_RUNS_D * len(alphas_d)
-alpha_per_learner_d = np.repeat(alphas_d, N_RUNS_D)
+N_EPISODES_DRIVE = 1000
+N_RUNS_DRIVE = 50
+alphas_drive = [0.01, 0.05, 0.20]
+n_learners_drive = N_RUNS_DRIVE * len(alphas_drive)
+alpha_per_learner_drive = np.repeat(alphas_drive, N_RUNS_DRIVE)
 
 V_prior = np.array([30., 30., 35., 15., 10., 3., 0.]) # the hard-coded time_to_go
-V_init_d = np.tile(V_prior, (n_learners_d, 1))
+V_init_drive = np.tile(V_prior, (n_learners_drive, 1))
 
-S_d, A_d, R_d, S_next_d, G_d, _ = episodes_for(rollout_drive, drive, pi_drive, N_EPISODES_D, n_learners_d, MAX_STEPS_DRIVE)
-V_td_d = td0_drive(S_d, R_d, S_next_d, V_init_d, alpha_per_learner_d, 1.0)
-V_mc_d = mc_drive(S_d, G_d, S_next_d, V_init_d, alpha_per_learner_d, 1.0)
+S_drive, A_drive, R_drive, S_next_drive, G_drive, _ = episodes_for(rollout_drive, drive, pi_drive, N_EPISODES_DRIVE, n_learners_drive, MAX_STEPS_DRIVE, GAMMA_DRIVE)
+V_td_drive = td0_drive(S_drive, R_drive, S_next_drive, V_init_drive, alpha_per_learner_drive, GAMMA_DRIVE)
+V_mc_drive = mc_drive(S_drive, G_drive, S_next_drive, V_init_drive, alpha_per_learner_drive, GAMMA_DRIVE)
 
-non_terminal_d = ~drive.terminal
-rms_td_d = rmse_over_states(V_td_d, v_drive_true, non_terminal_d)
-rms_mc_d = rmse_over_states(V_mc_d, v_drive_true, non_terminal_d)
+non_terminal_drive = ~drive.terminal
+rmse_td_drive = rmse_over_states(V_td_drive, v_drive_true, non_terminal_drive)
+rmse_mc_drive = rmse_over_states(V_mc_drive, v_drive_true, non_terminal_drive)
 
-print(f"one trip's total time has sd {G_d[:, 0, :].std():.2f} min "
-      f"- that is the noise Monte Carlo puts into every target\n")
+print(f"one trip's total time has sd {G_drive[:, 0, :].std():.2f} min "
+      f"- that is the noise Monte Carlo puts into every target")
 
-for i, alpha in enumerate(alphas_d):
-    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
-    td_curve = rms_td_d[:, block].mean(axis=1)
-    mc_curve =  rms_mc_d[:, block].mean(axis=1)
+middle_alpha_block = slice(N_RUNS_DRIVE, 2 * N_RUNS_DRIVE) # the alpha = 0.05 block
+```
+
+```{python}
+checkpoint_trips = [25, 100, 1000]
+rmse_drive_rows = []
+for i, alpha in enumerate(alphas_drive):
+    block = slice(i * N_RUNS_DRIVE, (i + 1) * N_RUNS_DRIVE)
+    td_curve = rmse_td_drive[:, block].mean(axis=1)
+    mc_curve = rmse_mc_drive[:, block].mean(axis=1)
 
     crossing = np.flatnonzero(td_curve < mc_curve)
-    print(f"RMSE at alpha = {alpha}")
 
-    for ep in (25, 100, 1000):
-        print(f"  after {ep} trips: TD(0) {td_curve[ep-1]:.3f} | MC {mc_curve[ep-1]:.3f}")
-    print(f"  TD overtakes MC at trip {crossing[0] + 1}\n" if crossing.size
-          else "  TD never overtakes MC\n")
+    row = dict(alpha=f"α = {alpha}")
+    for trip in checkpoint_trips:
+        row[f"td_{trip}"] = td_curve[trip - 1]
+        row[f"mc_{trip}"] = mc_curve[trip - 1]
+    row["overtakes"] = crossing[0] + 1 if crossing.size else None
+    rmse_drive_rows.append(row)
 
-mid = slice(N_RUNS_D, 2 * N_RUNS_D) # the alpha = 0.05 block
-print(f"{'state':>16} {'prior':>7} {'TD(0)':>7} {'MC':>7} {'exact':>7} - (alpha = 0.05)")
-for s, name in enumerate(DRIVE_STATES):
-    print(f"{name:>16} {V_prior[s]:7.2f} {V_td_d[-1, mid, s].mean():7.2f} "
-          f"{V_mc_d[-1, mid, s].mean():7.2f} {v_drive_true[s]:7.2f}")
+rmse_drive_columns = [f"{method}_{trip}" for trip in checkpoint_trips for method in ("td", "mc")]
+rmse_drive_table = (
+    GT(pd.DataFrame(rmse_drive_rows), rowname_col="alpha")
+    .tab_header(
+        title=md("**RMSE of TD(0) and constant-α MC on the commute**"),
+        subtitle=html(f"Against the exact <i>v</i><sub>π</sub>, in minutes, mean of {N_RUNS_DRIVE} runs per step size.")
+    )
+    .tab_stubhead(label="Step size")
+    .cols_label(**{f"td_{trip}": "TD(0)" for trip in checkpoint_trips},
+                **{f"mc_{trip}": "MC" for trip in checkpoint_trips},
+                overtakes="TD overtakes MC at trip")
+    .fmt_number(columns=rmse_drive_columns, decimals=3)
+    .fmt_integer(columns="overtakes")
+    .sub_missing(columns="overtakes", missing_text="never")
+    .cols_align("right", columns=[*rmse_drive_columns, "overtakes"])
+)
+for trip in checkpoint_trips:
+    rmse_drive_table = rmse_drive_table.tab_spanner(label=f"After {trip:,} trips", columns=[f"td_{trip}", f"mc_{trip}"])
+rmse_drive_table
+```
 
-print(f"\nspread of V(leaving office) across the {N_RUNS_D} runs after 1000 trips: "
-      f"TD(0) {V_td_d[-1, mid, OFFICE].std():.3f} | MC {V_mc_d[-1, mid, OFFICE].std():.3f}")
+```{python}
+drive_value_rows = pd.DataFrame({
+    "state": DRIVE_STATES,
+    "prior": V_prior,
+    "td": V_td_drive[-1, middle_alpha_block].mean(axis=0),
+    "mc": V_mc_drive[-1, middle_alpha_block].mean(axis=0),
+    "exact": v_drive_true,
+})
+drive_value_columns = ["prior", "td", "mc", "exact"]
+
+drive_value_table = (
+    GT(drive_value_rows, rowname_col="state")
+    .tab_header(
+        title=md(f"**Predicted time to go after {N_EPISODES_DRIVE:,} trips**"),
+        subtitle=f"α = {alphas_drive[1]}, mean of {N_RUNS_DRIVE} runs. Times in minutes."
+    )
+    .tab_stubhead(label="State")
+    .cols_label(prior="Prior", td="TD(0)", mc="MC", exact="Exact")
+    .fmt_number(columns=drive_value_columns, decimals=2)
+    .cols_align("right", columns=drive_value_columns)
+    .tab_source_note(
+        f"Spread (sd) of V(leaving office) across the {N_RUNS_DRIVE} runs after {N_EPISODES_DRIVE:,} trips: "
+        f"TD(0) {V_td_drive[-1, middle_alpha_block, OFFICE].std():.3f}, MC {V_mc_drive[-1, middle_alpha_block, OFFICE].std():.3f}."
+    )
+)
+drive_value_table
 ```
 
 
@@ -948,14 +1876,14 @@ learn_fig = make_subplots(
         r"$\text{RMSE against exact }v_{\pi}$",
         r"$V(\text{leaving office})\text{, one run at }\alpha = 0.05$")
     )
-trips = np.arange(1, N_EPISODES_D + 1)
+trips = np.arange(1, N_EPISODES_DRIVE + 1)
 
-for i, alpha in enumerate(alphas_d):
-    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
+for i, alpha in enumerate(alphas_drive):
+    block = slice(i * N_RUNS_DRIVE, (i + 1) * N_RUNS_DRIVE)
 
     learn_fig.add_scatter(
         x=trips,
-        y=rms_td_d[:, block].mean(axis=1),
+        y=rmse_td_drive[:, block].mean(axis=1),
         mode="lines",
         name=f"TD(0), alpha={alpha}",
         legendgroup=f"a{i}",
@@ -966,7 +1894,7 @@ for i, alpha in enumerate(alphas_d):
 
     learn_fig.add_scatter(
         x=trips,
-        y=rms_mc_d[:, block].mean(axis=1),
+        y=rmse_mc_drive[:, block].mean(axis=1),
         mode="lines",
         name=f"MC, alpha={alpha}",
         legendgroup=f"a{i}",
@@ -975,11 +1903,11 @@ for i, alpha in enumerate(alphas_d):
         col=1
     )
 
-run = N_RUNS_D # first learner of the alpha = 0.05 block
+run = N_RUNS_DRIVE # first learner of the alpha = 0.05 block
 
 learn_fig.add_scatter(
     x=trips,
-    y=V_mc_d[:, run, OFFICE],
+    y=V_mc_drive[:, run, OFFICE],
     mode="lines",
     name="MC",
     line=dict(color=colors[3], width=1.5),
@@ -990,7 +1918,7 @@ learn_fig.add_scatter(
 
 learn_fig.add_scatter(
     x=trips,
-    y=V_td_d[:, run, OFFICE],
+    y=V_td_drive[:, run, OFFICE],
     mode="lines",
     name="TD(0)",
     line=dict(color=colors[4], width=1.5),
@@ -1014,7 +1942,7 @@ learn_fig.update_yaxes(title="predicted time to go", row=1, col=2)
 
 learn_fig.update_layout(
     title="<b>Driving home, 1000 times</b><br><sup>constant-alpha MC vs TD(0), "
-          f"starting from the static table, {N_RUNS_D} runs</sup>",
+          f"starting from the static table, {N_RUNS_DRIVE} runs</sup>",
     template="plotly_white",
     legend1=dict(orientation="h", yanchor="bottom", y=-0.28, x=0),
     legend2=dict(orientation="h", yanchor="bottom", y=-0.28, x=0.55),
@@ -1034,14 +1962,14 @@ learn_fig = make_subplots(
         r"$\text{RMSE against exact }v_{\pi}$",
         r"$V(\text{leaving office})\text{, one run at }\alpha = 0.05$")
     )
-trips = np.arange(1, N_EPISODES_D + 1)
+trips = np.arange(1, N_EPISODES_DRIVE + 1)
 
-for i, alpha in enumerate(alphas_d):
-    block = slice(i * N_RUNS_D, (i + 1) * N_RUNS_D)
+for i, alpha in enumerate(alphas_drive):
+    block = slice(i * N_RUNS_DRIVE, (i + 1) * N_RUNS_DRIVE)
 
     learn_fig.add_scatter(
         x=trips,
-        y=rms_td_d[:, block].mean(axis=1),
+        y=rmse_td_drive[:, block].mean(axis=1),
         mode="lines",
         name=f"TD(0), alpha={alpha}",
         legendgroup=f"a{i}",
@@ -1052,7 +1980,7 @@ for i, alpha in enumerate(alphas_d):
 
     learn_fig.add_scatter(
         x=trips,
-        y=rms_mc_d[:, block].mean(axis=1),
+        y=rmse_mc_drive[:, block].mean(axis=1),
         mode="lines",
         name=f"MC, alpha={alpha}",
         legendgroup=f"a{i}",
@@ -1061,11 +1989,11 @@ for i, alpha in enumerate(alphas_d):
         col=1
     )
 
-run = N_RUNS_D # first learner of the alpha = 0.05 block
+run = N_RUNS_DRIVE # first learner of the alpha = 0.05 block
 
 learn_fig.add_scatter(
     x=trips,
-    y=V_mc_d[:, run, OFFICE],
+    y=V_mc_drive[:, run, OFFICE],
     mode="lines",
     name="MC",
     line=dict(color=colors[3], width=1.5),
@@ -1076,7 +2004,7 @@ learn_fig.add_scatter(
 
 learn_fig.add_scatter(
     x=trips,
-    y=V_td_d[:, run, OFFICE],
+    y=V_td_drive[:, run, OFFICE],
     mode="lines",
     name="TD(0)",
     line=dict(color=colors[4], width=1.5),
@@ -1100,7 +2028,7 @@ learn_fig.update_yaxes(title="predicted time to go", row=1, col=2)
 
 learn_fig.update_layout(
     title="<b>Driving home, 1000 times</b><br><sup>constant-alpha MC vs TD(0), "
-          f"starting from the static table, {N_RUNS_D} runs</sup>",
+          f"starting from the static table, {N_RUNS_DRIVE} runs</sup>",
     template="plotly_dark",
     legend1=dict(orientation="h", yanchor="bottom", y=-0.28, x=0),
     legend2=dict(orientation="h", yanchor="bottom", y=-0.28, x=0.55),
@@ -1123,53 +2051,90 @@ MC's target accumulates noise from *every remaining leg*, while TD's always sees
 ```{python}
 # stretch the commute by inserting extra highway legs.
 def make_long_drive(n_highway, name):
-    hwy0 = 3
-    truck = hwy0 + n_highway
+    """Build a longer drive-home commute, with the highway split into several legs.
+
+    The first ``n_highway - 1`` highway legs take 4 minutes each (sd 1.5). The last one branches
+    like the original exit: 12 minutes straight to the home street, or 10 minutes into the truck
+    state, which takes 8 more. The office, car, rain and home-street legs are as in `drive_env`.
+
+    Parameters
+    ----------
+    n_highway : int
+        Number of highway states, at least 1. With 1 the commute is the original one.
+    name : str
+        Label for the environment. It also keys the DP oracle.
+
+    Returns
+    -------
+    env : Env
+        The commute, with ``n_highway + 6`` states and 2 actions (the branches).
+    pi : ndarray, shape (n_highway + 6, 2)
+        The fixed policy that sets the scenario probabilities: rain with probability ``P_RAIN``
+        at the office, and the truck with probability ``P_TRUCK`` on the last highway leg.
+    """
+    first_highway = 3
+    truck = first_highway + n_highway
     street = truck + 1
     home = street + 1
 
     legs = {
         (OFFICE, 0): (CAR_DRY, 5.0, 1.0),
         (OFFICE, 1): (CAR_RAIN, 5.0, 1.0),
-        (CAR_DRY, 0): (hwy0, 13.0, 2.0),
-        (CAR_RAIN, 0): (hwy0, 18.0, 3.0),
+        (CAR_DRY, 0): (first_highway, 13.0, 2.0),
+        (CAR_RAIN, 0): (first_highway, 18.0, 3.0),
         (truck, 0): (street, 8.0, 1.5),
         (street, 0): (home, 3.0, 0.5)
     }
 
     for i in range(n_highway - 1):
-        legs[(hwy0 + i, 0)] = (hwy0 + i + 1, 4.0, 1.5)
+        legs[(first_highway + i, 0)] = (first_highway + i + 1, 4.0, 1.5)
 
-    legs[(hwy0 + n_highway - 1, 0)] = (street, 12.0, 1.5)
-    legs[(hwy0 + n_highway - 1, 1)] = (truck, 10.0, 1.0)
+    legs[(first_highway + n_highway - 1, 0)] = (street, 12.0, 1.5)
+    legs[(first_highway + n_highway - 1, 1)] = (truck, 10.0, 1.0)
 
     env = make_env(name, home + 1, 2, lambda s, a: legs.get((s, a), legs[(s, 0)]), [home], [OFFICE])
 
     pi = np.zeros((env.n_states, 2))
     pi[:, 0] = 1.0
     pi[OFFICE] = [1 - P_RAIN, P_RAIN]
-    pi[hwy0 + n_highway - 1] = [1 - P_TRUCK, P_TRUCK]
+    pi[first_highway + n_highway - 1] = [1 - P_TRUCK, P_TRUCK]
     return env, pi
 
-print("alpha = 0.05, 1000 trips, both started from the exact values plus N(0, 3) noise")
-print(f"{'legs':>5} {'return sd':>10} {'TD(0)':>8} {'MC':>8} {'MC/TD':>7}")
+long_drive_rows = []
 for n_highway in (1, 3, 6, 12):
-    env_l, pi_l = make_long_drive(n_highway, f"drive_long{n_highway}")
-    ORACLE[env_l.name] = make_dp(env_l)
-    v_true_l, _ = exact(env_l, 1.0, pi_l)
-    S_l, _, R_l, S_next_l, G_l, _ = episodes_for(make_rollout(env_l, 99), env_l, pi_l,
-                                                 N_EPISODES_D, N_RUNS_D, n_highway + 7)
-    V0_l = v_true_l + np_rng.normal(size=(N_RUNS_D, env_l.n_states)) * 3.0
-    V0_l[:, env_l.terminal] = 0.0
-    alpha_l = np.full(N_RUNS_D, 0.05)
-    td_predict = make_predict(env_l, "td0")
-    mc_predict = make_predict(env_l, "mc")
-    v_td = td_predict(S_l, R_l, S_next_l, V0_l, alpha_l, 1.0)
-    v_mc = mc_predict(S_l, G_l, S_next_l, V0_l, alpha_l, 1.0)
+    env_long, pi_long = make_long_drive(n_highway, f"drive_long{n_highway}")
+    ORACLE[env_long.name] = make_dp(env_long)
+    v_true_long, _ = exact(env_long, GAMMA_DRIVE, pi_long)
+    S_long, _, R_long, S_next_long, G_long, _ = episodes_for(make_rollout(env_long, 99), env_long, pi_long,
+                                                 N_EPISODES_DRIVE, N_RUNS_DRIVE, n_highway + 7, GAMMA_DRIVE)
+    V_init_long = v_true_long + np_rng.normal(size=(N_RUNS_DRIVE, env_long.n_states)) * 3.0
+    V_init_long[:, env_long.terminal] = 0.0
+    alpha_long = np.full(N_RUNS_DRIVE, 0.05)
+    td_predict = make_predict(env_long, "td0")
+    mc_predict = make_predict(env_long, "mc")
+    V_td_long = td_predict(S_long, R_long, S_next_long, V_init_long, alpha_long, GAMMA_DRIVE)
+    V_mc_long = mc_predict(S_long, G_long, S_next_long, V_init_long, alpha_long, GAMMA_DRIVE)
 
-    td_l = rmse_over_states(v_td, v_true_l, ~env_l.terminal)[-1].mean()
-    mc_l = rmse_over_states(v_mc, v_true_l, ~env_l.terminal)[-1].mean()
-    print(f"{n_highway + 4:5d} {G_l[:, 0, :].std():10.2f} {td_l:8.3f} {mc_l:8.3f} {mc_l/td_l:7.2f}")
+    rmse_td_long = rmse_over_states(V_td_long, v_true_long, ~env_long.terminal)[-1].mean()
+    rmse_mc_long = rmse_over_states(V_mc_long, v_true_long, ~env_long.terminal)[-1].mean()
+    long_drive_rows.append(dict(legs=n_highway + 4, return_sd=G_long[:, 0, :].std(), td=rmse_td_long, mc=rmse_mc_long,
+                                ratio=rmse_mc_long / rmse_td_long))
+```
+
+```{python}
+long_drive_table = (
+    GT(pd.DataFrame(long_drive_rows), rowname_col="legs")
+    .tab_header(
+        title=md(f"**Longer commutes: RMSE after {N_EPISODES_DRIVE:,} trips**"),
+        subtitle=f"α = 0.05, {N_EPISODES_DRIVE:,} trips, both started from the exact values plus N(0, 3) noise."
+    )
+    .tab_stubhead(label="Legs")
+    .cols_label(return_sd="Return sd", td="TD(0)", mc="MC", ratio="MC/TD")
+    .fmt_number(columns=["return_sd", "ratio"], decimals=2)
+    .fmt_number(columns=["td", "mc"], decimals=3)
+    .cols_align("right", columns=["return_sd", "td", "mc", "ratio"])
+)
+long_drive_table
 ```
 
 TD's error is flat at $\approx 0.44$ whether the commute is 5 legs or 16, while MC's climbs from $0.59$ to $0.75$.
@@ -1199,13 +2164,35 @@ alphas_td_walk = [0.05, 0.10, 0.15]
 alphas_mc_walk = [0.01, 0.02, 0.03, 0.04]
 
 def walk_experiment(predict, alphas):
+    """Run one prediction method on the random walk, for several step sizes at once.
+
+    Draws fresh episodes under the random policy, ``N_RUNS_WALK`` runs per step size, with every
+    learner starting from V = 0.5 in the five inner states and 0 at the two ends.
+
+    Parameters
+    ----------
+    predict : callable
+        ``td0_walk`` or ``mc_walk``, from `make_predict`. TD(0) is fed the rewards, MC the returns.
+    alphas : list of float
+        The step sizes.
+
+    Returns
+    -------
+    V : ndarray, shape (N_EPISODES_WALK, N_RUNS_WALK * len(alphas), n_states)
+        The values after each episode, with the learners grouped by step size.
+    curves : dict of {float: ndarray of shape (N_EPISODES_WALK,)}
+        For each step size, the RMSE over the five inner states after each episode, averaged
+        over the runs.
+    frac_finished : float
+        The fraction of episodes that terminated within ``MAX_STEPS_WALK`` steps.
+    """
     n_learners = N_RUNS_WALK * len(alphas)
     S, A, R, S_next, G, frac_finished = episodes_for(
-        rollout_walk, walk5, pi_walk, N_EPISODES_WALK, n_learners, MAX_STEPS_WALK)
+        rollout_walk, walk5, pi_walk, N_EPISODES_WALK, n_learners, MAX_STEPS_WALK, GAMMA_WALK)
     V_init = np.full((n_learners, walk5.n_states), 0.5)
     V_init[:, [0, 6]] = 0.0
     targets = R if predict is td0_walk else G
-    V = predict(S, targets, S_next, V_init, np.repeat(alphas, N_RUNS_WALK), 1.0)
+    V = predict(S, targets, S_next, V_init, np.repeat(alphas, N_RUNS_WALK), GAMMA_WALK)
     rmse = rmse_over_states(V, v_walk_true, inner_states)
     return V, {alpha: rmse[:, i * N_RUNS_WALK:(i + 1) * N_RUNS_WALK].mean(axis=1)
                for i, alpha in enumerate(alphas)}, frac_finished
@@ -1214,12 +2201,26 @@ V_walk_td, curves_td, frac_finished_td = walk_experiment(td0_walk, alphas_td_wal
 V_walk_mc, curves_mc, frac_finished_mc = walk_experiment(mc_walk, alphas_mc_walk)
 print(f"episodes finished within T={MAX_STEPS_WALK}: "
       f"TD data {frac_finished_td:.3%}, MC data {frac_finished_mc:.3%}")
+```
 
-for alpha, curve in curves_td.items():
-    print(f"  TD alpha={alpha:<5} RMS after 100 episodes: {curve[-1]:.4f}")
+```{python}
+walk_rows = pd.DataFrame(
+    [dict(method="TD(0)", alpha=f"α = {alpha}", rmse=curve[-1]) for alpha, curve in curves_td.items()]
+    + [dict(method="MC", alpha=f"α = {alpha}", rmse=curve[-1]) for alpha, curve in curves_mc.items()]
+)
 
-for alpha, curve in curves_mc.items():
-    print(f"  MC alpha={alpha:<5} RMS after 100 episodes: {curve[-1]:.4f}")
+walk_table = (
+    GT(walk_rows, rowname_col="alpha", groupname_col="method")
+    .tab_header(
+        title=md(f"**Random walk: RMSE after {N_EPISODES_WALK} episodes**"),
+        subtitle=f"Over the five inner states, mean of {N_RUNS_WALK} runs per step size."
+    )
+    .cols_label(rmse="RMSE")
+    .fmt_number(columns="rmse", decimals=4)
+    .cols_align("right", columns="rmse")
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
+)
+walk_table
 ```
 
 
@@ -1237,14 +2238,14 @@ walk_fig = make_subplots(
 
 alpha_010_run = N_RUNS_WALK  # first run of the alpha = 0.10 block
 
-for i, ep in enumerate([0, 1, 10, 100]):
-    y = np.full(5, 0.5) if ep == 0 else V_walk_td[ep - 1, alpha_010_run, inner_states]
+for i, episode in enumerate([0, 1, 10, 100]):
+    y = np.full(5, 0.5) if episode == 0 else V_walk_td[episode - 1, alpha_010_run, inner_states]
 
     walk_fig.add_scatter(
         x=list("ABCDE"),
         y=y,
         mode="lines+markers+text",
-        text=[""] * 4 + [f" {ep} ep"],
+        text=[""] * 4 + [f" {episode} ep"],
         textposition="middle right",
         textfont=dict(size=11),
         showlegend=False,
@@ -1321,14 +2322,14 @@ walk_fig = make_subplots(
 
 alpha_010_run = N_RUNS_WALK  # first run of the alpha = 0.10 block
 
-for i, ep in enumerate([0, 1, 10, 100]):
-    y = np.full(5, 0.5) if ep == 0 else V_walk_td[ep - 1, alpha_010_run, inner_states]
+for i, episode in enumerate([0, 1, 10, 100]):
+    y = np.full(5, 0.5) if episode == 0 else V_walk_td[episode - 1, alpha_010_run, inner_states]
 
     walk_fig.add_scatter(
         x=list("ABCDE"),
         y=y,
         mode="lines+markers+text",
-        text=[""] * 4 + [f" {ep} ep"],
+        text=[""] * 4 + [f" {episode} ep"],
         textposition="middle right",
         textfont=dict(size=11),
         showlegend=False,
@@ -1410,10 +2411,10 @@ Drag nodes around, or scroll to zoom.
 
 ```{python}
 #| classes: light-mode
-g = nx.MultiDiGraph()
+graph = nx.MultiDiGraph()
 
 for name, x in [("A", -220), ("B", 0)]:
-    g.add_node(
+    graph.add_node(
         name,
         label=name,
         shape="circle",
@@ -1425,7 +2426,7 @@ for name, x in [("A", -220), ("B", 0)]:
         x=x, y=0,
     )
 
-g.add_node(
+graph.add_node(
     "terminal",
     label="terminal",
     shape="rectangle",
@@ -1442,11 +2443,11 @@ transitions = [
     ("B", "terminal", "6/8, r = +1"),
     ("B", "terminal", "2/8, r = 0"),
 ]
-for s, s_next, lbl in transitions:
-    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for s, s_next, label in transitions:
+    graph.add_edge(s, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
 gv.d3(
-    g,
+    graph,
     graph_height=320,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -1460,10 +2461,10 @@ gv.d3(
 
 ```{python}
 #| classes: dark-mode
-g = nx.MultiDiGraph()
+graph = nx.MultiDiGraph()
 
 for name, x in [("A", -220), ("B", 0)]:
-    g.add_node(
+    graph.add_node(
         name,
         label=name,
         label_color="#faf8f8",
@@ -1476,7 +2477,7 @@ for name, x in [("A", -220), ("B", 0)]:
         x=x, y=0,
     )
 
-g.add_node(
+graph.add_node(
     "terminal",
     label="terminal",
     label_color="#faf8f8",
@@ -1494,13 +2495,13 @@ transitions = [
     ("B", "terminal", "6/8, r = +1"),
     ("B", "terminal", "2/8, r = 0"),
 ]
-for s, s_next, lbl in transitions:
-    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for s, s_next, label in transitions:
+    graph.add_edge(s, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
-g.graph['background_color'] = 'black'
+graph.graph['background_color'] = 'black'
 
 gv.d3(
-    g,
+    graph,
     graph_height=320,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -1525,9 +2526,35 @@ Below we compute the batch fixed points *both* ways by running the book's sweeps
 
 ```{python}
 def make_batch_td(env, n_iters=500):
-    """The batch-TD(0) fixed point, computed as policy evaluation on the maximum-likelihood
-    model estimated from the batch.  Transitions arrive flat, (n_transitions, n_runs),
-    weighted by weights."""
+    """Compile the batch-TD(0) fixed point: policy evaluation on the batch's maximum-likelihood model.
+
+    From each run's weighted transitions, estimate the model
+
+        r_hat(s)     = weighted mean of R_{t+1} over the transitions out of s,
+        P_hat(s, s') = weighted fraction of the transitions out of s that land in s',
+
+    then evaluate it with ``n_iters`` sweeps of
+
+        V(s) <- r_hat(s) + gamma * sum_s' P_hat(s, s') V(s'),
+
+    holding terminal states at 0.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the number of states and the terminal states.
+    n_iters : int, default 500
+        Number of evaluation sweeps.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(S, R, S_next, weights, gamma) -> (V, visits, P_hat, reward_hat)``.
+        ``S``, ``R``, ``S_next`` and ``weights`` have shape (n_transitions, n_runs), one column per
+        run's batch, and a transition with weight 0 is ignored. ``V``, ``visits`` (the summed
+        weight of the transitions out of each state) and ``reward_hat`` have shape
+        (n_runs, n_states); ``P_hat`` has shape (n_runs, n_states, n_states).
+    """
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
     S = pt.lmatrix("S")
     R = pt.dmatrix("R")
@@ -1550,6 +2577,24 @@ def make_batch_td(env, n_iters=500):
     P_hat = P_hat / safe_visits[:, :, None]
 
     def evaluation_sweep(V, P_hat, reward_hat, gamma):
+        """One sweep of policy evaluation on every run's estimated model, terminals held at 0.
+
+        Parameters
+        ----------
+        V : TensorVariable, shape (n_runs, n_states)
+            The values from the previous sweep.
+        P_hat : TensorVariable, shape (n_runs, n_states, n_states)
+            Each run's estimated transition probabilities.
+        reward_hat : TensorVariable, shape (n_runs, n_states)
+            Each run's estimated expected reward out of each state.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_runs, n_states)
+            The values after the sweep.
+        """
         return not_terminal[None, :] * (reward_hat + gamma * (P_hat * V[:, None, :]).sum(axis=2))
 
     # evaluated by DP
@@ -1564,7 +2609,20 @@ def make_batch_td(env, n_iters=500):
     return pytensor.function([S, R, S_next, weights, gamma], [V_iters[-1], visits, P_hat, reward_hat])
 
 def make_batch_mc(env):
-    "The batch-MC fixed point: the average observed return per state."
+    """Compile the batch-MC fixed point: the weighted average of the returns observed from each state.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the number of states.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(S, G, weights) -> V``. ``S``, ``G`` and ``weights`` have
+        shape (n_transitions, n_runs), one column per run's batch, and a step with weight 0 is
+        ignored. ``V`` has shape (n_runs, n_states), with 0 for a state that was never visited.
+    """
     S = pt.lmatrix("S")
     G = pt.dmatrix("G")
     weights = pt.dmatrix("W")
@@ -1585,8 +2643,33 @@ def make_batch_mc(env):
 
 ```{python}
 def make_batch_sweeps(env, kind):
-    """increments summed over the whole batch with V
-    held fixed, applied once per sweep, repeated until nothing moves."""
+    """Compile the book's batch-updating sweeps for TD(0) or MC.
+
+    Each sweep sums the increments of every transition in the batch with V held fixed, then
+    applies them all at once,
+
+        V(s) <- V(s) + alpha * sum over the transitions with S_t = s of w_t [ target_t - V(s) ],
+
+    where ``target_t = R_{t+1} + gamma * V(S_{t+1})`` for TD(0) (V of a terminal state counted
+    as 0) and ``G_t`` for MC. Repeated with a small enough alpha, the sweeps converge to the
+    batch fixed point.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the terminal states.
+    kind : {'td0', 'mc'}
+        Which target to use.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function
+        ``(S, targets, S_next, weights, V_init, alpha, gamma, n_sweeps) -> V``. ``S``,
+        ``targets`` (rewards for TD(0), returns for MC), ``S_next`` and ``weights`` have shape
+        (n_transitions, n_runs); ``V_init`` has shape (n_runs, n_states); ``alpha`` and ``gamma``
+        are floats. ``V`` has shape (n_sweeps, n_runs, n_states): the values after each sweep.
+    """
     not_terminal = pt.as_tensor_variable((~env.terminal).astype("float64"))
     S = pt.lmatrix("S")
     targets = pt.dmatrix("X")
@@ -1600,10 +2683,26 @@ def make_batch_sweeps(env, kind):
     n_transitions, n_runs = S.shape[0], S.shape[1]
     run_of = (pt.arange(n_runs)[None, :] * pt.ones((n_transitions, 1), dtype="int64")).ravel()
     s_flat, s_next_flat = S.ravel(), S_next.ravel()
-    x_flat, w_flat = targets.ravel(), weights.ravel()
+    targets_flat, w_flat = targets.ravel(), weights.ravel()
 
     def sweep(V, alpha, gamma):
-        target = (x_flat + gamma * not_terminal[s_next_flat] * V[run_of, s_next_flat] if kind == "td0" else x_flat)
+        """One batch sweep: every transition's increment computed with V fixed, then applied at once.
+
+        Parameters
+        ----------
+        V : TensorVariable, shape (n_runs, n_states)
+            The values before the sweep.
+        alpha : TensorVariable, scalar
+            Step size.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_runs, n_states)
+            The values after the sweep.
+        """
+        target =(targets_flat + gamma * not_terminal[s_next_flat] * V[run_of, s_next_flat] if kind == "td0" else targets_flat)
 
         increment = pt.inc_subtensor(pt.zeros_like(V)[run_of, s_flat],
                                      w_flat * (target - V[run_of, s_flat]))
@@ -1623,6 +2722,8 @@ def make_batch_sweeps(env, kind):
 
 
 ```{python}
+GAMMA_AB = 1.0 # the example is undiscounted
+
 ab_env = make_env(
     name = "ab",
     n_states = 3,
@@ -1640,13 +2741,32 @@ G_ab = R_ab.copy() # gamma = 1: the A episode returned 0 + 0 = 0
 G_ab[0] = 0.0
 weights_ab = np.ones_like(R_ab)
 
-V_td_ab, visits_ab, P_ab, reward_ab = make_batch_td(ab_env)(S_ab, R_ab, S_next_ab, weights_ab, 1.0)
+V_td_ab, visits_ab, P_ab, reward_ab = make_batch_td(ab_env)(S_ab, R_ab, S_next_ab, weights_ab, GAMMA_AB)
 V_mc_ab = make_batch_mc(ab_env)(S_ab, G_ab, weights_ab)
+```
 
-print(f"maximum-likelihood model:  p(B | A) = {P_ab[0, 0, 1]:.2f}, "
-      f"r_hat(A) = {reward_ab[0, 0]:.2f}, r_hat(B) = {reward_ab[0, 1]:.2f}")
-print(f"batch MC   : V(A) = {V_mc_ab[0, 0]:.3f}   V(B) = {V_mc_ab[0, 1]:.3f}")
-print(f"batch TD(0): V(A) = {V_td_ab[0, 0]:.3f}   V(B) = {V_td_ab[0, 1]:.3f}")
+```{python}
+batch_ab_rows = pd.DataFrame([
+    dict(method="Batch MC", V_A=V_mc_ab[0, 0], V_B=V_mc_ab[0, 1]),
+    dict(method="Batch TD(0)", V_A=V_td_ab[0, 0], V_B=V_td_ab[0, 1]),
+])
+
+batch_ab_table = (
+    GT(batch_ab_rows, rowname_col="method")
+    .tab_header(
+        title=md("**Batch MC against batch TD(0) on the A/B episodes**"),
+        subtitle="The eight episodes above, γ = 1."
+    )
+    .tab_stubhead(label="Method")
+    .cols_label(V_A=html("<i>V</i>(A)"), V_B=html("<i>V</i>(B)"))
+    .fmt_number(columns=["V_A", "V_B"], decimals=3)
+    .cols_align("right", columns=["V_A", "V_B"])
+    .tab_source_note(html(
+        f"Maximum-likelihood model: <i>p</i>(B | A) = {P_ab[0, 0, 1]:.2f}, "
+        f"<i>r̂</i>(A) = {reward_ab[0, 0]:.2f}, <i>r̂</i>(B) = {reward_ab[0, 1]:.2f}."
+    ))
+)
+batch_ab_table
 ```
 
 ## Batch Random Walk
@@ -1665,11 +2785,10 @@ sweep_mc_walk = make_batch_sweeps(walk5, "mc")
 N_RUNS_BATCH = 100
 N_EPISODES_BATCH = 100
 MAX_STEPS_BATCH = 80
-ALPHA = 0.002
-GAMMA = 1.0
-NSTEPS = 4000
+ALPHA_BATCH = 0.002
+N_SWEEPS_BATCH = 4000
 
-S_batch, A_batch, R_batch, S_next_batch, G_batch, frac_finished_batch = episodes_for(rollout_walk, walk5, pi_walk, N_EPISODES_BATCH, N_RUNS_BATCH, MAX_STEPS_BATCH)
+S_batch, A_batch, R_batch, S_next_batch, G_batch, frac_finished_batch = episodes_for(rollout_walk, walk5, pi_walk, N_EPISODES_BATCH, N_RUNS_BATCH, MAX_STEPS_BATCH, GAMMA_WALK)
 
 flatten = lambda X: X.reshape(N_EPISODES_BATCH * MAX_STEPS_BATCH, N_RUNS_BATCH)
 S_flat, R_flat = flatten(S_batch), flatten(R_batch)
@@ -1679,16 +2798,34 @@ episode_of_row = np.repeat(np.arange(N_EPISODES_BATCH), MAX_STEPS_BATCH)[:, None
 
 weights_first_10 = is_real_step * (episode_of_row < 10) # the first ten episodes
 V_init_batch = np.zeros((N_RUNS_BATCH, walk5.n_states))
-V_fixed_point, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights_first_10, 1.0)
-V_swept_td = sweep_td_walk(S_flat, R_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA, GAMMA, NSTEPS)
+V_fixed_point, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights_first_10, GAMMA_WALK)
+V_swept_td = sweep_td_walk(S_flat, R_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA_BATCH, GAMMA_WALK, N_SWEEPS_BATCH)
 
-print("batch TD: max |sweeps - DP on the estimated model| =",
-      f"{np.abs(V_swept_td[-1] - V_fixed_point)[:, inner_states].max():.2e}")
+V_swept_mc = sweep_mc_walk(S_flat, G_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA_BATCH, GAMMA_WALK, N_SWEEPS_BATCH)
+V_mean_return = batch_mc_walk(S_flat, G_flat, weights_first_10)
+```
 
-V_swept_mc = sweep_mc_walk(S_flat, G_flat, S_next_flat, weights_first_10,V_init_batch, ALPHA, GAMMA, NSTEPS)
+```{python}
+sweep_check_rows = pd.DataFrame([
+    dict(method="Batch TD(0)", fixed_point="DP on the estimated model",
+         max_gap=np.abs(V_swept_td[-1] - V_fixed_point)[:, inner_states].max()),
+    dict(method="Batch MC", fixed_point="Mean observed return",
+         max_gap=np.abs(V_swept_mc[-1] - V_mean_return)[:, inner_states].max()),
+])
 
-print("batch MC: max |sweeps - mean observed return| =",
-      f"{np.abs(V_swept_mc[-1] - batch_mc_walk(S_flat, G_flat, weights_first_10))[:, inner_states].max():.2e}")
+sweep_check_table = (
+    GT(sweep_check_rows, rowname_col="method")
+    .tab_header(
+        title=md("**Batch sweeps against the batch fixed points**"),
+        subtitle=f"The first ten episodes of each of the {N_RUNS_BATCH} batches; "
+                 f"{N_SWEEPS_BATCH:,} sweeps with α = {ALPHA_BATCH}."
+    )
+    .tab_stubhead(label="Method")
+    .cols_label(fixed_point="Fixed point", max_gap="max |sweeps − fixed point|")
+    .fmt_scientific(columns="max_gap", decimals=2)
+    .cols_align("right", columns="max_gap")
+)
+sweep_check_table
 ```
 
 
@@ -1699,7 +2836,7 @@ rmse_batch_td, rmse_batch_mc = [], []
 
 for n_episodes in batch_sizes:
     weights = is_real_step * (episode_of_row < n_episodes)
-    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, 1.0)
+    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, GAMMA_WALK)
     V_mc_batch = batch_mc_walk(S_flat, G_flat, weights)
 
     rmse = lambda V: np.sqrt(((V[:, inner_states] - v_walk_true[inner_states]) ** 2).mean(axis=1)).mean()
@@ -1745,7 +2882,7 @@ rmse_batch_td, rmse_batch_mc = [], []
 
 for n_episodes in batch_sizes:
     weights = is_real_step * (episode_of_row < n_episodes)
-    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, 1.0)
+    V_td_batch, *_ = batch_td_walk(S_flat, R_flat, S_next_flat, weights, GAMMA_WALK)
     V_mc_batch = batch_mc_walk(S_flat, G_flat, weights)
 
     rmse = lambda V: np.sqrt(((V[:, inner_states] - v_walk_true[inner_states]) ** 2).mean(axis=1)).mean()
@@ -1791,7 +2928,7 @@ However if the process is *not* Markov in the states, the certainty-equivalence 
 
 # Sarsa: on-policy TD control
 
-For control we move from learning state values to learning state-action pairs. SARSA is an on-policy algorithm because it estimates $q_\pi$ of the current behavior policy $\pi$ for all states and actions. The algorithms name comes from the fact that the update uses all the elements that define a transition from one state-action pair to another; $(S_t, A_t, R_{t+1}, S_{t+1}, A_{t+1})$.
+For control we move from learning state values to learning state-action pairs. SARSA is an on-policy algorithm because it estimates $q_\pi$ of the current behavior policy $\pi$ for all states and actions. The algorithm's name comes from the fact that the update uses all the elements that define a transition from one state-action pair to another; $(S_t, A_t, R_{t+1}, S_{t+1}, A_{t+1})$.
 
 $$
 Q(S_t,A_t) \;\leftarrow\; Q(S_t,A_t) + \alpha\left[R_{t+1} + \gamma\,Q(S_{t+1},A_{t+1}) - Q(S_t,A_t)\right]
@@ -1811,18 +2948,86 @@ Sarsa, Q-learning and Expected Sarsa differ *only* in how they compute the boots
 
 Important implementation details:
 
-A `live` flag (1 until the episode terminates, 0 after) multiplies $\alpha$, so the fixed-length inner scan can pad past the end of a short episode without corrupting anything.
-`eps_probs` builds the $\varepsilon$-greedy distribution explicitly rather than sampling a coin flip, because Expected Sarsa needs those probabilities. Illegal actions get $-\infty$ before the `argmax` and zero probability after it.
+A `still_running` flag (1 until the episode terminates, 0 after) multiplies $\alpha$, so the fixed-length inner scan can pad past the end of a short episode without corrupting anything.
+`eps_greedy_probs` builds the $\varepsilon$-greedy distribution explicitly rather than sampling a coin flip, because Expected Sarsa needs those probabilities. Illegal actions get $-\infty$ before the `argmax` and zero probability after it.
 
 `alpha` and `eps` are *vectors* over the run dimension, which is how the step-size sweeps with just one batched call.
 
 
 ```{python}
+def eps_greedy_probs(legal, q, eps):
+    """Return the ε-greedy distribution over the legal actions, for every run.
+
+        pi(a|s) = 1 - eps + eps / n_legal   for the greedy legal action,
+                  eps / n_legal             for every other legal action,
+                  0                         for an illegal action.
+
+    Ties for the greedy action go to the lowest-numbered action.
+
+    Parameters
+    ----------
+    legal : TensorVariable, shape (n_runs, n_actions)
+        1.0 where an action is legal in each run's state.
+    q : TensorVariable, shape (n_runs, n_actions)
+        The values the policy is greedy in, in each run's state.
+    eps : TensorVariable, shape (n_runs,)
+        Each run's ε.
+
+    Returns
+    -------
+    TensorVariable, shape (n_runs, n_actions)
+        Each run's action probabilities in its state.
+    """
+    runs = pt.arange(q.shape[0])
+    greedy = pt.argmax(pt.where(legal > 0, q, NEG_INF), axis=1)
+    probs = legal * (eps / legal.sum(axis=1))[:, None]
+    return pt.inc_subtensor(probs[runs, greedy], 1.0 - eps)
+
+
 def make_control(env, kind, seed):
-    """One-step tabular TD control.  kind = 'sarsa' | 'q' | 'expected_sarsa'.
-    Returns f(Q_init, alpha, eps, gamma, n_episodes, max_steps) -> Q, reward sums, step
-    counts, done flags, first action of each episode.  Q_init is (n_runs, n_states,
-    n_actions); alpha and eps are (n_runs,)."""
+    """Compile one-step tabular TD control (Sarsa, Q-learning or Expected Sarsa) for many runs at once.
+
+    Every run follows the ε-greedy policy of its own Q, and after each step applies
+
+        Q(S_t, A_t) <- Q(S_t, A_t) + alpha [ R_{t+1} + gamma * bootstrap - Q(S_t, A_t) ],
+
+    where the bootstrap term is
+
+    - Sarsa: ``Q(S_{t+1}, A_{t+1})``, with A_{t+1} drawn from the ε-greedy policy first;
+    - Q-learning: ``max_a Q(S_{t+1}, a)`` over the legal actions;
+    - Expected Sarsa: ``sum_a pi(a | S_{t+1}) Q(S_{t+1}, a)`` under the ε-greedy policy,
+
+    and counts as 0 when S_{t+1} is terminal. Every episode runs for ``max_steps`` steps; the
+    steps after termination are padding and change nothing. Each new episode starts from a state
+    drawn from ``env.start``.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model the agent acts in, the legal actions and the start distribution.
+    kind : {'sarsa', 'q', 'expected_sarsa'}
+        Which bootstrap term to use.
+    seed : int
+        Seed for the random generator.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function
+        ``(Q_init, alpha, eps, gamma, n_episodes, max_steps) -> (Q, reward_sum, step_count, done, first_action)``:
+
+        - ``Q_init``: shape (n_runs, n_states, n_actions).
+        - ``alpha``, ``eps``: shape (n_runs,), each run's step size and ε.
+        - ``gamma``: float, the discount factor.
+        - ``Q``: shape (n_runs, n_states, n_actions), the action values after the last episode.
+        - ``reward_sum``, ``step_count``: shape (n_episodes, n_runs), each episode's sum of
+          rewards and number of steps.
+        - ``done``: shape (n_episodes, n_runs), 1.0 where the episode terminated within
+          ``max_steps``.
+        - ``first_action``: shape (n_episodes, n_runs), the first action of each episode.
+
+        The random generator state carries over between calls.
+    """
     P = pt.as_tensor_variable(env.P)
     reward_mean = pt.as_tensor_variable(env.reward_mean)
     reward_sd = pt.as_tensor_variable(env.reward_sd)
@@ -1838,19 +3043,63 @@ def make_control(env, kind, seed):
     n_episodes = pt.iscalar("n_ep")
     max_steps = pt.iscalar("T")
 
-    def eps_greedy_probs(Q, s, eps):
-        "eps-greedy distribution over the legal actions of s, per run -> (n_runs, n_actions)"
-        runs = pt.arange(Q.shape[0])
-        legal = legal_actions[s]
-        greedy = pt.argmax(pt.where(legal > 0, Q[runs, s], NEG_INF), axis=1)
-        probs = legal * (eps / legal.sum(axis=1))[:, None]
-        return pt.inc_subtensor(probs[runs, greedy], 1.0 - eps)
-
     def pick(rng, Q, s, eps):
-        return rng.categorical(p=eps_greedy_probs(Q, s, eps))
+        """Draw one action per run from the ε-greedy policy of Q.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+        eps : TensorVariable, shape (n_runs,)
+            Each run's ε.
+
+        Returns
+        -------
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_runs,)
+            The actions.
+        """
+        runs = pt.arange(Q.shape[0])
+        return rng.categorical(p=eps_greedy_probs(legal_actions[s], Q[runs, s], eps))
 
     def step(rng, s, a, Q, alpha, eps, gamma, still_running):
-        "the shared half: take the step, then form the method's target"
+        """Take one step in every run, then update Q with the method's target.
+
+        The part shared by the three methods: draw S_{t+1} and R_{t+1}, form the bootstrap term
+        for ``kind``, update Q(S_t, A_t), and choose A_{t+1}. Sarsa draws A_{t+1} before the
+        update, because its target needs it; the other two draw it from the updated Q.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's state S_t and action A_t.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values before the update.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        still_running : TensorVariable, shape (n_runs,)
+            1.0 while the run's episode has not terminated, 0.0 after; it scales the update.
+
+        Returns
+        -------
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        s_next, a_next : TensorVariable of int, shape (n_runs,)
+            S_{t+1} and A_{t+1}.
+        r : TensorVariable, shape (n_runs,)
+            The rewards R_{t+1}.
+        Q_new : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values after the update.
+        """
         runs = pt.arange(Q.shape[0])
         rng, s_next = rng.categorical(p=P[s, a])
         rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a])
@@ -1863,7 +3112,7 @@ def make_control(env, kind, seed):
             bootstrap = pt.where(legal_actions[s_next] > 0, Q[runs, s_next], NEG_INF).max(axis=1)
         else: # expected_sarsa
             a_next = None
-            bootstrap = (eps_greedy_probs(Q, s_next, eps) * Q[runs, s_next]).sum(axis=1)
+            bootstrap = (eps_greedy_probs(legal_actions[s_next], Q[runs, s_next], eps) * Q[runs, s_next]).sum(axis=1)
 
         delta = r + gamma * not_terminal[s_next] * bootstrap - Q[runs, s, a]
         Q_new = pt.inc_subtensor(Q[runs, s, a], alpha * still_running * delta)
@@ -1874,11 +3123,61 @@ def make_control(env, kind, seed):
         return rng, s_next, a_next, r, Q_new
 
     def inner(rng, s, a, still_running, Q, reward_sum, step_count, alpha, eps, gamma):
+        """One step of the inner scan: `step`, plus the episode's running totals.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's state and action.
+        still_running : TensorVariable, shape (n_runs,)
+            1.0 while the run's episode has not terminated, 0.0 after.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values.
+        reward_sum, step_count : TensorVariable, shape (n_runs,)
+            The episode's sum of rewards and number of steps so far.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_next, a_next, still_running, Q, reward_sum, step_count)`` for the next
+            step. ``still_running`` drops to 0 once S_{t+1} is terminal, and the totals stop
+            growing.
+        """
         rng, s_next, a_next, r, Q_new = step(rng, s, a, Q, alpha, eps, gamma, still_running)
         return (rng, s_next, a_next, still_running * not_terminal[s_next], Q_new,
                 reward_sum + still_running * r, step_count + still_running)
 
     def episode(rng, s, a, Q, alpha, eps, gamma, max_steps):
+        """Run one episode in every run, then draw the next episode's start state and action.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's start state and first action.
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values at the start of the episode.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        max_steps : TensorVariable of int, scalar
+            Steps per episode.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_new, a_new, Q, reward_sum, step_count, done)``: the next episode's start
+            state and first action, the action values after this episode, and this episode's
+            sum of rewards, number of steps and done flag, each of shape (n_runs,).
+        """
         zero = pt.zeros_like(not_terminal[s])
 
         rng_final, S_seq, A_seq, running_seq, Q_seq, reward_sum, step_count = pytensor.scan(
@@ -1915,20 +3214,72 @@ def make_control(env, kind, seed):
 
 ```{python}
 def eps_greedy_pi(Q, eps, env):
-    "the eps-greedy policy of a Q table, as an (n_states, n_actions) matrix for the DP oracle"
+    """Return the ε-greedy policy of a Q table, as a pi(a|s) matrix for the DP oracle.
+
+        pi(a|s) = 1 - eps + eps / n_legal   for the greedy legal action,
+                  eps / n_legal             for every other legal action,
+                  0                         for an illegal action.
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    eps : float
+        Exploration probability ε.
+    env : Env
+        Supplies the legal actions.
+
+    Returns
+    -------
+    ndarray, shape (n_states, n_actions)
+        The policy pi(a|s).
+    """
     legal = env.legal_actions > 0
     pi = legal * (eps / legal.sum(axis=1))[:, None]
     pi[np.arange(env.n_states), np.where(legal, Q, NEG_INF).argmax(axis=1)] += 1 - eps
     return pi
 
 def greedy_pi(Q, env):
+    """Return the deterministic greedy policy of a Q table, as a pi(a|s) matrix.
+
+    Ties go to the lowest-numbered legal action.
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    env : Env
+        Supplies the legal actions.
+
+    Returns
+    -------
+    ndarray, shape (n_states, n_actions)
+        1.0 on the greedy legal action of each state, 0.0 elsewhere.
+    """
     pi = np.zeros((env.n_states, env.n_actions))
     pi[np.arange(env.n_states),
        np.where(env.legal_actions > 0, Q, NEG_INF).argmax(axis=1)] = 1.0
     return pi
 
-def value_gap(Q, env, gamma=1.0):
-    "how far the greedy policy of Q is from optimal, measured exactly by DP"
+def value_gap(Q, env, gamma):
+    """Return how far the greedy policy of Q is from optimal, measured exactly by the DP oracle.
+
+        max over reachable, non-terminal s of | v_greedy(s) - v_*(s) |
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    env : Env
+        The environment. Its oracle must be in ``ORACLE``.
+    gamma : float
+        Discount factor.
+
+    Returns
+    -------
+    float
+        The gap. 0 means the greedy policy is optimal.
+    """
     evaluate_policy, optimal_values, _ = ORACLE[env.name]
     graded_states = env.reachable & ~env.terminal
     return np.abs(evaluate_policy(greedy_pi(Q, env), gamma) - optimal_values(gamma))[graded_states].max()
@@ -1936,32 +3287,65 @@ def value_gap(Q, env, gamma=1.0):
 
 
 ```{python}
-EPS = 0.1
-ALPHA = 0.2
-GAMMA = 1.0
-N_RUNS_GRID = 20
-N_EPISODES_GRID = 800
-MAX_STEPS_GRID = 60
+EPS_SARSA = 0.1
+ALPHA_SARSA = 0.2
+N_RUNS_SARSA = 20
+N_EPISODES_SARSA = 800
+MAX_STEPS_SARSA = 60
 
-sarsa_g4 = make_control(grid4, "sarsa", 101)
-Q_init_g4 = np.zeros((N_RUNS_GRID, grid4.n_states, grid4.n_actions))
-Q_sarsa, reward_sum_sarsa, step_count_sarsa, done_sarsa, _ = sarsa_g4(
-    Q_init_g4,
-    np.full(N_RUNS_GRID, ALPHA),
-    np.full(N_RUNS_GRID, EPS),
-    GAMMA,
-    N_EPISODES_GRID,
-    MAX_STEPS_GRID
+sarsa_grid4 = make_control(grid4, "sarsa", 101)
+Q_init_grid4 = np.zeros((N_RUNS_SARSA, grid4.n_states, grid4.n_actions))
+Q_sarsa, reward_sum_sarsa, step_count_sarsa, done_sarsa, _ = sarsa_grid4(
+    Q_init_grid4,
+    np.full(N_RUNS_SARSA, ALPHA_SARSA),
+    np.full(N_RUNS_SARSA, EPS_SARSA),
+    GAMMA_GRID4,
+    N_EPISODES_SARSA,
+    MAX_STEPS_SARSA
 )
 
-gaps = np.array([value_gap(Q_sarsa[run], grid4) for run in range(N_RUNS_GRID)])
+gaps = np.array([value_gap(Q_sarsa[run], grid4, GAMMA_GRID4) for run in range(N_RUNS_SARSA)])
+```
 
-print(f"Sarsa on grid4: {N_EPISODES_GRID} episodes x {N_RUNS_GRID} runs, "
-      f"{done_sarsa.mean():.1%} of episodes finished")
-print(f"runs whose greedy policy is exactly optimal: {(gaps < 1e-9).sum()}/{N_RUNS_GRID}")
-print(f"average return over the last 50 episodes: {reward_sum_sarsa[-50:].mean():.2f}"
-      f"   (optimal, from a random start: {v_star_g4[~grid4.terminal].mean():.2f})")
-show_policy(Q_sarsa[0].argmax(axis=1), grid4, "\ngreedy policy of run 0 (T = terminal):")
+```{python}
+sarsa_rows = pd.DataFrame([
+    dict(measure="Episodes finished", value=done_sarsa.mean()),
+    dict(measure=f"Runs whose greedy policy is exactly optimal (of {N_RUNS_SARSA})", value=(gaps < 1e-9).sum()),
+    dict(measure="Average return over the last 50 episodes", value=reward_sum_sarsa[-50:].mean()),
+    dict(measure="Optimal average return, from a random start", value=v_star_grid4[~grid4.terminal].mean()),
+])
+row_finished, row_optimal_runs, rows_returns = [0], [1], [2, 3]
+
+sarsa_table = (
+    GT(sarsa_rows, rowname_col="measure")
+    .tab_header(
+        title=md("**Sarsa on the 4×4 gridworld**"),
+        subtitle=f"{N_EPISODES_SARSA} episodes × {N_RUNS_SARSA} runs, α = {ALPHA_SARSA}, ε = {EPS_SARSA}."
+    )
+    .cols_label(value="")
+    .fmt_percent(columns="value", rows=row_finished, decimals=1)
+    .fmt_integer(columns="value", rows=row_optimal_runs)
+    .fmt_number(columns="value", rows=rows_returns, decimals=2)
+    .cols_align("right", columns="value")
+)
+sarsa_table
+```
+
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Greedy policy of run 0 (T = terminal)": Q_sarsa[0].argmax(axis=1)},
+    grid4
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Greedy policy of run 0 (T = terminal)": Q_sarsa[0].argmax(axis=1)},
+    grid4,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 
@@ -1980,33 +3364,67 @@ sarsa_windy = make_control(windy, "sarsa", 202)
 N_RUNS_WINDY = 30
 N_EPISODES_WINDY = 170
 MAX_STEPS_WINDY = 1500
-GAMMA = 1.0
 
 Q_windy, reward_sum_windy, step_count_windy, done_windy, _ = sarsa_windy(
       np.zeros((N_RUNS_WINDY, windy.n_states, windy.n_actions)),
       np.full(N_RUNS_WINDY, 0.5),
       np.full(N_RUNS_WINDY, 0.1),
-      GAMMA,
+      GAMMA_WINDY,
       N_EPISODES_WINDY,
       MAX_STEPS_WINDY
 )
 
-print(f"episodes completed within T={MAX_STEPS_WINDY}: {done_windy.mean():.1%}")
-print(f"steps: episode 1 -> {step_count_windy[0].mean():.0f}, "
-      f"episode 20 -> {step_count_windy[19].mean():.0f}, "
-      f"last 10 -> {step_count_windy[-10:].mean():.0f} "
-      f"(optimal 15, eps-greedy pays a little more)")
+v_star_windy, q_star_windy = exact(windy, GAMMA_WINDY)
+```
 
-v_star_windy, q_star_windy = exact(windy)
+```{python}
+windy_rows = pd.DataFrame([
+    dict(measure=f"Episodes completed within T = {MAX_STEPS_WINDY}", value=done_windy.mean()),
+    dict(measure="Steps in episode 1", value=step_count_windy[0].mean()),
+    dict(measure="Steps in episode 20", value=step_count_windy[19].mean()),
+    dict(measure="Steps per episode, last 10 episodes", value=step_count_windy[-10:].mean()),
+    dict(measure=f"Total time steps for {N_EPISODES_WINDY} episodes", value=step_count_windy.sum(axis=0).mean()),
+])
+row_completed, rows_steps, row_last_10 = [0], [1, 2, 3, 4], [3]
 
-print(f"total time steps for {N_EPISODES_WINDY} episodes: "
-      f"{step_count_windy.sum(axis=0).mean():.0f}")
+windy_table = (
+    GT(windy_rows, rowname_col="measure")
+    .tab_header(
+        title=md("**Sarsa on the windy gridworld**"),
+        subtitle=f"Mean of {N_RUNS_WINDY} runs."
+    )
+    .cols_label(value="")
+    .fmt_percent(columns="value", rows=row_completed, decimals=1)
+    .fmt_number(columns="value", rows=rows_steps, decimals=0)
+    .cols_align("right", columns="value")
+    .tab_footnote("Optimal 15; ε-greedy pays a little more.", loc.stub(rows=row_last_10))
+)
+windy_table
+```
 
-show_policy(Q_windy[0].argmax(axis=1), windy,
-            f"\ngreedy policy of run 0 (wind per column: {WIND.tolist()}) | Initial State = {np.flatnonzero(windy.start).item()}:")
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Greedy policy of run 0": Q_windy[0].argmax(axis=1),
+     "Optimal policy": q_star_windy.argmax(axis=1)},
+    windy,
+    title=f"<b>Policies on the windy gridworld</b><br><sup>wind per column: {WIND.tolist()}; "
+          f"initial state = {np.flatnonzero(windy.start).item()}</sup>",
+    cell_px=45
+).show(config=dict(displayModeBar=False))
+```
 
-show_policy(q_star_windy.argmax(axis=1), windy,
-            f"\noptimal policy:")
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Greedy policy of run 0": Q_windy[0].argmax(axis=1),
+     "Optimal policy": q_star_windy.argmax(axis=1)},
+    windy,
+    title=f"<b>Policies on the windy gridworld</b><br><sup>wind per column: {WIND.tolist()}; "
+          f"initial state = {np.flatnonzero(windy.start).item()}</sup>",
+    cell_px=45,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 
@@ -2106,13 +3524,25 @@ cell, the tint of a column is its wind strength, and the numbers under the grid 
 n_rows_windy, n_cols_windy = windy.shape
 WIND_FILL = {0: colors[0], 1: colors[4], 2: colors[6]}
 
-def windy_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_windy)
-    return col, n_rows_windy - 1 - row
-
 def greedy_path(env, Q, max_steps=200):
-    "follow argmax_a Q(s, a) from the start state through the (deterministic) dynamics"
+    """Follow argmax_a Q(s, a) from the start state through the deterministic dynamics.
+
+    Stops at a terminal state, or after ``max_steps`` moves if the greedy policy loops.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the start state, the terminal states and the (deterministic) model ``P``.
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    max_steps : int, default 200
+        The most moves to follow.
+
+    Returns
+    -------
+    list of int
+        The states visited, starting with the start state.
+    """
     s = np.flatnonzero(env.start).item()
     path = [s]
     while not env.terminal[s] and len(path) <= max_steps:
@@ -2122,7 +3552,7 @@ def greedy_path(env, Q, max_steps=200):
 
 a_greedy_windy = Q_windy[0].argmax(axis=1)
 path_windy = greedy_path(windy, Q_windy[0])
-xs_windy, ys_windy = map(np.array, zip(*(windy_xy(s) for s in path_windy)))
+xs_windy, ys_windy = map(np.array, zip(*(grid_xy(s, windy.shape) for s in path_windy)))
 
 start_windy = np.flatnonzero(windy.start).item()
 goal_windy = np.flatnonzero(windy.terminal).item()
@@ -2131,7 +3561,7 @@ windy_grid_fig = go.Figure()
 pad = 0.04
 
 for s in range(windy.n_states):
-    x, y = windy_xy(s)
+    x, y = grid_xy(s, windy.shape)
     windy_grid_fig.add_shape(
         type="rect",
         x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
@@ -2177,14 +3607,14 @@ episode_windy_fig.add_scatter(
 
 episode_windy_fig.frames = [
     go.Frame(
-        name=str(k),
+        name=str(frame_index),
         data=[
-            go.Scatter(x=xs_windy[:k+1], y=ys_windy[:k+1]),
-            go.Scatter(x=xs_windy[k:k+1], y=ys_windy[k:k+1])
+            go.Scatter(x=xs_windy[:frame_index+1], y=ys_windy[:frame_index+1]),
+            go.Scatter(x=xs_windy[frame_index:frame_index+1], y=ys_windy[frame_index:frame_index+1])
         ],
         traces=[0, 1]
     )
-    for k in range(len(path_windy))
+    for frame_index in range(len(path_windy))
 ]
 
 updatemenus = [
@@ -2216,10 +3646,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(len(path_windy))
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(len(path_windy))
         ]
     )
 ]
@@ -2259,13 +3689,25 @@ episode_windy_fig.show(config=dict(displayModeBar=False))
 n_rows_windy, n_cols_windy = windy.shape
 WIND_FILL = {0: colors[0], 1: colors[4], 2: colors[6]}
 
-def windy_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_windy)
-    return col, n_rows_windy - 1 - row
-
 def greedy_path(env, Q, max_steps=200):
-    "follow argmax_a Q(s, a) from the start state through the (deterministic) dynamics"
+    """Follow argmax_a Q(s, a) from the start state through the deterministic dynamics.
+
+    Stops at a terminal state, or after ``max_steps`` moves if the greedy policy loops.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the start state, the terminal states and the (deterministic) model ``P``.
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    max_steps : int, default 200
+        The most moves to follow.
+
+    Returns
+    -------
+    list of int
+        The states visited, starting with the start state.
+    """
     s = np.flatnonzero(env.start).item()
     path = [s]
     while not env.terminal[s] and len(path) <= max_steps:
@@ -2275,7 +3717,7 @@ def greedy_path(env, Q, max_steps=200):
 
 a_greedy_windy = Q_windy[0].argmax(axis=1)
 path_windy = greedy_path(windy, Q_windy[0])
-xs_windy, ys_windy = map(np.array, zip(*(windy_xy(s) for s in path_windy)))
+xs_windy, ys_windy = map(np.array, zip(*(grid_xy(s, windy.shape) for s in path_windy)))
 
 start_windy = np.flatnonzero(windy.start).item()
 goal_windy = np.flatnonzero(windy.terminal).item()
@@ -2284,7 +3726,7 @@ windy_grid_fig = go.Figure()
 pad = 0.04
 
 for s in range(windy.n_states):
-    x, y = windy_xy(s)
+    x, y = grid_xy(s, windy.shape)
     windy_grid_fig.add_shape(
         type="rect",
         x0=x-0.5+pad, x1=x+0.5-pad, y0=y-0.5+pad, y1=y+0.5-pad,
@@ -2330,14 +3772,14 @@ episode_windy_fig.add_scatter(
 
 episode_windy_fig.frames = [
     go.Frame(
-        name=str(k),
+        name=str(frame_index),
         data=[
-            go.Scatter(x=xs_windy[:k+1], y=ys_windy[:k+1]),
-            go.Scatter(x=xs_windy[k:k+1], y=ys_windy[k:k+1])
+            go.Scatter(x=xs_windy[:frame_index+1], y=ys_windy[:frame_index+1]),
+            go.Scatter(x=xs_windy[frame_index:frame_index+1], y=ys_windy[frame_index:frame_index+1])
         ],
         traces=[0, 1]
     )
-    for k in range(len(path_windy))
+    for frame_index in range(len(path_windy))
 ]
 
 updatemenus = [
@@ -2372,10 +3814,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(len(path_windy))
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(len(path_windy))
         ]
     )
 ]
@@ -2411,13 +3853,13 @@ episode_windy_fig.show(config=dict(displayModeBar=False))
 
 # Q-learning: off-policy TD control
 
-In the previous chapter we looked at off-policy control were we had two policies:
+In the previous chapter we looked at off-policy control where we had two policies:
 
 - A **behavior policy**: The policy that generates our experiences
 
 - A **target policy**: The policy whose values we want to estimate
 
-Q-learning does something very clever. It's bootstrapping target is independent of the distribution of the behavior policy, which means we no longer need to leverage *importance sampling* to correct for distributions from the wrong policy. You may have already noticed that the target is the Bellman optimality target, which refers to the greedy policy regardless of which action the behavior policy takes.
+Q-learning does something very clever. Its bootstrapping target is independent of the distribution of the behavior policy, which means we no longer need to leverage *importance sampling* to correct for distributions from the wrong policy. You may have already noticed that the target is the Bellman optimality target, which refers to the greedy policy regardless of which action the behavior policy takes.
 
 ::: {.callout-important}
 
@@ -2453,19 +3895,42 @@ for kind in ["sarsa", "q", "expected_sarsa"]:
         np.zeros((N_RUNS_CLIFF, cliff.n_states, cliff.n_actions)),
         np.full(N_RUNS_CLIFF, 0.5),
         np.full(N_RUNS_CLIFF, 0.1),
-        GAMMA,
+        GAMMA_CLIFF,
         N_EPISODES_CLIFF,
         MAX_STEPS_CLIFF
     )
     Q_cliff, reward_sum_cliff, step_count_cliff, done_cliff, _ = cliff_results[kind]
-    print(f"{kind} episodes finished within T={MAX_STEPS_CLIFF}: {done_cliff.mean():.1%} "
-          f"mean return over the last 100 episodes: {reward_sum_cliff[-100:].mean():.2f}")
 
-v_star_cliff, q_star_cliff = exact(cliff)
+v_star_cliff, q_star_cliff = exact(cliff, GAMMA_CLIFF)
 cliff_start = np.argmax(cliff.start)
-print(f"\noptimal path: {-v_star_cliff[cliff_start]:.0f} steps "
-      f"(v_* = {v_star_cliff[cliff_start]:.0f}), "
-      f"reachable states: {cliff.reachable.sum()}/{cliff.n_states}")
+```
+
+```{python}
+CONTROL_LABELS = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
+cliff_rows = pd.DataFrame([
+    dict(method=CONTROL_LABELS[kind], finished=done_cliff.mean(), last_100=reward_sum_cliff[-100:].mean())
+    for kind, (_, reward_sum_cliff, _, done_cliff, _) in cliff_results.items()
+])
+
+cliff_table = (
+    GT(cliff_rows, rowname_col="method")
+    .tab_header(
+        title=md("**Sarsa, Q-learning and Expected Sarsa on the cliff**"),
+        subtitle=f"{N_EPISODES_CLIFF} episodes × {N_RUNS_CLIFF} runs, α = 0.5, ε = 0.1."
+    )
+    .tab_stubhead(label="Method")
+    .cols_label(finished=f"Episodes finished within T = {MAX_STEPS_CLIFF}",
+                last_100="Mean return, last 100 episodes")
+    .fmt_percent(columns="finished", decimals=1)
+    .fmt_number(columns="last_100", decimals=2)
+    .cols_align("right", columns=["finished", "last_100"])
+    .tab_source_note(html(
+        f"Optimal path: {-v_star_cliff[cliff_start]:.0f} steps "
+        f"(<i>v</i><sub>*</sub> = {f'{v_star_cliff[cliff_start]:.0f}'.replace('-', '−')}). "
+        f"Reachable states: {cliff.reachable.sum()} of {cliff.n_states}."
+    ))
+)
+cliff_table
 ```
 
 
@@ -2474,20 +3939,15 @@ print(f"\noptimal path: {-v_star_cliff[cliff_start]:.0f} steps "
 n_rows_cliff = cliff.shape[0]
 n_cols_cliff = cliff.shape[1]
 cliff_goal = np.argmax(cliff.terminal)
-cliff_cells = {3 * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
+cliff_cells = {(n_rows_cliff - 1) * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
 
 CLIFF_FILL = {"safe": "#f0f0f0", "cliff": colors[2], "goal": colors[8]}
 methods = ["sarsa", "q"]
 method_labels = {"sarsa": "Sarsa (on-policy)", "q": "Q-learning (off-policy)"}
 method_colors = {"sarsa": colors[0], "q": colors[9]}
 
-def cliff_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_cliff)
-    return col, n_rows_cliff - 1 - row
-
 paths_cliff = {kind: greedy_path(cliff, cliff_results[kind][0].mean(axis=0)) for kind in methods}
-xy_cliff = {kind: tuple(map(np.array, zip(*(cliff_xy(s) for s in path))))
+xy_cliff = {kind: tuple(map(np.array, zip(*(grid_xy(s, cliff.shape) for s in path))))
             for kind, path in paths_cliff.items()}
 n_frames_cliff = max(len(path) for path in paths_cliff.values())
 
@@ -2505,7 +3965,7 @@ for row, kind in enumerate(methods, start=1):
     a_greedy = cliff_results[kind][0].mean(axis=0).argmax(axis=1)
 
     for s in range(cliff.n_states):
-        x, y = cliff_xy(s)
+        x, y = grid_xy(s, cliff.shape)
         cell_kind = "cliff" if s in cliff_cells else "goal" if s == cliff_goal else "safe"
         episode_cliff_fig.add_shape(
             type="rect",
@@ -2552,18 +4012,31 @@ for row, kind in enumerate(methods, start=1):
         row=row, col=1
     )
 
-def frame_data(k):
-    "both agents step together; whoever reaches the goal first waits there"
+def frame_data(frame_index):
+    """Return the trail and marker traces of both agents at animation frame ``frame_index``.
+
+    Both agents step together; whoever reaches the goal first waits there.
+
+    Parameters
+    ----------
+    frame_index : int
+        The frame, counted in moves from the start.
+
+    Returns
+    -------
+    list of plotly.graph_objects.Scatter
+        For each method in ``methods``, its trail so far and its current position.
+    """
     data = []
     for kind in methods:
         xs, ys = xy_cliff[kind]
-        j = min(k, len(xs) - 1)
-        data += [go.Scatter(x=xs[:j+1], y=ys[:j+1]), go.Scatter(x=xs[j:j+1], y=ys[j:j+1])]
+        position = min(frame_index, len(xs) - 1)
+        data += [go.Scatter(x=xs[:position+1], y=ys[:position+1]), go.Scatter(x=xs[position:position+1], y=ys[position:position+1])]
     return data
 
 episode_cliff_fig.frames = [
-    go.Frame(name=str(k), data=frame_data(k), traces=[0, 1, 2, 3])
-    for k in range(n_frames_cliff)
+    go.Frame(name=str(frame_index), data=frame_data(frame_index), traces=[0, 1, 2, 3])
+    for frame_index in range(n_frames_cliff)
 ]
 
 updatemenus = [
@@ -2595,10 +4068,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(n_frames_cliff)
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(n_frames_cliff)
         ]
     )
 ]
@@ -2639,20 +4112,15 @@ episode_cliff_fig.show(config=dict(displayModeBar=False))
 n_rows_cliff = cliff.shape[0]
 n_cols_cliff = cliff.shape[1]
 cliff_goal = np.argmax(cliff.terminal)
-cliff_cells = {3 * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
+cliff_cells = {(n_rows_cliff - 1) * n_cols_cliff + col: "C" for col in range(1, n_cols_cliff - 1)}
 
 CLIFF_FILL = {"safe": "#f0f0f0", "cliff": colors[2], "goal": colors[8]}
 methods = ["sarsa", "q"]
 method_labels = {"sarsa": "Sarsa (on-policy)", "q": "Q-learning (off-policy)"}
 method_colors = {"sarsa": colors[0], "q": colors[9]}
 
-def cliff_xy(s):
-    "state id -> (x, y) in plot coordinates, with grid row 0 drawn at the top"
-    row, col = divmod(s, n_cols_cliff)
-    return col, n_rows_cliff - 1 - row
-
 paths_cliff = {kind: greedy_path(cliff, cliff_results[kind][0].mean(axis=0)) for kind in methods}
-xy_cliff = {kind: tuple(map(np.array, zip(*(cliff_xy(s) for s in path))))
+xy_cliff = {kind: tuple(map(np.array, zip(*(grid_xy(s, cliff.shape) for s in path))))
             for kind, path in paths_cliff.items()}
 n_frames_cliff = max(len(path) for path in paths_cliff.values())
 
@@ -2670,7 +4138,7 @@ for row, kind in enumerate(methods, start=1):
     a_greedy = cliff_results[kind][0].mean(axis=0).argmax(axis=1)
 
     for s in range(cliff.n_states):
-        x, y = cliff_xy(s)
+        x, y = grid_xy(s, cliff.shape)
         cell_kind = "cliff" if s in cliff_cells else "goal" if s == cliff_goal else "safe"
         episode_cliff_fig.add_shape(
             type="rect",
@@ -2717,18 +4185,31 @@ for row, kind in enumerate(methods, start=1):
         row=row, col=1
     )
 
-def frame_data(k):
-    "both agents step together; whoever reaches the goal first waits there"
+def frame_data(frame_index):
+    """Return the trail and marker traces of both agents at animation frame ``frame_index``.
+
+    Both agents step together; whoever reaches the goal first waits there.
+
+    Parameters
+    ----------
+    frame_index : int
+        The frame, counted in moves from the start.
+
+    Returns
+    -------
+    list of plotly.graph_objects.Scatter
+        For each method in ``methods``, its trail so far and its current position.
+    """
     data = []
     for kind in methods:
         xs, ys = xy_cliff[kind]
-        j = min(k, len(xs) - 1)
-        data += [go.Scatter(x=xs[:j+1], y=ys[:j+1]), go.Scatter(x=xs[j:j+1], y=ys[j:j+1])]
+        position = min(frame_index, len(xs) - 1)
+        data += [go.Scatter(x=xs[:position+1], y=ys[:position+1]), go.Scatter(x=xs[position:position+1], y=ys[position:position+1])]
     return data
 
 episode_cliff_fig.frames = [
-    go.Frame(name=str(k), data=frame_data(k), traces=[0, 1, 2, 3])
-    for k in range(n_frames_cliff)
+    go.Frame(name=str(frame_index), data=frame_data(frame_index), traces=[0, 1, 2, 3])
+    for frame_index in range(n_frames_cliff)
 ]
 
 updatemenus = [
@@ -2763,10 +4244,10 @@ sliders = [
         currentvalue=dict(prefix="step "),
         steps=[
             dict(
-                label=str(k),
+                label=str(frame_index),
                 method="animate",
-                args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
-            ) for k in range(n_frames_cliff)
+                args=[[str(frame_index)], dict(mode="immediate", frame=dict(duration=0, redraw=False), transition=dict(duration=0))]
+            ) for frame_index in range(n_frames_cliff)
         ]
     )
 ]
@@ -2815,7 +4296,7 @@ for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
       x=np.arange(len(y)) + 10,
       y=y,
       mode="lines",
-      name={"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}[kind],
+      name=CONTROL_LABELS[kind],
       line=dict(color=colors[i], width=2)
     )
 
@@ -2854,7 +4335,7 @@ for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
       x=np.arange(len(y)) + 10,
       y=y,
       mode="lines",
-      name={"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}[kind],
+      name=CONTROL_LABELS[kind],
       line=dict(color=colors[i], width=2)
     )
 
@@ -2892,45 +4373,30 @@ We give both a smaller step size and more episodes so the constant-$\alpha$ nois
 
 
 ```{python}
-N_RUNS_OPT = 30
-N_EPISODES_OPT = 3000
-MAX_STEPS_OPT = 150
-ALPHA_OPT = EPS_OPT = 0.1
+N_RUNS_ORACLE = 30
+N_EPISODES_ORACLE = 3000
+MAX_STEPS_ORACLE = 150
+ALPHA_ORACLE = EPS_ORACLE = 0.1
 rollout_cliff = make_rollout(cliff, 404)
-
-labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
 
 # the oracle each method's own theory says it converges to: q_* off-policy, q_pi on-policy
 converges_to_q_star = {"sarsa": False, "q": True, "expected_sarsa": False}
 
-def cell(x, is_target, width, decimals=2):
-    "right-aligned number; a trailing ' *' marks the oracle this method should match"
-    return f"{x:.{decimals}f}".rjust(width - 2) + (" *" if is_target else "  ")
-
-print(f"cliff: alpha = {ALPHA_OPT}, eps = {EPS_OPT}, {N_EPISODES_OPT} episodes, "
-      f"Q averaged over {N_RUNS_OPT} runs\n")
-print("q_* = optimal action values (Q-learning's target)")
-print("q_pi_eps = action values of the learner's own eps-greedy policy (Sarsa's target)")
-print("* = the oracle that method's own theory says it converges to\n")
-print(f"{'':16s}{'value at the start state':^34s}{'worst state its own policy occupies':^39s}")
-print(f"{'method':16s}{'Q(start)':>10}{'q_*':>10}  {'q_pi_eps':>10}  "
-      f"  {'states':>6}{'max|Q-q_*|':>12}  {'max|Q-q_pi_eps|':>15}")
-print("-" * 89)
-
+oracle_rows = []
 for kind in ["sarsa", "q", "expected_sarsa"]:
     learner = make_control(cliff, kind, 505)
-    Q_opt, *_ = learner(
-            np.zeros((N_RUNS_OPT, cliff.n_states, cliff.n_actions)),
-            np.full(N_RUNS_OPT, ALPHA_OPT),
-            np.full(N_RUNS_OPT, EPS_OPT),
-            GAMMA,
-            N_EPISODES_OPT,
-            MAX_STEPS_OPT
+    Q_learned, *_ = learner(
+            np.zeros((N_RUNS_ORACLE, cliff.n_states, cliff.n_actions)),
+            np.full(N_RUNS_ORACLE, ALPHA_ORACLE),
+            np.full(N_RUNS_ORACLE, EPS_ORACLE),
+            GAMMA_CLIFF,
+            N_EPISODES_ORACLE,
+            MAX_STEPS_ORACLE
     )
 
-    Q_mean = Q_opt.mean(axis=0)
-    pi_eps = eps_greedy_pi(Q_mean, EPS_OPT, cliff)
-    _, q_pi_eps = exact(cliff, GAMMA, pi_eps)
+    Q_mean = Q_learned.mean(axis=0)
+    pi_eps = eps_greedy_pi(Q_mean, EPS_ORACLE, cliff)
+    _, q_pi_eps = exact(cliff, GAMMA_CLIFF, pi_eps)
     greedy_action = Q_mean[cliff_start].argmax()
 
     # grade only where the learner actually has experience: the greedy action of
@@ -2940,14 +4406,51 @@ for kind in ["sarsa", "q", "expected_sarsa"]:
     occupied &= ~cliff.terminal
     graded = (np.flatnonzero(occupied), Q_mean.argmax(axis=1)[occupied])
 
-    is_star = converges_to_q_star[kind]
-    print(f"{labels[kind]:16s}{Q_mean[cliff_start, greedy_action]:10.2f}"
-          f"{cell(q_star_cliff[cliff_start, greedy_action], is_star, 12)}"
-          f"{cell(q_pi_eps[cliff_start, greedy_action], not is_star, 12)}"
-          f"  {occupied.sum():6d}"
-          f"{cell(np.abs(Q_mean[graded] - q_star_cliff[graded]).max(), is_star, 14)}"
-          f"{cell(np.abs(Q_mean[graded] - q_pi_eps[graded]).max(), not is_star, 17)}".rstrip())
+    oracle_rows.append(dict(
+        method=CONTROL_LABELS[kind],
+        Q_start=Q_mean[cliff_start, greedy_action],
+        q_star_start=q_star_cliff[cliff_start, greedy_action],
+        q_pi_eps_start=q_pi_eps[cliff_start, greedy_action],
+        n_occupied=occupied.sum(),
+        error_q_star=np.abs(Q_mean[graded] - q_star_cliff[graded]).max(),
+        error_q_pi_eps=np.abs(Q_mean[graded] - q_pi_eps[graded]).max(),
+    ))
+```
 
+```{python}
+rows_q_star = [i for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]) if converges_to_q_star[kind]]
+rows_q_pi_eps = [i for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]) if not converges_to_q_star[kind]]
+value_columns = ["Q_start", "q_star_start", "q_pi_eps_start", "error_q_star", "error_q_pi_eps"]
+
+oracle_table = (
+    GT(pd.DataFrame(oracle_rows), rowname_col="method")
+    .tab_header(
+        title=md("**Learned action values against the two oracles on the cliff**"),
+        subtitle=f"Cliff, α = {ALPHA_ORACLE}, ε = {EPS_ORACLE}, {N_EPISODES_ORACLE:,} episodes, Q averaged over {N_RUNS_ORACLE} runs."
+    )
+    .tab_stubhead(label="Method")
+    .tab_spanner(label="Value at the start state", columns=["Q_start", "q_star_start", "q_pi_eps_start"])
+    .tab_spanner(label="Worst state its own policy occupies",
+                 columns=["n_occupied", "error_q_star", "error_q_pi_eps"])
+    .cols_label(
+        Q_start=html("<i>Q</i>(start)"),
+        q_star_start=html("<i>q</i><sub>*</sub>"),
+        q_pi_eps_start=html("<i>q</i><sub>π<sub>ε</sub></sub>"),
+        n_occupied="States",
+        error_q_star=html("max |<i>Q</i> − <i>q</i><sub>*</sub>|"),
+        error_q_pi_eps=html("max |<i>Q</i> − <i>q</i><sub>π<sub>ε</sub></sub>|"),
+    )
+    .fmt_number(columns=value_columns, decimals=2)
+    .fmt_integer(columns="n_occupied")
+    .cols_align("right", columns=[*value_columns, "n_occupied"])
+    .tab_style(style.text(weight="bold"), loc.body(columns=["q_star_start", "error_q_star"], rows=rows_q_star))
+    .tab_style(style.text(weight="bold"), loc.body(columns=["q_pi_eps_start", "error_q_pi_eps"], rows=rows_q_pi_eps))
+    .tab_source_note(html("<i>q</i><sub>*</sub> = optimal action values (Q-learning's target)."))
+    .tab_source_note(html("<i>q</i><sub>π<sub>ε</sub></sub> = action values of the learner's own "
+                          "ε-greedy policy (Sarsa's target)."))
+    .tab_source_note("Bold = the oracle that method's own theory says it converges to.")
+)
+oracle_table
 ```
 
 - **Q-learning matches $q_*$.** $Q(\text{start}) = -13.00$ is exactly the optimal action value, even though every episode was generated by an $\varepsilon$-greedy policy that keeps falling off the cliff. Due to learning using an off-policy framework, we evaluate the *greedy* policy, the $\max_a$ in the target, while the agent behaves according to its own behavior policy which gets estimated poorly at $q_{\pi_\varepsilon}(\text{start}) = -45.78$. This is why the online return in the figure above is *worse* than Sarsa's even though its value estimates are better.
@@ -2962,7 +4465,7 @@ $$
 Q(S_t,A_t) \leftarrow Q(S_t,A_t) + \alpha\Big[R_{t+1} + \gamma\sum_a \pi(a\mid S_{t+1})\,Q(S_{t+1},a) - Q(S_t,A_t)\Big]
 $$
 
-This is an *expected* backup over actions with a *sampled* transition. It moves in the same direction as Sarsa in expectation, however, since the algorithm does not require a random next-action the variance is lesser. Notice if we select the greedy policy for $\pi$ inside the sum then expected Sarsa is exactly Q-learning. Thus, expected Sarsa is a generalization of Q-leanring.
+This is an *expected* backup over actions with a *sampled* transition. It moves in the same direction as Sarsa in expectation, however, since the algorithm does not require a random next-action the variance is lesser. Notice if we select the greedy policy for $\pi$ inside the sum then expected Sarsa is exactly Q-learning. Thus, expected Sarsa is a generalization of Q-learning.
 
 Expected Sarsa can be on-policy or off-policy if the behavior policy is selected to be different from the target policy.
 
@@ -2972,19 +4475,19 @@ Sweeping the step-size highlights the variance reduction in comparison to regula
 ```{python}
 alphas_sweep = np.round(np.arange(0.1, 1.001, 0.1), 2)
 N_RUNS_SWEEP, N_EPISODES_SWEEP, MAX_STEPS_SWEEP = 50, 500, 150
-EPS = 0.1
+EPS_SWEEP = 0.1
 
 n_learners_sweep = len(alphas_sweep) * N_RUNS_SWEEP
 alpha_per_learner_sweep = np.repeat(alphas_sweep, N_RUNS_SWEEP)
 
-sweep_results = {}
+sweep_results, sweep_finished = {}, {}
 for kind in ["sarsa", "q", "expected_sarsa"]:
     learner = make_control(cliff, kind, 606)
     _, reward_sum_sweep, _, done_sweep, _ = learner(
         np.zeros((n_learners_sweep, cliff.n_states, cliff.n_actions)),
         alpha_per_learner_sweep,
-        np.full(n_learners_sweep, EPS),
-        GAMMA,
+        np.full(n_learners_sweep, EPS_SWEEP),
+        GAMMA_CLIFF,
         N_EPISODES_SWEEP,
         MAX_STEPS_SWEEP
     )
@@ -2992,13 +4495,29 @@ for kind in ["sarsa", "q", "expected_sarsa"]:
     per_alpha = reward_sum_sweep.reshape(N_EPISODES_SWEEP, len(alphas_sweep), N_RUNS_SWEEP)
     sweep_results[kind] = (per_alpha[:100].mean(axis=(0, 2)),
                            per_alpha[-100:].mean(axis=(0, 2)))
-    print(f"{kind}: episodes finished: {done_sweep.mean():.1%}")
+    sweep_finished[kind] = done_sweep.mean()
+```
+
+```{python}
+sweep_finished_table = (
+    GT(pd.DataFrame([dict(method=CONTROL_LABELS[kind], finished=finished)
+                     for kind, finished in sweep_finished.items()]),
+       rowname_col="method")
+    .tab_header(
+        title=md("**Episodes finished in the step-size sweep**"),
+        subtitle=f"{len(alphas_sweep)} step sizes × {N_RUNS_SWEEP} runs × {N_EPISODES_SWEEP} episodes, ε = {EPS_SWEEP}."
+    )
+    .tab_stubhead(label="Method")
+    .cols_label(finished="Episodes finished")
+    .fmt_percent(columns="finished", decimals=1)
+    .cols_align("right", columns="finished")
+)
+sweep_finished_table
 ```
 
 
 ```{python}
 #| classes: light-mode
-labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
 sweep_fig = make_subplots(
     rows=1,
     cols=2,
@@ -3017,7 +4536,7 @@ for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
             x=alphas_sweep,
             y=y,
             mode="lines+markers",
-            name=labels[kind],
+            name=CONTROL_LABELS[kind],
             line=dict(color=colors[i], width=2),
             marker=dict(size=7, line=dict(color="white", width=1)),
             showlegend=(col == 1),
@@ -3044,7 +4563,6 @@ sweep_fig.show(config=dict(displayModeBar=False))
 
 ```{python}
 #| classes: dark-mode
-labels = {"sarsa": "Sarsa", "q": "Q-learning", "expected_sarsa": "Expected Sarsa"}
 sweep_fig = make_subplots(
     rows=1,
     cols=2,
@@ -3063,7 +4581,7 @@ for i, kind in enumerate(["sarsa", "q", "expected_sarsa"]):
             x=alphas_sweep,
             y=y,
             mode="lines+markers",
-            name=labels[kind],
+            name=CONTROL_LABELS[kind],
             line=dict(color=colors[i], width=2),
             marker=dict(size=7, line=dict(color="white", width=1)),
             showlegend=(col == 1),
@@ -3105,10 +4623,10 @@ We create the book's two state MDP that highlights the difficulties of learning 
 
 ```{python}
 #| classes: light-mode
-g = nx.MultiDiGraph()
+graph = nx.MultiDiGraph()
 
 for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
-    g.add_node(
+    graph.add_node(
         name,
         label=label,
         shape="circle",
@@ -3121,7 +4639,7 @@ for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
     )
 
 for name, x in [("left terminal", -420), ("right terminal", 300)]:
-    g.add_node(
+    graph.add_node(
         name,
         label="terminal",
         shape="rectangle",
@@ -3138,11 +4656,11 @@ transitions = [
     ("A", "right terminal", "right, r = 0"),
     ("B", "left terminal", "10 actions, r ~ N(−0.1, 1)"),
 ]
-for s, s_next, lbl in transitions:
-    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for s, s_next, label in transitions:
+    graph.add_edge(s, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
 gv.d3(
-    g,
+    graph,
     graph_height=320,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -3156,10 +4674,10 @@ gv.d3(
 
 ```{python}
 #| classes: dark-mode
-g = nx.MultiDiGraph()
+graph = nx.MultiDiGraph()
 
 for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
-    g.add_node(
+    graph.add_node(
         name,
         label=label,
         label_color="#faf8f8",
@@ -3173,7 +4691,7 @@ for name, label, x in [("B", "B", -180), ("A", "A (start)", 60)]:
     )
 
 for name, x in [("left terminal", -420), ("right terminal", 300)]:
-    g.add_node(
+    graph.add_node(
         name,
         label="terminal",
         label_color="#faf8f8",
@@ -3191,13 +4709,13 @@ transitions = [
     ("A", "right terminal", "right, r = 0"),
     ("B", "left terminal", "10 actions, r ~ N(−0.1, 1)"),
 ]
-for s, s_next, lbl in transitions:
-    g.add_edge(s, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for s, s_next, label in transitions:
+    graph.add_edge(s, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
-g.graph['background_color'] = 'black'
+graph.graph['background_color'] = 'black'
 
 gv.d3(
-    g,
+    graph,
     graph_height=320,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -3222,7 +4740,38 @@ The roles are swapped on a coin flip at each step, and the behavior is $\varepsi
 
 ```{python}
 def make_double_q(env, seed):
-    "Double Q-learning: two tables, one picks the action and the other values it."
+    """Compile Double Q-learning for many runs at once: two tables, one picks the action and the other values it.
+
+    Every run behaves ε-greedily in Q1 + Q2. At each step a coin flip picks which table learns:
+
+        Q1(S_t, A_t) <- Q1(S_t, A_t) + alpha [ R_{t+1} + gamma * Q2(S_{t+1}, argmax_a Q1(S_{t+1}, a)) - Q1(S_t, A_t) ],
+
+    or the same with Q1 and Q2 swapped. The argmax runs over the legal actions, and the bootstrap
+    term counts as 0 when S_{t+1} is terminal. Episodes are padded to ``max_steps`` steps as in
+    `make_control`.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the model the agent acts in, the legal actions and the start distribution.
+    seed : int
+        Seed for the random generator.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function
+        ``(Q_init, alpha, eps, gamma, n_episodes, max_steps) -> (Q1, Q2, reward_sum, first_action)``:
+
+        - ``Q_init``: shape (n_runs, n_states, n_actions), the starting Q1. Q2 starts at 0.
+        - ``alpha``, ``eps``: shape (n_runs,), each run's step size and ε.
+        - ``gamma``: float, the discount factor.
+        - ``Q1``, ``Q2``: shape (n_runs, n_states, n_actions), the two tables after the last episode.
+        - ``reward_sum``: shape (n_episodes, n_runs), each episode's sum of rewards.
+        - ``first_action``: shape (n_episodes, n_runs), the first action of each episode.
+
+        The random generator state carries over between calls.
+    """
     P = pt.as_tensor_variable(env.P)
     reward_mean = pt.as_tensor_variable(env.reward_mean)
     reward_sd = pt.as_tensor_variable(env.reward_sd)
@@ -3239,16 +4788,74 @@ def make_double_q(env, seed):
     max_steps = pt.iscalar("T")
 
     def argmax_legal(Q, s):
+        """Return each run's greedy legal action in its state.
+
+        Parameters
+        ----------
+        Q : TensorVariable, shape (n_runs, n_states, n_actions)
+            Action values.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+
+        Returns
+        -------
+        TensorVariable of int, shape (n_runs,)
+            ``argmax_a Q(s, a)`` over the legal actions, ties to the lowest-numbered action.
+        """
         runs = pt.arange(Q.shape[0])
         return pt.argmax(pt.where(legal_actions[s] > 0, Q[runs, s], NEG_INF), axis=1)
 
     def pick(rng, Q_sum, s, eps):
+        """Draw one action per run from the ε-greedy policy of Q1 + Q2.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        Q_sum : TensorVariable, shape (n_runs, n_states, n_actions)
+            Q1 + Q2.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+        eps : TensorVariable, shape (n_runs,)
+            Each run's ε.
+
+        Returns
+        -------
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_runs,)
+            The actions.
+        """
         runs = pt.arange(Q_sum.shape[0])
-        legal = legal_actions[s]
-        probs = legal * (eps / legal.sum(axis=1))[:, None]
-        return rng.categorical(p=pt.inc_subtensor(probs[runs, argmax_legal(Q_sum, s)], 1.0 - eps))
+        return rng.categorical(p=eps_greedy_probs(legal_actions[s], Q_sum[runs, s], eps))
 
     def inner(rng, s, a, still_running, Q1, Q2, reward_sum, alpha, eps, gamma):
+        """Take one step in every run and update one of the two tables, chosen by a coin flip.
+
+        Both updates are computed, and the coin flip multiplies one of them by 0.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's state S_t and action A_t.
+        still_running : TensorVariable, shape (n_runs,)
+            1.0 while the run's episode has not terminated, 0.0 after; it scales the update.
+        Q1, Q2 : TensorVariable, shape (n_runs, n_states, n_actions)
+            The two tables before the update.
+        reward_sum : TensorVariable, shape (n_runs,)
+            The episode's sum of rewards so far.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_next, a_next, still_running, Q1, Q2, reward_sum)`` for the next step.
+        """
         runs = pt.arange(Q1.shape[0])
         rng, s_next = rng.categorical(p=P[s, a])
         rng, r = rng.normal(loc=reward_mean[s, a], scale=reward_sd[s, a])
@@ -3258,8 +4865,8 @@ def make_double_q(env, seed):
         bootstrap1 = not_terminal[s_next] * Q2[runs, s_next, best1]  # eval by the other
         bootstrap2 = not_terminal[s_next] * Q1[runs, s_next, best2]
 
-        rng, u = rng.uniform(size=still_running.shape)
-        updates_Q1 = pt.cast(u < 0.5, "float64")# which table learns this step
+        rng, coin = rng.uniform(size=still_running.shape)
+        updates_Q1 = pt.cast(coin < 0.5, "float64")# which table learns this step
 
         Q1 = pt.inc_subtensor(Q1[runs, s, a], alpha * still_running * updates_Q1 * (r + gamma * bootstrap1 - Q1[runs, s, a]))
         Q2 = pt.inc_subtensor(Q2[runs, s, a], alpha * still_running * (1 - updates_Q1) * (r + gamma * bootstrap2 - Q2[runs, s, a]))
@@ -3269,6 +4876,30 @@ def make_double_q(env, seed):
                 reward_sum + still_running * r)
 
     def episode(rng, s, a, Q1, Q2, alpha, eps, gamma, max_steps):
+        """Run one episode in every run, then draw the next episode's start state and action.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s, a : TensorVariable of int, shape (n_runs,)
+            Each run's start state and first action.
+        Q1, Q2 : TensorVariable, shape (n_runs, n_states, n_actions)
+            The two tables at the start of the episode.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        max_steps : TensorVariable of int, scalar
+            Steps per episode.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_new, a_new, Q1, Q2, reward_sum)``: the next episode's start state and
+            first action, the tables after this episode, and this episode's sum of rewards,
+            of shape (n_runs,).
+        """
         zero = pt.zeros_like(not_terminal[s])
 
         rng_final, S_seq, A_seq, running_seq, Q1_seq, Q2_seq, reward_sum = pytensor.scan(
@@ -3316,7 +4947,7 @@ Q_q, _, _, _, first_action_q = q_learner_maxbias(
     Q_init_maxbias,
     np.full(N_RUNS_MAXBIAS, 0.1),
     np.full(N_RUNS_MAXBIAS, 0.1),
-    GAMMA,
+    GAMMA_MAXBIAS,
     N_EPISODES_MAXBIAS,
     MAX_STEPS_MAXBIAS
 )
@@ -3325,7 +4956,7 @@ Q1_double, Q2_double, _, first_action_double = double_q_maxbias(
     Q_init_maxbias,
     np.full(N_RUNS_MAXBIAS, 0.1),
     np.full(N_RUNS_MAXBIAS, 0.1),
-    GAMMA,
+    GAMMA_MAXBIAS,
     N_EPISODES_MAXBIAS,
     MAX_STEPS_MAXBIAS
 )
@@ -3333,18 +4964,51 @@ Q1_double, Q2_double, _, first_action_double = double_q_maxbias(
 left_q = (first_action_q == 0).mean(axis=1)
 left_double = (first_action_double == 0).mean(axis=1)
 
-print(f"% of episodes taking 'left' from A (eps-greedy floor = {0.1/2:.0%})")
-for ep in [1, 10, 50, 100, 200, 300]:
-    print(f"  after {ep:3d} episodes: Q-learning {left_q[ep-1]:6.1%}   "
-          f"Double Q {left_double[ep-1]:6.1%}")
-
 # the biased quantity is the bootstrap value each method feeds into Q(A, left)
 bootstrap_q = Q_q[:, 1].max(axis=1) # max_a Q(B,a)
 best_by_Q1 = Q1_double[:, 1].argmax(axis=1)
 bootstrap_double = Q2_double[np.arange(N_RUNS_MAXBIAS), 1, best_by_Q1]  # Q2(B, argmax_a Q1(B,a))
-print(f"\nbootstrap value used for the Q(A,left) update, true value -0.1:")
-print(f"  Q-learning max_a Q(B,a) = {bootstrap_q.mean():+.3f}")
-print(f"  Double Q Q2(B, argmax_a Q1(B,a)) = {bootstrap_double.mean():+.3f}")
+```
+
+```{python}
+left_rows = pd.DataFrame([
+    dict(episodes=f"After {episode} episode{'s' if episode > 1 else ''}", q_learning=left_q[episode - 1], double_q=left_double[episode - 1])
+    for episode in [1, 10, 50, 100, 200, 300]
+])
+
+left_table = (
+    GT(left_rows, rowname_col="episodes")
+    .tab_header(
+        title=md("**Episodes taking 'left' from A**"),
+        subtitle=f"ε-greedy floor = {0.1/2:.0%}. Mean of {N_RUNS_MAXBIAS:,} runs."
+    )
+    .cols_label(q_learning="Q-learning", double_q="Double Q")
+    .fmt_percent(columns=["q_learning", "double_q"], decimals=1)
+    .cols_align("right", columns=["q_learning", "double_q"])
+)
+left_table
+```
+
+```{python}
+bootstrap_rows = pd.DataFrame([
+    dict(method="Q-learning", quantity="max<sub><i>a</i></sub> <i>Q</i>(B, <i>a</i>)", value=bootstrap_q.mean()),
+    dict(method="Double Q", quantity="<i>Q</i><sub>2</sub>(B, argmax<sub><i>a</i></sub> <i>Q</i><sub>1</sub>(B, <i>a</i>))",
+         value=bootstrap_double.mean()),
+])
+
+bootstrap_table = (
+    GT(bootstrap_rows, rowname_col="method")
+    .tab_header(
+        title=md("**Bootstrap value used for the Q(A, left) update**"),
+        subtitle="True value −0.1. Mean over the runs."
+    )
+    .tab_stubhead(label="Method")
+    .cols_label(quantity="Bootstrap term", value="Value")
+    .fmt_markdown(columns="quantity")
+    .fmt_number(columns="value", decimals=3, force_sign=True)
+    .cols_align("right", columns="value")
+)
+bootstrap_table
 ```
 
 
@@ -3457,9 +5121,41 @@ learning update is plain TD(0) on $U$, which is on-policy, so like Sarsa it eval
 
 ```{python}
 def make_afterstate_control(env, seed):
-    """TD(0) over afterstate values.  Deterministic dynamics only: the afterstate of (s,a)
-    is the cell you land in, so one table U indexed by afterstate replaces the (s,a) table
-    and the greedy step becomes a one-step lookahead through the known model."""
+    """Compile on-policy TD(0) control over afterstate values, for many runs at once.
+
+    Deterministic dynamics only: the afterstate of (s, a) is the cell the agent lands in, so one
+    table U indexed by afterstate replaces the (s, a) table. Acting is a one-step lookahead
+    through the known model,
+
+        pi(s) = argmax_a [ r(s, a) + gamma * U(afterstate(s, a)) ]   (ε-greedy around it),
+
+    and learning is plain TD(0) on U along the states visited,
+
+        U(S_t) <- U(S_t) + alpha [ R_{t+1} + gamma * U(S_{t+1}) - U(S_t) ],
+
+    with U of a terminal state counted as 0. Episodes are padded to ``max_steps`` steps as in
+    `make_control`.
+
+    Parameters
+    ----------
+    env : Env
+        Supplies the deterministic model, the rewards, the legal actions and the start distribution.
+    seed : int
+        Seed for the random generator.
+
+    Returns
+    -------
+    control : callable
+        Compiled PyTensor function
+        ``(U_init, alpha, eps, gamma, n_episodes, max_steps) -> (U, reward_sum, done)``. ``U_init``
+        and ``U`` have shape (n_runs, n_states); ``alpha`` and ``eps`` have shape (n_runs,);
+        ``reward_sum`` and ``done`` have shape (n_episodes, n_runs). The random generator state
+        carries over between calls.
+    lookahead_fn : callable
+        Compiled ``(U, gamma) -> q``: the model-implied action values
+        ``r(s, a) + gamma * U(afterstate(s, a))`` of one table U of shape (n_states,), with shape
+        (n_states, n_actions).
+    """
 
     assert np.allclose(env.P.max(axis=2), 1.0), "afterstates here assume deterministic dynamics"
 
@@ -3478,19 +5174,78 @@ def make_afterstate_control(env, seed):
     max_steps = pt.iscalar("T")
 
     def lookahead(U, s, gamma):
-        "model-implied action values  r(s,a) + gamma * U(afterstate(s,a))  -> (n_runs, n_actions)"
+        """Return the model-implied action values of each run's state.
+
+            q(s, a) = r(s, a) + gamma * U(afterstate(s, a)),   with U of a terminal afterstate 0
+
+        Parameters
+        ----------
+        U : TensorVariable, shape (n_runs, n_states)
+            Afterstate values.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        TensorVariable, shape (n_runs, n_actions)
+            The action values in each run's state.
+        """
         runs = pt.arange(U.shape[0])[:, None]
         s_next = afterstate[s]
         return reward[s] + gamma * not_terminal[s_next] * U[runs, s_next]
 
     def pick(rng, U, s, eps, gamma):
-        runs = pt.arange(U.shape[0])
-        legal = legal_actions[s]
-        greedy = pt.argmax(pt.where(legal > 0, lookahead(U, s, gamma), NEG_INF), axis=1)
-        probs = legal * (eps / legal.sum(axis=1))[:, None]
-        return rng.categorical(p=pt.inc_subtensor(probs[runs, greedy], 1.0 - eps))
+        """Draw one action per run, ε-greedy with respect to the lookahead values.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        U : TensorVariable, shape (n_runs, n_states)
+            Afterstate values.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state.
+        eps : TensorVariable, shape (n_runs,)
+            Each run's ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        rng : RandomGeneratorSharedVariable
+            The advanced generator.
+        a : TensorVariable of int, shape (n_runs,)
+            The actions.
+        """
+        return rng.categorical(p=eps_greedy_probs(legal_actions[s], lookahead(U, s, gamma), eps))
 
     def inner(rng, s, still_running, U, reward_sum, alpha, eps, gamma):
+        """Choose an action in every run, move to its afterstate, and apply TD(0) to U.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's state S_t.
+        still_running : TensorVariable, shape (n_runs,)
+            1.0 while the run's episode has not terminated, 0.0 after; it scales the update.
+        U : TensorVariable, shape (n_runs, n_states)
+            Afterstate values before the update.
+        reward_sum : TensorVariable, shape (n_runs,)
+            The episode's sum of rewards so far.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_next, still_running, U, reward_sum)`` for the next step.
+        """
         runs = pt.arange(U.shape[0])
         rng, a = pick(rng, U, s, eps, gamma)
         s_next, r = afterstate[s, a], reward[s, a]
@@ -3499,6 +5254,29 @@ def make_afterstate_control(env, seed):
         return (rng, s_next, still_running * not_terminal[s_next], U, reward_sum + still_running * r)
 
     def episode(rng, s, U, alpha, eps, gamma, max_steps):
+        """Run one episode in every run, then draw the next episode's start state.
+
+        Parameters
+        ----------
+        rng : RandomGeneratorSharedVariable
+            The random generator state.
+        s : TensorVariable of int, shape (n_runs,)
+            Each run's start state.
+        U : TensorVariable, shape (n_runs, n_states)
+            Afterstate values at the start of the episode.
+        alpha, eps : TensorVariable, shape (n_runs,)
+            Each run's step size and ε.
+        gamma : TensorVariable, scalar
+            Discount factor.
+        max_steps : TensorVariable of int, scalar
+            Steps per episode.
+
+        Returns
+        -------
+        tuple
+            ``(rng, s_new, U, reward_sum, done)``: the next episode's start state, the values after
+            this episode, and this episode's sum of rewards and done flag, of shape (n_runs,).
+        """
         zero = pt.zeros_like(not_terminal[s])
 
         rng_final, S_seq, running_seq, U_seq, reward_sum = pytensor.scan(
@@ -3539,36 +5317,49 @@ def make_afterstate_control(env, seed):
 
 
 ```{python}
-afterstate_control_g4, lookahead_g4 = make_afterstate_control(grid4, 909)
+afterstate_control_grid4, lookahead_grid4 = make_afterstate_control(grid4, 909)
 
 N_RUNS_AFTER = 20
 
-U_after, reward_sum_after, done_after = afterstate_control_g4(
+U_after, reward_sum_after, done_after = afterstate_control_grid4(
       np.zeros((N_RUNS_AFTER, grid4.n_states)),
       np.full(N_RUNS_AFTER, 0.2),
       np.full(N_RUNS_AFTER, 0.1),
-      GAMMA,
+      GAMMA_GRID4,
       400,
       60
 )
 
-evaluate_policy_g4, optimal_values_g4, _ = ORACLE["grid4"]
+evaluate_policy_grid4, optimal_values_grid4, _ = ORACLE["grid4"]
 
 gaps_after = np.array(
     [
-        np.abs(evaluate_policy_g4(greedy_pi(lookahead_g4(U_after[run], GAMMA), grid4), GAMMA) - v_star_g4)[~grid4.terminal].max()
+        np.abs(evaluate_policy_grid4(greedy_pi(lookahead_grid4(U_after[run], GAMMA_GRID4), grid4), GAMMA_GRID4) - v_star_grid4)[~grid4.terminal].max()
         for run in range(N_RUNS_AFTER)
     ]
 )
 
 print(f"afterstate TD(0), 400 episodes: runs whose greedy policy is exactly optimal: "
       f"{(gaps_after < 1e-9).sum()}/{N_RUNS_AFTER}")
+```
 
-show_grid(U_after.mean(axis=0), grid4, "\nlearned afterstate values U (mean over runs):")
-print()
+```{python}
+#| classes: light-mode
+values_figure(
+    {"Learned afterstate values U (mean over runs)": U_after.mean(axis=0),
+     "Exact v<sub>*</sub>": v_star_grid4},
+    grid4
+).show(config=dict(displayModeBar=False))
+```
 
-show_grid(v_star_g4, grid4, "exact v_* :")
-
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"Learned afterstate values U (mean over runs)": U_after.mean(axis=0),
+     "Exact v<sub>*</sub>": v_star_grid4},
+    grid4,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 

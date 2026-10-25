@@ -43,11 +43,15 @@ with warnings.catch_warnings():
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 import pytensor
 import pytensor.tensor as pt
+from dataclasses import dataclass
 import plotly.graph_objects as go
 import plotly.express as px
 import plotly.io as pio
+from plotly.subplots import make_subplots
+from great_tables import GT, loc, md, html
 
 colors = px.colors.qualitative.Pastel
 pio.renderers.default = "notebook_connected"
@@ -73,34 +77,294 @@ terminal = np.zeros(n_states, dtype=bool)
 terminal[TERMINAL_STATES] = True
 UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
 ARROWS = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
+GRID_SHAPE = (4, 4) # (n_rows, n_cols) of the gridworld
+STEP_REWARD_GRID = -1.0 # reward on every step out of a non-terminal state
 ```
 
 
-Three plain-Python helpers: `grid_step` is the deterministic dynamics we are about to bake into $P$, while `show_grid` and `show_policy` print a length-16 vector as a $4\times4$ block so we can eyeball values and greedy actions as we go.
+Plain-Python helpers: `grid_step` is the deterministic dynamics we are about to bake into $P$, while `values_figure` and `policy_figure` draw a length-16 vector as a $4\times4$ grid so we can eyeball values and greedy actions as we go.
 
 ```{python}
 def grid_step(s, a):
-    "Where action a takes you from state s (clamped to the grid, terminals absorb)."
+    """Return the state that action `a` leads to from state `s`.
+
+    Moves are deterministic. A move that would step off the grid leaves the agent where it is,
+    and a terminal state is absorbing: every action leaves the agent in it.
+
+    Parameters
+    ----------
+    s : int
+        The current state, numbered ``row * n_cols + col`` on the grid.
+    a : {UP, DOWN, LEFT, RIGHT}
+        The action.
+
+    Returns
+    -------
+    int
+        The next state.
+    """
     if s in TERMINAL_STATES:
         return s
-    row, col = divmod(s, 4)
+    n_rows, n_cols = GRID_SHAPE
+    row, col = divmod(s, n_cols)
     if a == UP: row = max(row - 1, 0)
-    elif a == DOWN: row = min(row + 1, 3)
+    elif a == DOWN: row = min(row + 1, n_rows - 1)
     elif a == LEFT: col = max(col - 1, 0)
-    elif a == RIGHT: col = min(col + 1, 3)
-    return row * 4 + col
+    elif a == RIGHT: col = min(col + 1, n_cols - 1)
+    return row * n_cols + col
+```
 
-def show_grid(values, title=""):
-    if title: print(title)
-    for row in np.asarray(values, dtype=float).reshape(4, 4):
-        print("  " + "  ".join(f"{x:6.1f}" for x in row))
+```{python}
+STEP = {UP: (0, 1), DOWN: (0, -1), LEFT: (-1, 0), RIGHT: (1, 0)} # action -> (dx, dy) when drawn
 
-def show_policy(actions, title=""):
-    if title: print(title)
-    chars = [ARROWS[int(a)] if not terminal[s] else "T"
-             for s, a in enumerate(actions)]
-    for row in range(4):
-        print("   " + "  ".join(chars[row * 4:(row + 1) * 4]))
+@dataclass(frozen=True)
+class GridTheme:
+    template: str    # plotly template
+    background: str  # plot background, which shows in the gaps between cells
+    floor: str       # fill of a non-terminal cell
+
+GRID_LIGHT = GridTheme(template="plotly_white", background="white", floor="#f2f2f2")
+GRID_DARK = GridTheme(template="plotly_dark", background="black", floor="#9e9d9d")
+GRID_TERMINAL = colors[4] # terminal cell fill, the same in both themes
+GRID_INK, GRID_ARROW = "#4a4a4a", colors[2] # labels and policy arrows, drawn on the cells in both themes
+
+def grid_xy(s, shape):
+    """Convert a state id to (x, y) plot coordinates, with grid row 0 drawn at the top.
+
+    Parameters
+    ----------
+    s : int
+        The state, numbered ``row * n_cols + col``.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+
+    Returns
+    -------
+    x, y : int
+        The column, and the row counted up from the bottom.
+    """
+    n_rows, n_cols = shape
+    row, col = divmod(int(s), n_cols)
+    return col, n_rows - 1 - row
+
+def grid_panels(panel_titles, shape, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Make an empty figure with one subplot per panel, each holding a grid of square cells.
+
+    The figure is tall enough for every cell to be ``cell_px`` pixels high and takes the page
+    width; the cells stay square. The panels are laid out left to right, then top to bottom.
+
+    Parameters
+    ----------
+    panel_titles : list of str
+        One title per panel.
+    shape : tuple of (int, int)
+        The (n_rows, n_cols) of the grid. Every panel shares it.
+    title : str, default ""
+        The figure title. Plotly HTML (<b>, <br>, <sup>) works.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        The figure, with the axes of every panel hidden and scaled so the cells are square.
+    """
+    n_rows, n_cols = shape
+    n_panels = len(panel_titles)
+    n_panel_cols = n_panel_cols or n_panels
+    n_panel_rows = -(-n_panels // n_panel_cols) # ceiling division
+    gap_x_px, gap_y_px = 20, 40 # between panels
+    plot_width = n_panel_cols * n_cols * cell_px + (n_panel_cols - 1) * gap_x_px
+    plot_height = n_panel_rows * n_rows * cell_px + (n_panel_rows - 1) * gap_y_px
+
+    fig = make_subplots(
+        rows=n_panel_rows,
+        cols=n_panel_cols,
+        subplot_titles=[f"<b>{t}</b>" for t in panel_titles],
+        horizontal_spacing=gap_x_px / plot_width,
+        vertical_spacing=gap_y_px / plot_height
+    )
+
+    for row in range(1, n_panel_rows + 1):
+        for col in range(1, n_panel_cols + 1):
+            x_axis = fig.get_subplot(row, col).xaxis.plotly_name.replace("axis", "")
+            fig.update_xaxes(range=[-0.55, n_cols - 0.45], visible=False, constrain="domain",
+                             row=row, col=col)
+            fig.update_yaxes(range=[-0.55, n_rows - 0.45], visible=False, scaleanchor=x_axis,
+                             constrain="domain", row=row, col=col)
+
+    margin = dict(l=10, r=10, b=10, t=(80 if title else 0) + 30)
+    fig.update_layout(
+        title=title,
+        height=plot_height + margin["t"] + margin["b"],
+        margin=margin,
+        template=theme.template,
+        plot_bgcolor=theme.background,
+        showlegend=False
+    )
+    return fig
+
+def draw_cells(fig, shape, fills, labels, row=1, col=1, pad=0.04):
+    """Draw one filled square per state into a subplot, with an optional label on top.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    fills : list of str, length n_rows * n_cols
+        The fill color of each state's cell.
+    labels : dict of {int: str}
+        Text drawn in the middle of a cell, by state, e.g. ``{0: "T"}``.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    pad : float, default 0.04
+        Gap around each cell, in cell widths.
+    """
+    n_rows, n_cols = shape
+    for s in range(n_rows * n_cols):
+        x, y = grid_xy(s, shape)
+        fig.add_shape(
+            type="rect",
+            x0=x - 0.5 + pad,
+            x1=x + 0.5 - pad,
+            y0=y - 0.5 + pad,
+            y1=y + 0.5 - pad,
+            fillcolor=fills[s],
+            line_width=0,
+            layer="below",
+            row=row, col=col
+        )
+    for s, label in labels.items():
+        x, y = grid_xy(s, shape)
+        fig.add_annotation(x=x, y=y, text=f"<b>{label}</b>", showarrow=False,
+                           font=dict(size=14, color=GRID_INK), row=row, col=col)
+
+def draw_arrows(fig, shape, actions, states, row=1, col=1, color=GRID_ARROW):
+    """Draw an arrow in each of the given states, pointing the way its action moves.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A figure from `grid_panels`. It is changed in place.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    actions : array_like of int, shape (n_rows * n_cols,)
+        The action in each state. Only the entries for ``states`` are drawn.
+    states : array_like of int
+        The states that get an arrow.
+    row, col : int, default 1, 1
+        The panel to draw into.
+    color : str, default GRID_ARROW
+        The arrow color.
+    """
+    subplot = fig.get_subplot(row, col)
+    x_ref = subplot.xaxis.plotly_name.replace("axis", "")
+    y_ref = subplot.yaxis.plotly_name.replace("axis", "")
+    for s in states:
+        x, y = grid_xy(s, shape)
+        dx, dy = STEP[int(actions[s])]
+        fig.add_annotation(
+            x=x + 0.34 * dx,
+            y=y + 0.34 * dy,
+            ax=x - 0.22 * dx,
+            ay=y - 0.22 * dy,
+            xref=x_ref, yref=y_ref,
+            axref=x_ref, ayref=y_ref,
+            showarrow=True,
+            arrowhead=2, arrowsize=1.0, arrowwidth=2.2, arrowcolor=color
+        )
+
+def values_figure(values, shape, title="", fmt=".1f", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one number per state, laid out as the grid and colored by size.
+
+    Each panel has its own color scale, so the colors compare states within a panel; the printed
+    numbers carry the values.
+
+    Parameters
+    ----------
+    values : dict of {str: array_like of shape (n_rows * n_cols,)}
+        One panel per entry: its title, and the number for each state (e.g. a state-value
+        function).
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    title : str, default ""
+        The figure title.
+    fmt : str, default ".1f"
+        d3 format spec for the numbers printed in the cells.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The plotly template and plot background. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    n_rows, n_cols = shape
+    fig = grid_panels(list(values), shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(values)
+    for i, v in enumerate(values.values()):
+        grid = np.asarray(v, dtype=float).reshape(n_rows, n_cols)
+        state = np.arange(n_rows * n_cols).reshape(n_rows, n_cols)
+        fig.add_heatmap(
+            x=np.arange(n_cols),
+            y=np.arange(n_rows),
+            z=grid[::-1], # grid row 0 at the top
+            customdata=state[::-1],
+            colorscale="Teal",
+            showscale=False,
+            texttemplate=f"%{{z:{fmt}}}",
+            xgap=3,
+            ygap=3,
+            hovertemplate=f"state %{{customdata}}: <b>%{{z:{fmt}}}</b><extra></extra>",
+            row=i // n_panel_cols + 1, col=i % n_panel_cols + 1
+        )
+    return fig
+
+def policy_figure(policies, shape, terminal, title="", n_panel_cols=None, cell_px=100, theme=GRID_LIGHT):
+    """Draw one arrow per state for each deterministic policy, laid out as the grid.
+
+    Terminal states are the terminal color and labeled "T"; every other state gets an arrow.
+
+    Parameters
+    ----------
+    policies : dict of {str: array_like of int, shape (n_rows * n_cols,)}
+        One panel per entry: its title, and the action taken in each state.
+    shape : tuple of (int, int)
+        The grid's (n_rows, n_cols).
+    terminal : ndarray of bool, shape (n_rows * n_cols,)
+        True for the terminal states.
+    title : str, default ""
+        The figure title.
+    n_panel_cols : int, optional
+        Panels per row of the figure. The default puts every panel in one row.
+    cell_px : int, default 100
+        Height of one grid cell, in pixels.
+    theme : GridTheme, default GRID_LIGHT
+        The template, background and floor fill. GRID_DARK for the book's dark theme.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    n_rows, n_cols = shape
+    fills = [GRID_TERMINAL if terminal[s] else theme.floor for s in range(n_rows * n_cols)]
+    labels = {int(s): "T" for s in np.flatnonzero(terminal)}
+    fig = grid_panels(list(policies), shape, title, n_panel_cols, cell_px, theme)
+    n_panel_cols = n_panel_cols or len(policies)
+    for i, actions in enumerate(policies.values()):
+        row, col = i // n_panel_cols + 1, i % n_panel_cols + 1
+        draw_cells(fig, shape, fills, labels, row, col)
+        draw_arrows(fig, shape, actions, np.flatnonzero(~terminal), row, col)
+    return fig
 ```
 
 
@@ -114,7 +378,7 @@ for s in range(n_states):
         s_next = grid_step(s, a)
         P[s, a, s_next] = 1.0
         if s not in TERMINAL_STATES:
-            reward_table[s, a, s_next] = -1.0
+            reward_table[s, a, s_next] = STEP_REWARD_GRID
 ```
 
 
@@ -137,6 +401,34 @@ P_pi = (pi_eval_sym[:, :, None] * P_sym).sum(axis=1) # p(s' | s) under pi
 reward_pi = (pi_eval_sym * reward_mean).sum(axis=1)  # r(s) under pi
 
 def evaluation_step(v_prev, reward_pi, P_pi, gamma, not_terminal):
+    """One sweep of iterative policy evaluation on the collapsed Markov reward process.
+
+    Applies the Bellman expectation backup to every state at once,
+
+        v_{k+1}(s) = sum_a pi(a|s) sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v_k(s') ],
+
+    which, with the policy folded into ``reward_pi`` and ``P_pi``, is the linear map
+    ``v_{k+1} = r^pi + gamma * P^pi v_k``. Here every reward is -1 until a terminal state is
+    reached, and ``not_terminal`` pins the two terminal states to 0.
+
+    Parameters
+    ----------
+    v_prev : TensorVariable, shape (n_states,)
+        The values v_k from the previous sweep.
+    reward_pi : TensorVariable, shape (n_states,)
+        Expected one-step reward under pi, ``r^pi(s) = sum_a pi(a|s) r(s, a)``.
+    P_pi : TensorVariable, shape (n_states, n_states)
+        State-to-state transition matrix under pi, ``P^pi[s, s'] = sum_a pi(a|s) p(s'|s, a)``.
+    gamma : TensorVariable, scalar
+        Discount factor.
+    not_terminal : TensorVariable, shape (n_states,)
+        1.0 for a non-terminal state, 0.0 for a terminal one.
+
+    Returns
+    -------
+    TensorVariable, shape (n_states,)
+        The values v_{k+1}.
+    """
     return not_terminal * (reward_pi + gamma * pt.dot(P_pi, v_prev))
 
 v_eval = pytensor.scan(
@@ -159,7 +451,28 @@ Policy improvement, also unchanged from the DP chapter: score every action by on
 
 ```{python}
 def greedy_from_values(v, gamma):
-    "the greedy policy of a state-value vector, via one-step lookahead through the model"
+    """Return the deterministic greedy policy of a state-value function, via one-step lookahead.
+
+    Looks one step ahead through the model with the compiled ``action_values_of``,
+
+        q(s, a) = sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v(s') ],
+
+    and picks ``argmax_a q(s, a)`` in every state. Ties go to the lowest-numbered action.
+
+    Parameters
+    ----------
+    v : ndarray, shape (n_states,)
+        State values v(s).
+    gamma : float
+        Discount factor.
+
+    Returns
+    -------
+    pi_greedy : ndarray, shape (n_states, n_actions)
+        The policy as a one-hot matrix: 1.0 on the greedy action of each state, 0.0 elsewhere.
+    a_greedy : ndarray of int, shape (n_states,)
+        The greedy action of each state.
+    """
     a_greedy = action_values_of(v, gamma).argmax(axis=1)
     pi_greedy = np.zeros((n_states, n_actions))
     pi_greedy[np.arange(n_states), a_greedy] = 1.0
@@ -171,10 +484,10 @@ Running the oracle on the equiprobable random policy at $\gamma = 1$ gives the t
 
 ```{python}
 # exact answers we will test against
-GAMMA = 1.0
+GAMMA_GRID = 1.0
 pi_random = np.ones((n_states, n_actions)) / n_actions
-v_pi_random = evaluate_policy(pi_random, GAMMA)
-q_pi_random = action_values_of(v_pi_random, GAMMA)
+v_pi_random = evaluate_policy(pi_random, GAMMA_GRID)
+q_pi_random = action_values_of(v_pi_random, GAMMA_GRID)
 q_pi_random[terminal] = 0.0
 pi_star = pi_random
 ```
@@ -184,17 +497,32 @@ Policy iteration - alternating evaluation and greedification until the policy st
 
 ```{python}
 for _ in range(50): # policy iteration
-    pi_new, a_star = greedy_from_values(evaluate_policy(pi_star, GAMMA), GAMMA)
+    pi_new, a_star = greedy_from_values(evaluate_policy(pi_star, GAMMA_GRID), GAMMA_GRID)
     if np.array_equal(pi_new, pi_star):
         break
     pi_star = pi_new
-v_star = evaluate_policy(pi_star, GAMMA)
-q_star = action_values_of(v_star, GAMMA)
+v_star = evaluate_policy(pi_star, GAMMA_GRID)
+q_star = action_values_of(v_star, GAMMA_GRID)
 q_star[terminal] = 0.0
+```
 
-show_grid(v_pi_random, "exact v_pi (equiprobable random policy):")
-print()
-show_grid(v_star, "exact v_* :")
+```{python}
+#| classes: light-mode
+values_figure(
+    {"Exact v<sub>π</sub> (equiprobable random policy)": v_pi_random,
+     "Exact v<sub>*</sub>": v_star},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"Exact v<sub>π</sub> (equiprobable random policy)": v_pi_random,
+     "Exact v<sub>*</sub>": v_star},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 ## Simulating episodes with `scan` and a threaded RNG
@@ -220,6 +548,39 @@ a_start_sym = pt.lvector("a0")     # (n_episodes,) forced first actions (for exp
 max_steps_sym = pt.iscalar("T")    # episode length cap
 
 def simulate_step(s, rng, pi, P):
+    """Advance every episode in the batch by one time step.
+
+    Samples an action from the policy, then the next state from the model,
+
+        A_t ~ pi(. | S_t),    S_{t+1} ~ p(. | S_t, A_t),
+
+    and returns the reward ``R_{t+1} = r(S_t, A_t)``, the expected one-step reward. The moves
+    are deterministic here, so that is exactly the reward the move earns: -1 out of a
+    non-terminal state, 0 out of a terminal one. Terminal states absorb, so an episode that has
+    ended keeps sitting in its terminal state, earning 0.
+
+    Parameters
+    ----------
+    s : TensorVariable of int, shape (n_episodes,)
+        The current states S_t.
+    rng : RandomGeneratorSharedVariable
+        The random generator state, threaded through the scan.
+    pi : TensorVariable, shape (n_states, n_actions)
+        The policy being rolled out, pi(a|s).
+    P : TensorVariable, shape (n_states, n_actions, n_states)
+        Transition probabilities p(s'|s, a).
+
+    Returns
+    -------
+    s_next : TensorVariable of int, shape (n_episodes,)
+        The next states S_{t+1}.
+    rng : RandomGeneratorSharedVariable
+        The advanced generator.
+    a : TensorVariable of int, shape (n_episodes,)
+        The actions A_t.
+    reward : TensorVariable, shape (n_episodes,)
+        The rewards R_{t+1}.
+    """
     rng, a = rng.categorical(p=pi[s]) # A_t ~ pi(.|S_t), batched over episodes
     rng, s_next = rng.categorical(p=P[s, a]) # S_{t+1} ~ p(.|S_t,A_t)
     return s_next, rng, a, reward_mean[s, a]
@@ -276,6 +637,25 @@ The returns come from a second scan over the same $(T, B)$ reward block, run bac
 rewards_sym = pt.matrix("rewards")
 
 def accumulate_return(r, G_next, gamma):
+    """One step of the backward return recursion, G_t = R_{t+1} + gamma * G_{t+1}, for every episode.
+
+    The scan walks the (T, B) reward block from its last row to its first, so ``G_next`` is
+    the row of returns already computed for step t + 1. The return after the last step is 0.
+
+    Parameters
+    ----------
+    r : TensorVariable, shape (n_episodes,)
+        The rewards R_{t+1}: one row of the reward block, supplied by the scan sequence.
+    G_next : TensorVariable, shape (n_episodes,)
+        The returns G_{t+1} from the following time step.
+    gamma : TensorVariable, scalar
+        Discount factor.
+
+    Returns
+    -------
+    TensorVariable, shape (n_episodes,)
+        The returns G_t.
+    """
     return r + gamma * G_next
 
 G_reversed = pytensor.scan(
@@ -295,6 +675,30 @@ Averaging sampled returns means summing them into buckets - one per state, or on
 ```{python}
 # scatter-add sample returns into buckets (states, or state-action pairs)
 def make_aggregator(n_buckets):
+    """Compile a scatter-add that sums weighted values into buckets, along with the weights.
+
+    For every bucket j,
+
+        sums[j] = sum over i with ids[i] = j of weights[i] * values[i],
+        counts[j] = sum over i with ids[i] = j of weights[i].
+
+    With unit weights, ``counts`` is the number of values in each bucket and ``sums / counts``
+    is the sample average. With importance-sampling ratios as weights, the two are the
+    numerator and denominator of the weighted importance-sampling estimate.
+
+    Parameters
+    ----------
+    n_buckets : int
+        Number of buckets: ``n_states`` for states, or ``n_states * n_actions`` for raveled
+        state-action ids ``s * n_actions + a``.
+
+    Returns
+    -------
+    callable
+        Compiled PyTensor function ``(ids, values, weights) -> (sums, counts)``. ``ids`` is int64
+        and ``values`` and ``weights`` are float64, all of shape (n_values,); ``sums`` and
+        ``counts`` have shape (n_buckets,).
+    """
     ids = pt.lvector("ids")
     values = pt.dvector("values")
     weights = pt.dvector("weights")
@@ -311,7 +715,25 @@ The last ingredient separates first-visit from every-visit MC: a forward sweep t
 
 ```{python}
 def first_visit_mask(ids, n_buckets):
-    "ids: (max_steps, n_episodes). True where an id appears for the first time in its episode."
+    """Flag the first occurrence of each id within its episode.
+
+    Sweeps forward through time and marks a step True if its id has not appeared earlier in the
+    same episode. Terminal steps are flagged like any other, so callers mask them out. Used as
+    the weights of an aggregator, the mask gives first-visit MC; all ones gives every-visit MC.
+
+    Parameters
+    ----------
+    ids : ndarray of int, shape (max_steps, n_episodes)
+        The state, or the raveled state-action id ``s * n_actions + a``, at every step of every
+        episode. Row t holds time step t.
+    n_buckets : int
+        Number of possible ids: ``n_states``, or ``n_states * n_actions``.
+
+    Returns
+    -------
+    ndarray of bool, shape (max_steps, n_episodes)
+        True where an id appears for the first time in its episode.
+    """
     max_steps, n_episodes = ids.shape
     seen = np.zeros((n_episodes, n_buckets), dtype=bool)
     is_first_visit = np.zeros(ids.shape, dtype=bool)
@@ -344,7 +766,7 @@ np_rng = np.random.default_rng(0)
 N_EPISODES, MAX_STEPS = 5000, 150
 s_start = np_rng.choice(np.flatnonzero(~terminal), size=N_EPISODES)
 S, A, R = simulate(pi_random, s_start.astype("int64"), MAX_STEPS)
-G = returns_fn(R, 1.0)
+G = returns_fn(R, GAMMA_GRID)
 print(f"{N_EPISODES} episodes, {np.isin(S[-1], TERMINAL_STATES).mean():.2%} terminated within T={MAX_STEPS}")
 ```
 
@@ -356,21 +778,68 @@ first_visits = first_visit_mask(S, n_states) & ~terminal[S]  # first-visit flags
 every_visit = ~terminal[S] # every-visit flags
 
 def mc_state_values(visit_mask):
-    "average of the returns following the flagged visits, per state"
+    """Return the Monte Carlo estimate of v_pi: the average return after the flagged visits, per state.
+
+        V(s) = (sum of G_t over the flagged visits to s) / (number of flagged visits to s)
+
+    Uses the episodes ``S`` and returns ``G`` simulated above under the random policy.
+
+    Parameters
+    ----------
+    visit_mask : ndarray of bool, shape (max_steps, n_episodes)
+        Which visits to count, aligned with ``S`` and ``G``: the first visits for first-visit MC,
+        or every non-terminal visit for every-visit MC.
+
+    Returns
+    -------
+    ndarray, shape (n_states,)
+        The estimate V(s), with 0 for a state that has no flagged visit.
+    """
     ids = S[visit_mask].astype("int64")
     sums, counts = aggregate_states(ids, G[visit_mask], np.ones(ids.size))
     return np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
 
 V_first_visit, V_every_visit = mc_state_values(first_visits), mc_state_values(every_visit)
+```
 
-show_grid(V_first_visit, f"first-visit MC estimate ({N_EPISODES} episodes):")
-print()
+```{python}
+#| classes: light-mode
+values_figure(
+    {f"First-visit MC estimate ({N_EPISODES:,} episodes)": V_first_visit,
+     "Exact v<sub>π</sub> from the DP oracle": v_pi_random},
+    GRID_SHAPE
+).show(config=dict(displayModeBar=False))
+```
 
-show_grid(v_pi_random, "exact v_pi from the DP oracle:")
-print()
+```{python}
+#| classes: dark-mode
+values_figure(
+    {f"First-visit MC estimate ({N_EPISODES:,} episodes)": V_first_visit,
+     "Exact v<sub>π</sub> from the DP oracle": v_pi_random},
+    GRID_SHAPE,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
 
-print(f"max |error|  first-visit: {np.abs(V_first_visit - v_pi_random)[~terminal].max():.3f}"
-      f"   every-visit: {np.abs(V_every_visit - v_pi_random)[~terminal].max():.3f}")
+```{python}
+prediction_error_rows = pd.DataFrame([
+    dict(estimator="First-visit", max_error=np.abs(V_first_visit - v_pi_random)[~terminal].max()),
+    dict(estimator="Every-visit", max_error=np.abs(V_every_visit - v_pi_random)[~terminal].max()),
+])
+
+prediction_error_table = (
+    GT(prediction_error_rows, rowname_col="estimator")
+    .tab_header(
+        title=md("**First-visit against every-visit MC prediction**"),
+        subtitle=html(f"Largest error against the exact <i>v</i><sub>π</sub> over the non-terminal states, "
+                      f"after {N_EPISODES:,} episodes.")
+    )
+    .tab_stubhead(label="Estimator")
+    .cols_label(max_error=html("max |<i>V</i>(<i>s</i>) − <i>v</i><sub>π</sub>(<i>s</i>)|"))
+    .fmt_number(columns="max_error", decimals=3)
+    .cols_align("right", columns="max_error")
+)
+prediction_error_table
 ```
 
 
@@ -381,7 +850,28 @@ On the log-scale axis the $1/\sqrt n$ Monte Carlo rate shows up as a straight li
 ```{python}
 # convergence: root-mean-square error over states as episodes accumulate
 def running_rmse(visit_mask):
-    "RMSE against the exact v_pi after each additional episode"
+    """Return the RMSE of the MC estimate against the exact v_pi after each additional episode.
+
+    Re-accumulates the returns episode by episode, with a cumulative sum along the episode axis,
+    so the estimate V_n built from the first n episodes is available for every n. Each is then
+    compared with the exact values over the non-terminal states,
+
+        RMSE_n = sqrt( mean over non-terminal s of ( V_n(s) - v_pi(s) )^2 ).
+
+    A state with no flagged visit yet counts with estimate 0. Uses the episodes ``S`` and returns
+    ``G`` simulated above under the random policy, and its exact values ``v_pi_random``.
+
+    Parameters
+    ----------
+    visit_mask : ndarray of bool, shape (max_steps, N_EPISODES)
+        Which visits to count, aligned with ``S`` and ``G``: the first visits for first-visit MC,
+        or every non-terminal visit for every-visit MC.
+
+    Returns
+    -------
+    ndarray, shape (N_EPISODES,)
+        RMSE_n for n = 1, ..., N_EPISODES.
+    """
     sums = np.zeros((n_states, N_EPISODES))
     counts = np.zeros((n_states, N_EPISODES))
     states, episodes = S[visit_mask], np.where(visit_mask)[1]
@@ -472,7 +962,7 @@ s_start_es = np_rng.choice(np.flatnonzero(~terminal), size=N_EPISODES_ES).astype
 a_start_es = np_rng.integers(0, n_actions, size=N_EPISODES_ES).astype("int64")
 
 S_es, A_es, R_es = simulate_exploring_starts(pi_random, s_start_es, a_start_es, MAX_STEPS)
-G_es = returns_fn(R_es, GAMMA)
+G_es = returns_fn(R_es, GAMMA_GRID)
 SA_es = S_es * n_actions + A_es # raveled (s, a) ids
 
 first_visits_es = first_visit_mask(SA_es, n_states * n_actions) & ~terminal[S_es]
@@ -484,11 +974,30 @@ sums, counts = aggregate_state_actions(
 )
 
 Q_mc = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0).reshape(n_states, n_actions)
+```
 
-print(f"pairs covered with exploring starts: {(counts.reshape(n_states, n_actions)[~terminal] > 0).sum()}"
-      f" of {(~terminal).sum() * n_actions}")
+```{python}
+n_pairs_covered = (counts.reshape(n_states, n_actions)[~terminal] > 0).sum()
+n_pairs_total = (~terminal).sum() * n_actions
+exploring_starts_rows = pd.DataFrame([dict(
+    pairs_covered=f"{n_pairs_covered} of {n_pairs_total}",
+    max_error=np.abs(Q_mc - q_pi_random)[~terminal].max(),
+)])
 
-print(f"max |Q_mc - q_pi| = {np.abs(Q_mc - q_pi_random)[~terminal].max():.3f}")
+exploring_starts_table = (
+    GT(exploring_starts_rows)
+    .tab_header(
+        title=md("**Action values of the random policy, with exploring starts**"),
+        subtitle=f"{N_EPISODES_ES:,} episodes, each starting from a uniformly drawn (s, a) pair."
+    )
+    .cols_label(
+        pairs_covered="(s, a) pairs covered",
+        max_error=html("max |<i>Q</i><sub>MC</sub> − <i>q</i><sub>π</sub>|")
+    )
+    .fmt_number(columns="max_error", decimals=3)
+    .cols_align("right", columns=["pairs_covered", "max_error"])
+)
+exploring_starts_table
 ```
 
 
@@ -647,7 +1156,7 @@ for iteration in range(N_ITERATIONS):
     s_start_iter = np_rng.choice(np.flatnonzero(~terminal), size=EPISODES_PER_ITERATION).astype("int64")
     a_start_iter = np_rng.integers(0, n_actions, size=EPISODES_PER_ITERATION).astype("int64")
     S_iter, A_iter, R_iter = simulate_exploring_starts(pi_control, s_start_iter, a_start_iter, MAX_STEPS_ES)
-    G_iter = returns_fn(R_iter, GAMMA)
+    G_iter = returns_fn(R_iter, GAMMA_GRID)
     es_mean_returns.append(G_iter[0].mean())
 
     SA_iter = S_iter * n_actions + A_iter
@@ -666,14 +1175,31 @@ for iteration in range(N_ITERATIONS):
     a_greedy = Q_control.argmax(axis=1) # improvement: greedy, no model needed
     pi_control = np.zeros((n_states, n_actions))
     pi_control[np.arange(n_states), a_greedy] = 1.0
-    es_value_gaps.append(np.abs(evaluate_policy(pi_control, GAMMA) - v_star).max())
+    es_value_gaps.append(np.abs(evaluate_policy(pi_control, GAMMA_GRID) - v_star).max())
 
 first_optimal = next((i for i, gap in enumerate(es_value_gaps) if gap < 1e-9), None)
 if first_optimal is not None:
     print(f"greedy policy first optimal at iteration {first_optimal + 1} of {N_ITERATIONS};"
         f" final gap to v*: {es_value_gaps[-1]:.4f}")
+```
 
-show_policy(a_greedy, "\nlearned policy (T = terminal):")
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Learned policy (T = terminal)": a_greedy},
+    GRID_SHAPE,
+    terminal
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Learned policy (T = terminal)": a_greedy},
+    GRID_SHAPE,
+    terminal,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
 ```
 
 
@@ -765,20 +1291,60 @@ This $\frac{\varepsilon}{|\mathcal A|}$ floor on every action is exactly what ma
 EPS = 0.1
 
 def eps_greedy(Q, eps):
-    "the eps-greedy policy of a Q table, as an (n_states, n_actions) matrix"
+    """Return the ε-greedy policy of a Q table.
+
+        pi(a|s) = 1 - eps + eps / |A|   if a = argmax_a' Q(s, a'),
+                  eps / |A|             otherwise.
+
+    Ties go to the lowest-numbered action.
+
+    Parameters
+    ----------
+    Q : ndarray, shape (n_states, n_actions)
+        Action values.
+    eps : float
+        Exploration probability ε.
+
+    Returns
+    -------
+    ndarray, shape (n_states, n_actions)
+        The policy pi(a|s). Each row sums to 1.
+    """
     pi = np.full((n_states, n_actions), eps / n_actions)
     pi[np.arange(n_states), Q.argmax(axis=1)] += 1 - eps
     return pi
 
 def sample_average_trial():
-    "eps-greedy MC control with Q = average of ALL returns ever seen."
+    """Run one trial of on-policy ε-greedy MC control in which Q averages every return ever seen.
+
+    Each of 300 iterations rolls out 50 episodes, each capped at 50 steps, under the ε-greedy
+    policy of the current Q (ε = ``EPS``), from start states drawn uniformly from the non-terminal
+    states. Their first-visit returns are added to running sums and counts, so
+
+        Q(s, a) = average of every first-visit return of (s, a) so far,
+
+    including the returns collected under older, worse policies. At the end, the DP oracle
+    grades the greedy policy of Q.
+
+    Returns
+    -------
+    value_gap : float
+        ``max_s |v_greedy(s) - v_*(s)|``, where v_greedy is the exact value of the greedy policy
+        of the final Q. 0 means that policy is optimal.
+    Q : ndarray, shape (n_states, n_actions)
+        The final action-value estimates.
+    Q_count : ndarray, shape (n_states, n_actions)
+        How many returns each Q(s, a) averages.
+    a_greedy : ndarray of int, shape (n_states,)
+        The greedy action of the final Q in each state.
+    """
     Q_sum, Q_count = np.zeros(n_states * n_actions), np.zeros(n_states * n_actions)
     Q = np.zeros((n_states, n_actions))
     for iteration in range(300):
         pi_soft = eps_greedy(Q, EPS)
         s_start_iter = np_rng.choice(np.flatnonzero(~terminal), size=50).astype("int64")
         S_iter, A_iter, R_iter = simulate(pi_soft, s_start_iter, 50)
-        G_iter = returns_fn(R_iter, GAMMA)
+        G_iter = returns_fn(R_iter, GAMMA_GRID)
         SA_iter = S_iter * n_actions + A_iter
         first_visits_iter = first_visit_mask(SA_iter, n_states * n_actions) & ~terminal[S_iter]
 
@@ -794,7 +1360,7 @@ def sample_average_trial():
     a_greedy = Q.argmax(axis=1)
     pi_greedy = np.zeros((n_states, n_actions))
     pi_greedy[np.arange(n_states), a_greedy] = 1.0
-    return (np.abs(evaluate_policy(pi_greedy, GAMMA) - v_star).max(), Q, Q_count.reshape(n_states, n_actions), a_greedy)
+    return (np.abs(evaluate_policy(pi_greedy, GAMMA_GRID) - v_star).max(), Q, Q_count.reshape(n_states, n_actions), a_greedy)
 ```
 
 
@@ -803,25 +1369,59 @@ We run five trials, then open up the worst one. If its greedy policy is wrong so
 ```{python}
 trials = [sample_average_trial() for _ in range(5)]
 value_gaps = [gap for gap, *_ in trials]
-print("value gap to v* per trial: " + "   ".join(f"{gap:.1f}" for gap in value_gaps))
 
 worst_trial = trials[int(np.argmax(value_gaps))]
 if worst_trial[0] > 1e-9:
     worst_gap, Q_worst, Q_count_worst, a_worst = worst_trial
-    stuck_state = int(np.abs(evaluate_policy(np.eye(n_actions)[a_worst], 1.0) - v_star).argmax())
+    stuck_state = int(np.abs(evaluate_policy(np.eye(n_actions)[a_worst], GAMMA_GRID) - v_star).argmax())
     action_names = ["up", "down", "left", "right"]
-
-    print(f"\nworst trial is stuck at state {stuck_state} "
-          f"(greedy pick: {action_names[a_worst[stuck_state]]}):")
-
-    for a in range(n_actions):
-        print(f"   {action_names[a]:>6}: Q = {Q_worst[stuck_state, a]:.2f}"
-              f" from {int(Q_count_worst[stuck_state, a])} returns")
-else:
-    print("(all five trials happened to converge this time - rerun to see one get stuck)")
 ```
 
-the rarely-explored optimal action still averages in early garbage returns at an eps-trickle of new data it would need thousands more episodes to recover. The cure is to replace the sample average with a **constant step size**,
+```{python}
+trial_rows = pd.DataFrame(
+    [dict(trial=f"Trial {trial}", value_gap=gap) for trial, gap in enumerate(value_gaps, start=1)]
+)
+
+trials_table = (
+    GT(trial_rows, rowname_col="trial")
+    .tab_header(
+        title=md("**Sample-average ε-greedy MC control: value gap per trial**"),
+        subtitle=html(f"ε = {EPS}. The gap is max<sub><i>s</i></sub> |<i>v</i><sub>greedy</sub>(<i>s</i>) − "
+                      "<i>v</i><sub>*</sub>(<i>s</i>)| for the greedy policy of the trial's final <i>Q</i>.")
+    )
+    .cols_label(value_gap=html("Value gap to <i>v</i><sub>*</sub>"))
+    .fmt_number(columns="value_gap", decimals=1)
+    .cols_align("right", columns="value_gap")
+)
+trials_table
+```
+
+```{python}
+stuck_table = None
+if worst_trial[0] > 1e-9:
+    stuck_rows = pd.DataFrame([
+        dict(action=action_names[a], Q=Q_worst[stuck_state, a], n_returns=int(Q_count_worst[stuck_state, a]))
+        for a in range(n_actions)
+    ])
+
+    stuck_table = (
+        GT(stuck_rows, rowname_col="action")
+        .tab_header(
+            title=md(f"**The worst trial is stuck at state {stuck_state}**"),
+            subtitle=f"Greedy pick: {action_names[a_worst[stuck_state]]}."
+        )
+        .tab_stubhead(label="Action")
+        .cols_label(Q=html("<i>Q</i>(<i>s</i>, <i>a</i>)"), n_returns="Returns averaged")
+        .fmt_number(columns="Q", decimals=2)
+        .fmt_integer(columns="n_returns")
+        .cols_align("right", columns=["Q", "n_returns"])
+    )
+else:
+    print("(all five trials happened to converge this time - rerun to see one get stuck)")
+stuck_table
+```
+
+The rarely-explored optimal action still averages in early garbage returns at an eps-trickle of new data it would need thousands more episodes to recover. The cure is to replace the sample average with a **constant step size**,
 
 $$
 Q(S_t, A_t) \leftarrow Q(S_t, A_t) + \alpha\,\big[G_t - Q(S_t, A_t)\big],
@@ -839,7 +1439,7 @@ for iteration in range(1000):
     pi_soft = eps_greedy(Q_soft, EPS)
     s_start_iter = np_rng.choice(np.flatnonzero(~terminal), size=50).astype("int64")
     S_iter, A_iter, R_iter = simulate(pi_soft, s_start_iter, 50)
-    G_iter = returns_fn(R_iter, GAMMA)
+    G_iter = returns_fn(R_iter, GAMMA_GRID)
     soft_returns.append(G_iter[0].mean())
     SA_iter = S_iter * n_actions + A_iter
     first_visits_iter = first_visit_mask(SA_iter, n_states * n_actions) & ~terminal[S_iter]
@@ -858,15 +1458,55 @@ for iteration in range(1000):
 a_soft = Q_soft.argmax(axis=1)
 pi_soft_greedy = np.zeros((n_states, n_actions))
 pi_soft_greedy[np.arange(n_states), a_soft] = 1.0
+value_gap_soft = np.abs(evaluate_policy(pi_soft_greedy, GAMMA_GRID) - v_star).max()
 
-print(f"constant-alpha eps-greedy: value gap of greedy policy to v* = "
-      f"{np.abs(evaluate_policy(pi_soft_greedy, 1.0) - v_star).max():.4f}")
+v_soft = evaluate_policy(eps_greedy(Q_soft, EPS), GAMMA_GRID)
+```
 
-show_policy(a_soft, "\ngreedy actions of the learned eps-soft policy:")
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Greedy actions of the learned ε-soft policy": a_soft},
+    GRID_SHAPE,
+    terminal
+).show(config=dict(displayModeBar=False))
+```
 
-v_soft = evaluate_policy(eps_greedy(Q_soft, EPS), 1.0)
-print(f"\nthe eps-soft policy itself is a little worse than v_* (the price of exploring):"
-      f"\n  v(s=6): eps-soft {v_soft[6]:.2f} vs v* {v_star[6]:.2f}")
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Greedy actions of the learned ε-soft policy": a_soft},
+    GRID_SHAPE,
+    terminal,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+GREEDY_GROUP = "Greedy policy of the learned <i>Q</i>"
+PRICE_GROUP = "The ε-soft policy itself is a little worse than <i>v</i><sub>*</sub> (the price of exploring)"
+soft_rows = pd.DataFrame([
+    dict(group=GREEDY_GROUP, quantity="Value gap to <i>v</i><sub>*</sub>", value=value_gap_soft),
+    dict(group=PRICE_GROUP, quantity="ε-soft policy, <i>v</i>(6)", value=v_soft[6]),
+    dict(group=PRICE_GROUP, quantity="<i>v</i><sub>*</sub>(6)", value=v_star[6]),
+])
+row_gap = [0]
+rows_state6 = [1, 2]
+
+soft_table = (
+    GT(soft_rows, rowname_col="quantity", groupname_col="group")
+    .tab_header(
+        title=md("**Constant-α ε-greedy MC control**"),
+        subtitle=f"α = {ALPHA}, ε = {EPS}."
+    )
+    .cols_label(value="")
+    .fmt_markdown(columns="quantity")
+    .fmt_number(columns="value", rows=row_gap, decimals=4)
+    .fmt_number(columns="value", rows=rows_state6, decimals=2)
+    .cols_align("right", columns="value")
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
+)
+soft_table
 ```
 
 
@@ -944,7 +1584,7 @@ $$
 
 There are two common estimators for importance sampling:
 
-1. **Ordinary**: which is unbiased but exhibits *high varianace* and
+1. **Ordinary**: which is unbiased but exhibits *high variance* and
 2. **Weighted**: which is *biased* but exhibits low variance
 
 $$
@@ -960,11 +1600,11 @@ In the example below, the behavior policy is set as the equiprobable random poli
 # target policy: 70% optimal action, 10% the others
 pi_target = np.full((n_states, n_actions), 0.1)
 pi_target[np.arange(n_states), a_star] += 0.6
-v_target = evaluate_policy(pi_target, GAMMA) # the oracle
+v_target = evaluate_policy(pi_target, GAMMA_GRID) # the oracle
 ```
 
 
-The ratios are one symbolic expression over a whole $(T, B)$ batch, where an elementwise division $\pi/b$ at each step is computed for non-termial steps, whereas padded post-terminal steps are forced to 1. We then compute a *reversed* `cumprod` to turn per-step ratios into the tail products $\rho_{t:T-1}$.
+The ratios are one symbolic expression over a whole $(T, B)$ batch, where an elementwise division $\pi/b$ at each step is computed for non-terminal steps, whereas padded post-terminal steps are forced to 1. We then compute a *reversed* `cumprod` to turn per-step ratios into the tail products $\rho_{t:T-1}$.
 
 ```{python}
 # per-step ratios and their tail products rho_{t:T-1}, symbolically
@@ -990,7 +1630,7 @@ We sample 20,000 episodes rolled out under the **behavior** policy and collect t
 N_EPISODES_IS, MAX_STEPS_IS = 20000, 150
 s_start_is = np_rng.choice(np.flatnonzero(~terminal), size=N_EPISODES_IS).astype("int64")
 S_is, A_is, R_is = simulate(pi_random, s_start_is, MAX_STEPS_IS) # episodes from the BEHAVIOR policy
-G_is = returns_fn(R_is, GAMMA)
+G_is = returns_fn(R_is, GAMMA_GRID)
 rho_is = rho_tail_fn(S_is, A_is, pi_target, pi_random)
 ```
 
@@ -1013,23 +1653,74 @@ V_weighted = np.divide(
     where=weight_sum > 0
 )
 
-show_grid(V_ordinary, f"ordinary IS estimate of v_pi_target ({N_EPISODES_IS} behavior episodes):")
-print()
-
-show_grid(V_weighted, f"weighted IS estimate of v_pi_target ({N_EPISODES_IS} behavior episodes):")
-print()
-
-show_grid(v_target, "exact v_pi_target:")
-print()
-
 def rmse_against_target(V):
+    """Return the RMSE of a state-value estimate against the exact target-policy values.
+
+        sqrt( mean over non-terminal s of ( V(s) - v_pi_target(s) )^2 )
+
+    Parameters
+    ----------
+    V : ndarray, shape (n_states,)
+        The estimate, e.g. from ordinary or weighted importance sampling.
+
+    Returns
+    -------
+    float
+        The RMSE over the non-terminal states.
+    """
     return np.sqrt(((V - v_target)[~terminal] ** 2).mean())
+```
 
-print(f"ordinary IS: rmse {rmse_against_target(V_ordinary):.4f} "
-      f"max {np.abs(V_ordinary - v_target)[~terminal].max():.3f}")
+```{python}
+#| classes: light-mode
+values_figure(
+    {"Ordinary IS estimate": V_ordinary,
+     "Weighted IS estimate": V_weighted,
+     "Exact v<sub>π_target</sub>": v_target},
+    GRID_SHAPE,
+    title=f"<b>Estimates of v<sub>π_target</sub></b><br><sup>{N_EPISODES_IS:,} behavior episodes</sup>",
+    cell_px=70
+).show(config=dict(displayModeBar=False))
+```
 
-print(f"weighted IS: rmse {rmse_against_target(V_weighted):.4f} "
-      f"max {np.abs(V_weighted - v_target)[~terminal].max():.3f}")
+```{python}
+#| classes: dark-mode
+values_figure(
+    {"Ordinary IS estimate": V_ordinary,
+     "Weighted IS estimate": V_weighted,
+     "Exact v<sub>π_target</sub>": v_target},
+    GRID_SHAPE,
+    title=f"<b>Estimates of v<sub>π_target</sub></b><br><sup>{N_EPISODES_IS:,} behavior episodes</sup>",
+    cell_px=70,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+importance_sampling_rows = pd.DataFrame([
+    dict(estimator="Ordinary IS", rmse=rmse_against_target(V_ordinary),
+         max_error=np.abs(V_ordinary - v_target)[~terminal].max()),
+    dict(estimator="Weighted IS", rmse=rmse_against_target(V_weighted),
+         max_error=np.abs(V_weighted - v_target)[~terminal].max()),
+])
+
+importance_sampling_table = (
+    GT(importance_sampling_rows, rowname_col="estimator")
+    .tab_header(
+        title=md("**Ordinary against weighted importance sampling**"),
+        subtitle=html(f"Errors against the exact <i>v</i><sub>π_target</sub> over the non-terminal states, "
+                      f"from {N_EPISODES_IS:,} behavior episodes.")
+    )
+    .tab_stubhead(label="Estimator")
+    .cols_label(
+        rmse="RMSE",
+        max_error=html("max |<i>V</i>(<i>s</i>) − <i>v</i><sub>π_target</sub>(<i>s</i>)|")
+    )
+    .fmt_number(columns="rmse", decimals=4)
+    .fmt_number(columns="max_error", decimals=3)
+    .cols_align("right", columns=["rmse", "max_error"])
+)
+importance_sampling_table
 ```
 
 
@@ -1040,7 +1731,7 @@ To see the bias/variance tradeoff directly we estimate a single state repeatedly
 N_RUNS_IS, N_EPISODES_PER_RUN = 50, 400
 s_start_state6 = np.full(N_RUNS_IS * N_EPISODES_PER_RUN, 6, dtype="int64")
 S_state6, A_state6, R_state6 = simulate(pi_random, s_start_state6, MAX_STEPS_IS)
-G_state6 = returns_fn(R_state6, GAMMA)
+G_state6 = returns_fn(R_state6, GAMMA_GRID)
 rho_state6 = rho_tail_fn(S_state6, A_state6, pi_target, pi_random)
 
 # the first visit to state 6 is t = 0 by construction
@@ -1298,7 +1989,7 @@ for run in range(N_RUNS_INFINITE):
 #| classes: light-mode
 
 inf_fig = go.Figure()
-for running_mean in running_means:
+for run, running_mean in enumerate(running_means):
     inf_fig.add_scatter(
         x=plot_draws + 1,
         y=running_mean[plot_draws],
@@ -1328,7 +2019,7 @@ inf_fig.show(config=dict(displayModeBar=False))
 #| classes: dark-mode
 
 inf_fig = go.Figure()
-for running_mean in running_means:
+for run, running_mean in enumerate(running_means):
     inf_fig.add_scatter(
         x=plot_draws + 1,
         y=running_mean[plot_draws],
@@ -1382,6 +2073,31 @@ One step consumes an episode's $(G, W)$, grows the cumulative weight $C$, and mo
 
 ```{python}
 def incremental_step(G, W, V_prev, C_prev):
+    """One episode's incremental weighted-importance-sampling update of a single state's value.
+
+        C_n = C_{n-1} + W_n,    V_{n+1} = V_n + (W_n / C_n) [ G_n - V_n ]
+
+    While the cumulative weight is still 0 (every episode so far had weight 0), V is left
+    unchanged; the switch also keeps the division safe.
+
+    Parameters
+    ----------
+    G : TensorVariable, scalar
+        The return G_n that follows this episode's first visit, supplied by the scan sequence.
+    W : TensorVariable, scalar
+        Its importance weight ``W_n = rho_{t:T-1}``, supplied by the scan sequence.
+    V_prev : TensorVariable, scalar
+        The estimate V_n before this episode.
+    C_prev : TensorVariable, scalar
+        The cumulative weight C_{n-1} before this episode.
+
+    Returns
+    -------
+    V_new : TensorVariable, scalar
+        The estimate V_{n+1}.
+    C_new : TensorVariable, scalar
+        The cumulative weight C_n.
+    """
     C_new = C_prev + W
     safe_C = pt.switch(pt.gt(C_new, 0), C_new, 1.0)
     V_new = pt.switch(pt.gt(C_new, 0), V_prev + (W / safe_C) * (G - V_prev), V_prev)
@@ -1402,16 +2118,35 @@ The incremental estimate after the last episode against the batch formula $\sum 
 ```{python}
 V_incremental, C_incremental = incremental_fn(G_state6_episodes, W_state6_episodes)
 V_batch = (W_state6_episodes * G_state6_episodes).sum() / W_state6_episodes.sum()
+```
 
-print(f"episodes touching state 6: {G_state6_episodes.size}")
-print(f"incremental final estimate: {V_incremental[-1]:.6f}")
-print(f"batch weighted-IS estimate: {V_batch:.6f}")
-print(f"exact v_pi(6) = {v_target[6]:.3f}")
+```{python}
+incremental_rows = pd.DataFrame([
+    dict(estimate="Incremental, final", value=V_incremental[-1]),
+    dict(estimate="Batch weighted IS", value=V_batch),
+    dict(estimate="Exact <i>v</i><sub>π</sub>(6)", value=v_target[6]),
+])
+rows_estimates = [0, 1]
+row_exact = [2]
+
+incremental_table = (
+    GT(incremental_rows, rowname_col="estimate")
+    .tab_header(
+        title=md("**Incremental against batch weighted IS at state 6**"),
+        subtitle=f"{G_state6_episodes.size:,} episodes touch state 6."
+    )
+    .cols_label(value=html("Estimate of <i>v</i><sub>π</sub>(6)"))
+    .fmt_markdown(columns="estimate")
+    .fmt_number(columns="value", rows=rows_estimates, decimals=6)
+    .fmt_number(columns="value", rows=row_exact, decimals=3)
+    .cols_align("right", columns="value")
+)
+incremental_table
 ```
 
 # Off-policy MC Control
 
-So far off-policy machinery has only been used for, *prediction*, evaluating a fixed target policy from another policy's episodes. Now, however, the target policy is no longer fixed. It is always **greedy with respect to the current $Q$**, so it improves every time $Q$ does, while the behavior policy $b$ stays soft, exploratory, and unchanged. One policy does all the exploring whil the other is deterministic.
+So far off-policy machinery has only been used for *prediction*, evaluating a fixed target policy from another policy's episodes. Now, however, the target policy is no longer fixed. It is always **greedy with respect to the current $Q$**, so it improves every time $Q$ does, while the behavior policy $b$ stays soft, exploratory, and unchanged. One policy does all the exploring while the other is deterministic.
 
 Because $\pi$ is greedy and deterministic, its action probabilities are only ever 0 or 1,
 
@@ -1465,6 +2200,52 @@ Two details are easy to miss. The greedy check reads `Q_new`, the table *after* 
 
 ```{python}
 def backward_step(s, a, r, G, W, Q, C, gamma, behavior_probs):
+    """One step of the backward pass of off-policy MC control, within a single episode.
+
+    At step t, with ``(s, a, r) = (S_t, A_t, R_{t+1})``:
+
+        G <- gamma * G + R_{t+1}
+        C(S_t, A_t) <- C(S_t, A_t) + W
+        Q(S_t, A_t) <- Q(S_t, A_t) + (W / C(S_t, A_t)) [ G - Q(S_t, A_t) ]
+        W <- W * 1{A_t = argmax_a Q(S_t, a)} / b(A_t | S_t)
+
+    The greedy check reads Q after this step's update. Once A_t is not greedy, W becomes 0 and
+    every earlier step of the episode adds nothing. Padded steps after termination (S_t
+    terminal) leave C, Q and W unchanged; their reward is 0 and they come first in the backward
+    pass, so G is still 0 when the real steps begin.
+
+    Parameters
+    ----------
+    s : TensorVariable of int, scalar
+        The state S_t, supplied by the scan sequence.
+    a : TensorVariable of int, scalar
+        The action A_t, supplied by the scan sequence.
+    r : TensorVariable, scalar
+        The reward R_{t+1}, supplied by the scan sequence.
+    G : TensorVariable, scalar
+        The return from step t + 1 onward.
+    W : TensorVariable, scalar
+        The importance weight ``rho_{t+1:T-1}``.
+    Q : TensorVariable, shape (n_states, n_actions)
+        The action values.
+    C : TensorVariable, shape (n_states, n_actions)
+        The cumulative weight of each state-action pair.
+    gamma : TensorVariable, scalar
+        Discount factor.
+    behavior_probs : TensorVariable, shape (n_states, n_actions)
+        The behavior policy b(a|s).
+
+    Returns
+    -------
+    G_new : TensorVariable, scalar
+        The return from step t onward.
+    W_new : TensorVariable, scalar
+        The importance weight ``rho_{t:T-1}``, for the next (earlier) step.
+    Q_new : TensorVariable, shape (n_states, n_actions)
+        The action values, with Q(S_t, A_t) updated.
+    C_new : TensorVariable, shape (n_states, n_actions)
+        The cumulative weights, with C(S_t, A_t) updated.
+    """
     still_running = not_terminal[s] # skip padded steps
     G_new = gamma * G + r
     W_effective = W * still_running
@@ -1489,6 +2270,35 @@ Wrapping that step in a backward `scan` processes one whole episode by starting 
 
 ```{python}
 def episode_update(S_episode, A_episode, R_episode, Q, C, gamma, behavior_probs):
+    """Process one whole episode with the backward pass of off-policy MC control.
+
+    Runs `backward_step` from the episode's last step to its first, starting from G = 0 and
+    W = 1, and keeps only the Q and C tables as they stand at the end of the pass.
+
+    Parameters
+    ----------
+    S_episode : TensorVariable of int, shape (max_steps,)
+        The states of one episode (one row of the batch), supplied by the outer scan sequence.
+    A_episode : TensorVariable of int, shape (max_steps,)
+        Its actions.
+    R_episode : TensorVariable, shape (max_steps,)
+        Its rewards; entry t is R_{t+1}.
+    Q : TensorVariable, shape (n_states, n_actions)
+        The action values before this episode.
+    C : TensorVariable, shape (n_states, n_actions)
+        The cumulative weights before this episode.
+    gamma : TensorVariable, scalar
+        Discount factor.
+    behavior_probs : TensorVariable, shape (n_states, n_actions)
+        The behavior policy b(a|s).
+
+    Returns
+    -------
+    Q : TensorVariable, shape (n_states, n_actions)
+        The action values after this episode.
+    C : TensorVariable, shape (n_states, n_actions)
+        The cumulative weights after this episode.
+    """
     _, _, Q_steps, C_steps = pytensor.scan(
         fn=backward_step,
         sequences=[S_episode, A_episode, R_episode],
@@ -1543,24 +2353,20 @@ for batch in range(N_BATCHES):
         R_batch.T,
         Q_offpolicy,
         C_offpolicy,
-        GAMMA,
+        GAMMA_GRID,
         pi_random
     )
 
     a_offpolicy = Q_offpolicy.argmax(axis=1)
     pi_offpolicy = np.zeros((n_states, n_actions))
     pi_offpolicy[np.arange(n_states), a_offpolicy] = 1.0
-    offpolicy_value_gaps.append(np.abs(evaluate_policy(pi_offpolicy, 1.0) - v_star).max())
+    offpolicy_value_gaps.append(np.abs(evaluate_policy(pi_offpolicy, GAMMA_GRID) - v_star).max())
 ```
 
 
 The report below measures the error $|Q - q_*|$ twice, once along the actions the learned policy actually takes, and once over *all* state-action pairs. The gap between the two numbers is the "learns only from tails" weakness showing up in the output because pairs the target policy has abandoned stop receiving weight, so their estimates stay stuck near the pessimistic initialization. Which is fine because a greedy policy only needs its own actions to be ranked correctly.
 
 ```{python}
-print(f"value gap to v* after each batch of {EPISODES_PER_BATCH} behavior episodes:")
-print("  " + "  ".join(f"{gap:.2f}" for gap in offpolicy_value_gaps))
-show_policy(a_offpolicy, "\nlearned target policy (greedy w.r.t. Q):")
-
 nonterminal_states = np.flatnonzero(~terminal)
 
 error_greedy_pairs = np.abs(
@@ -1569,9 +2375,57 @@ error_greedy_pairs = np.abs(
 ).max()
 
 error_all_pairs = np.abs(Q_offpolicy - q_star)[~terminal].max()
+```
 
-print(f"\nmax |Q - q*| along the learned greedy actions: {error_greedy_pairs:.4f}")
-print(f"max |Q - q*| over all pairs: {error_all_pairs:.2f} <- abandoned pairs stay rough")
+```{python}
+#| classes: light-mode
+policy_figure(
+    {"Learned target policy (greedy w.r.t. Q)": a_offpolicy},
+    GRID_SHAPE,
+    terminal
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+#| classes: dark-mode
+policy_figure(
+    {"Learned target policy (greedy w.r.t. Q)": a_offpolicy},
+    GRID_SHAPE,
+    terminal,
+    theme=GRID_DARK
+).show(config=dict(displayModeBar=False))
+```
+
+```{python}
+GAPS_GROUP = "Value gap to <i>v</i><sub>*</sub> after each batch"
+ERRORS_GROUP = "max |<i>Q</i> − <i>q</i><sub>*</sub>|"
+offpolicy_rows = pd.DataFrame(
+    [dict(group=GAPS_GROUP, quantity=f"Batch {batch}", value=gap)
+     for batch, gap in enumerate(offpolicy_value_gaps, start=1)]
+    + [
+        dict(group=ERRORS_GROUP, quantity="Along the learned greedy actions", value=error_greedy_pairs),
+        dict(group=ERRORS_GROUP, quantity="Over all pairs", value=error_all_pairs),
+    ]
+)
+rows_gaps = list(range(len(offpolicy_value_gaps)))
+row_greedy_pairs = [len(offpolicy_value_gaps)]
+row_all_pairs = [len(offpolicy_value_gaps) + 1]
+
+offpolicy_table = (
+    GT(offpolicy_rows, rowname_col="quantity", groupname_col="group")
+    .tab_header(
+        title=md("**Off-policy MC control from random behavior**"),
+        subtitle=f"{N_BATCHES} batches of {EPISODES_PER_BATCH:,} behavior episodes."
+    )
+    .cols_label(value="")
+    .fmt_number(columns="value", rows=rows_gaps, decimals=2)
+    .fmt_number(columns="value", rows=row_greedy_pairs, decimals=4)
+    .fmt_number(columns="value", rows=row_all_pairs, decimals=2)
+    .cols_align("right", columns="value")
+    .tab_footnote("Abandoned pairs stay rough.", loc.stub(rows=row_all_pairs))
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
+)
+offpolicy_table
 ```
 
 # Discounting-aware importance sampling
@@ -1624,19 +2478,19 @@ G_discounted = (gamma_powers[:, None] * rewards_estimator_sym).sum(axis=0) # ord
 ordinary = rho_prefix[-1] * G_discounted # full-trajectory rho * G
 per_decision = (gamma_powers[:, None] * rho_prefix * rewards_estimator_sym).sum(axis=0)
 
-disc_aware_numerator = (
+discounting_aware_numerator = (
     (1.0 - gamma_sym) * (gamma_powers[:-1, None] * rho_prefix[:-1] * flat_partial_returns[:-1]).sum(axis=0)
     + gamma_powers[-1] * rho_prefix[-1] * flat_partial_returns[-1]
 )
 
-disc_aware_weight = (
+discounting_aware_weight = (
     (1.0 - gamma_sym) * (gamma_powers[:-1, None] * rho_prefix[:-1]).sum(axis=0)
     + gamma_powers[-1] * rho_prefix[-1]
 )
 
 estimators_fn = pytensor.function(
     [rewards_estimator_sym, ratios_estimator_sym, gamma_sym],
-    [ordinary, rho_prefix[-1], per_decision, disc_aware_numerator, disc_aware_weight]
+    [ordinary, rho_prefix[-1], per_decision, discounting_aware_numerator, discounting_aware_weight]
 )
 
 ```
@@ -1655,7 +2509,7 @@ S_estimators, A_estimators, R_estimators = simulate(pi_random, s_start_estimator
 ratios_estimators = np.where(terminal[S_estimators], 1.0,
                              pi_star[S_estimators, A_estimators] / pi_random[S_estimators, A_estimators])
 
-ordinary_draws, rho_draws, per_decision_draws, disc_aware_numerator_draws, disc_aware_weight_draws = estimators_fn(R_estimators, ratios_estimators, GAMMA_IS)
+ordinary_draws, rho_draws, per_decision_draws, discounting_aware_numerator_draws, discounting_aware_weight_draws = estimators_fn(R_estimators, ratios_estimators, GAMMA_IS)
 
 per_run = lambda x: x.reshape(N_RUNS_ESTIMATORS, N_EPISODES_PER_ESTIMATOR_RUN)
 
@@ -1663,16 +2517,37 @@ estimates = {
     "ordinary IS": per_run(ordinary_draws).mean(axis=1),
     "weighted IS": per_run(ordinary_draws).sum(axis=1) / np.maximum(per_run(rho_draws).sum(axis=1), 1e-300),
     "per-decision": per_run(per_decision_draws).mean(axis=1),
-    "disc-aware ordinary": per_run(disc_aware_numerator_draws).mean(axis=1),
-    "disc-aware weighted": per_run(disc_aware_numerator_draws).sum(axis=1)
-                           / np.maximum(per_run(disc_aware_weight_draws).sum(axis=1), 1e-300),
+    "disc-aware ordinary": per_run(discounting_aware_numerator_draws).mean(axis=1),
+    "disc-aware weighted": per_run(discounting_aware_numerator_draws).sum(axis=1)
+                           / np.maximum(per_run(discounting_aware_weight_draws).sum(axis=1), 1e-300),
 }
+```
 
-print(f"\n{'estimator':>22} | {'mean':>7} | {'bias':>7} | {'variance':>9} | {'MSE':>7}")
-print("-" * 66)
-for name, estimate in estimates.items():
-    print(f"{name:>22} | {estimate.mean():+7.3f} | {estimate.mean() - v_target_discounted[6]:+7.3f}"
-          f" | {estimate.var():9.4f} | {((estimate - v_target_discounted[6]) ** 2).mean():7.4f}")
+```{python}
+estimator_rows = pd.DataFrame([
+    dict(
+        estimator=name,
+        mean=estimate.mean(),
+        bias=estimate.mean() - v_target_discounted[6],
+        variance=estimate.var(),
+        mse=((estimate - v_target_discounted[6]) ** 2).mean(),
+    )
+    for name, estimate in estimates.items()
+])
+
+estimators_table = (
+    GT(estimator_rows, rowname_col="estimator")
+    .tab_header(
+        title=md("**Five off-policy estimators of v(6)**"),
+        subtitle=f"γ = {GAMMA_IS}, {N_RUNS_ESTIMATORS} runs of {N_EPISODES_PER_ESTIMATOR_RUN} episodes."
+    )
+    .tab_stubhead(label="Estimator")
+    .cols_label(mean="Mean", bias="Bias", variance="Variance", mse="MSE")
+    .fmt_number(columns=["mean", "bias"], decimals=3, force_sign=True)
+    .fmt_number(columns=["variance", "mse"], decimals=4)
+    .cols_align("right", columns=["mean", "bias", "variance", "mse"])
+)
+estimators_table
 ```
 
 
@@ -1748,18 +2623,38 @@ Finally, the variance payoff from discounting-awareness depends on how much of t
 
 ```{python}
 # the discounting-aware payoff grows as gamma shrinks: same episodes, gamma = 0.5
-GAMMA_DSC = 0.5
-ordinary_draws_05, _, _, disc_aware_numerator_draws_05, _ = estimators_fn(R_estimators, ratios_estimators, GAMMA_DSC)
+GAMMA_IS_LOW = 0.5
+ordinary_draws_low_gamma, _, _, discounting_aware_numerator_draws_low_gamma, _ = estimators_fn(R_estimators, ratios_estimators, GAMMA_IS_LOW)
 
-for gamma, ordinary_g, disc_aware_g in [(GAMMA_IS, ordinary_draws, disc_aware_numerator_draws), (GAMMA_DSC, ordinary_draws_05, disc_aware_numerator_draws_05)]:
-    var_ordinary = per_run(ordinary_g).mean(axis=1).var()
-    var_disc_aware = per_run(disc_aware_g).mean(axis=1).var()
-
-    print(f"gamma={gamma}:  var(ordinary) = {var_ordinary:.4f}   var(disc-aware) = {var_disc_aware:.4f}"
-          f"   reduction x{var_ordinary / var_disc_aware:.1f}")
+variance_rows = []
+for gamma, ordinary_at_gamma, discounting_aware_at_gamma in [(GAMMA_IS, ordinary_draws, discounting_aware_numerator_draws), (GAMMA_IS_LOW, ordinary_draws_low_gamma, discounting_aware_numerator_draws_low_gamma)]:
+    variance_ordinary = per_run(ordinary_at_gamma).mean(axis=1).var()
+    variance_discounting_aware = per_run(discounting_aware_at_gamma).mean(axis=1).var()
+    variance_rows.append(dict(gamma=f"γ = {gamma}", variance_ordinary=variance_ordinary, variance_discounting_aware=variance_discounting_aware,
+                              reduction=variance_ordinary / variance_discounting_aware))
 ```
 
-# Recap
+```{python}
+variance_table = (
+    GT(pd.DataFrame(variance_rows), rowname_col="gamma")
+    .tab_header(
+        title=md("**Variance of ordinary against discounting-aware IS**"),
+        subtitle=f"The same {N_RUNS_ESTIMATORS} runs of {N_EPISODES_PER_ESTIMATOR_RUN} episodes, at two discounts."
+    )
+    .tab_stubhead(label="Discount")
+    .cols_label(
+        variance_ordinary="Var(ordinary)",
+        variance_discounting_aware="Var(discounting-aware)",
+        reduction="Reduction"
+    )
+    .fmt_number(columns=["variance_ordinary", "variance_discounting_aware"], decimals=4)
+    .fmt_number(columns="reduction", decimals=1, pattern="×{x}")
+    .cols_align("right", columns=["variance_ordinary", "variance_discounting_aware", "reduction"])
+)
+variance_table
+```
+
+# Summary & Recap
 
 - **MC prediction** - first/every-visit averages of returns converge to $v_\pi$ at the $1/\sqrt n$ Monte Carlo rate
 

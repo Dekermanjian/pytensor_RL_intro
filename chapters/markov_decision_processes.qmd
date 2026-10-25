@@ -17,7 +17,7 @@ A guided, worked-example tour of the core objects of reinforcement learning:
 We build everything symbolically with **PyTensor** so the equations in the
 markdown map almost one-to-one onto the code.
 
-## The running example: the Recycling Robot
+# The running example: the Recycling Robot
 
 A mobile robot collects soda cans. It decides whether to actively **search**, **wait** for someone to bring a can, or **recharge** its battery. Its battery is either `high` or `low`.
 
@@ -31,10 +31,10 @@ A finite MDP is the tuple $\langle \mathcal{S}, \mathcal{A}, p, r, \gamma\rangle
 | $r(s,a,s')$ | reward on a transition | cans collected (and a penalty if the battery dies) |
 | $\gamma\in[0,1)$ | discount factor | how much we value the future |
 
-### Dynamics
+## Dynamics
 Searching from `high` keeps the battery `high` with probability $\alpha$. Searching from `low` keeps it `low` with probability $\beta$, and with probability $1-\beta$ the battery dies and the robot must be rescued — it is carried back to a charger (state becomes `high`) with a big penalty of $-3$. Searching yields expected reward $r_\text{search}$, waiting yields $r_\text{wait}$ ($r_\text{search} > r_\text{wait}$), and recharging yields $0$.
 
-### Transition graph
+## Transition graph
 
 The full MDP as an interactive graph, rendered with **gravis**. Circles are **states**, boxes are **(state, action)** pairs. Edges connect a state to its available actions; each arrow out of an action node is labeled with its transition probability and reward (using $\alpha=0.9$, $\beta=0.7$, $r_\text{search}=2$, $r_\text{wait}=1$).
 
@@ -57,6 +57,8 @@ import plotly.io as pio
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
+import pandas as pd
+from great_tables import GT, md, html, vals
 
 colors = px.colors.qualitative.Pastel
 pio.renderers.default = "notebook_connected"
@@ -66,7 +68,7 @@ print("pytensor", pytensor.__version__)
 
 ```{python}
 #| classes: light-mode
-g = nx.DiGraph()
+graph = nx.DiGraph()
 
 # nodes: two states
 states = {
@@ -74,7 +76,7 @@ states = {
     "high": dict(x=180, y=0),
 }
 for name, pos in states.items():
-    g.add_node(
+    graph.add_node(
         name,
         label=name,
         shape="circle",
@@ -94,7 +96,7 @@ actions = {
     "high: wait": dict(x=320, y=-160),
 }
 for name, pos in actions.items():
-    g.add_node(
+    graph.add_node(
         name,
         label=name.split(": ")[1],
         shape="rectangle",
@@ -109,7 +111,7 @@ for name, pos in actions.items():
 # state -> action edges
 for a in actions:
     s = a.split(":")[0]
-    g.add_edge(s, a, color="#999999", size=1.5)
+    graph.add_edge(s, a, color="#999999", size=1.5)
 
 # action -> next-state edges
 transitions = [
@@ -121,11 +123,11 @@ transitions = [
     ("low: wait", "low", "1.0, r = +1"),
     ("low: recharge", "high", "1.0, r = 0"),
 ]
-for a, s_next, lbl in transitions:
-    g.add_edge(a, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for a, s_next, label in transitions:
+    graph.add_edge(a, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
 gv.d3(
-    g,
+    graph,
     graph_height=450,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -139,7 +141,7 @@ gv.d3(
 
 ```{python}
 #| classes: dark-mode
-g = nx.DiGraph()
+graph = nx.DiGraph()
 
 # nodes: two states
 states = {
@@ -147,7 +149,7 @@ states = {
     "high": dict(x=180, y=0),
 }
 for name, pos in states.items():
-    g.add_node(
+    graph.add_node(
         name,
         label=name,
         label_color="#faf8f8",
@@ -168,7 +170,7 @@ actions = {
     "high: wait": dict(x=320, y=-160),
 }
 for name, pos in actions.items():
-    g.add_node(
+    graph.add_node(
         name,
         label=name.split(": ")[1],
         label_color="#faf8f8",
@@ -184,7 +186,7 @@ for name, pos in actions.items():
 # state -> action edges
 for a in actions:
     s = a.split(":")[0]
-    g.add_edge(s, a, color="#999999", size=1.5)
+    graph.add_edge(s, a, color="#999999", size=1.5)
 
 # action -> next-state edges
 transitions = [
@@ -196,13 +198,13 @@ transitions = [
     ("low: wait", "low", "1.0, r = +1"),
     ("low: recharge", "high", "1.0, r = 0"),
 ]
-for a, s_next, lbl in transitions:
-    g.add_edge(a, s_next, label=lbl, color="#999999", size=2, label_color=colors[6])
+for a, s_next, label in transitions:
+    graph.add_edge(a, s_next, label=label, color="#999999", size=2, label_color=colors[6])
 
-g.graph['background_color'] = 'black'
+graph.graph['background_color'] = 'black'
 
 gv.d3(
-    g,
+    graph,
     graph_height=450,
     layout_algorithm_active=False,
     node_label_data_source="label",
@@ -215,7 +217,7 @@ gv.d3(
 ```
 
 
-## Define the MDP as tensors
+# Define the MDP as tensors
 
 We index `states = [high, low]` and `actions = [search, wait, recharge]`.
 
@@ -234,17 +236,18 @@ HIGH, LOW = 0, 1
 SEARCH, WAIT, RECHARGE = 0, 1, 2
 state_names  = ["high", "low"]
 action_names = ["search", "wait", "recharge"]
-nS, nA = 2, 3
+n_states, n_actions = 2, 3
 
 # parameters
 alpha = 0.9
 beta = 0.7
 r_search = 2.0
 r_wait = 1.0
-gamma_val = 0.9
+r_rescue = -3.0 # the battery dies and the robot is carried back to the charger
+GAMMA_ROBOT = 0.9
 
 # transition tensor P[s, a, s']
-P = np.zeros((nS, nA, nS))
+P = np.zeros((n_states, n_actions, n_states))
 P[HIGH, SEARCH, HIGH] = alpha
 P[HIGH, SEARCH, LOW] = 1 - alpha
 P[LOW, SEARCH, HIGH] = 1 - beta
@@ -255,10 +258,10 @@ P[LOW, RECHARGE, HIGH] = 1.0
 P[HIGH, RECHARGE, HIGH] = 1.0 # unavailable -> harmless self-loop (masked out)
 
 # reward tensor R[s, a, s']
-R = np.zeros((nS, nA, nS))
+R = np.zeros((n_states, n_actions, n_states))
 R[HIGH, SEARCH, HIGH] = r_search
 R[HIGH, SEARCH, LOW] = r_search
-R[LOW, SEARCH, HIGH] = -3.0 # rescued
+R[LOW, SEARCH, HIGH] = r_rescue # rescued
 R[LOW, SEARCH, LOW] = r_search
 R[HIGH, WAIT, HIGH] = r_wait
 R[LOW, WAIT, LOW]  = r_wait
@@ -269,11 +272,9 @@ avail = np.array([[1, 1, 0], # high: search, wait, recharge zeroed out
                   [1, 1, 1]], # low:  search, wait, recharge
                  dtype=bool)
 
-assert np.allclose(P.sum(axis=2), 1.0), "each P[s,a,:] must sum to 1"
-print("P sums over s' (should be all 1s):\n", P.sum(axis=2))
 ```
 
-### Expected immediate reward $r(s,a)$
+## Expected immediate reward $r(s,a)$
 
 It's often handier to work with the reward *expected over the next state*:
 
@@ -284,19 +285,19 @@ In PyTensor this is just an elementwise product summed over the last axis.
 
 ```{python}
 # Convert into PyTensor constants, and make gamma a symbolic scalar so we can plug in different discounts
-P_t   = pt.as_tensor_variable(P) # (2, 3, 2)
-R_t   = pt.as_tensor_variable(R) # same shape
-avail_t = pt.as_tensor_variable(avail.astype("float64")) # (2, 3)
+P_sym   = pt.as_tensor_variable(P) # (2, 3, 2)
+R_sym   = pt.as_tensor_variable(R) # same shape
+avail_sym = pt.as_tensor_variable(avail.astype("float64")) # (2, 3)
 gamma = pt.scalar("gamma")
 
 # r(s, a) = sum_s' P[s,a,s'] * R[s,a,s']
-r_sa = (P_t * R_t).sum(axis=2) # (2, 3)
+reward_mean = (P_sym * R_sym).sum(axis=2) # (2, 3)
 
 print("Expected immediate reward r(s,a):")
-print(r_sa.eval())
+print(reward_mean.eval())
 ```
 
-## Rewards and returns
+# Rewards and returns
 
 The agent's goal is to maximize the **return**; the `discounted` sum of future rewards. For a trajectory starting at time $t$,
 
@@ -318,35 +319,79 @@ Let's compute $G_0$ for a concrete reward sequence two ways and check that they 
 ```{python}
 # A sample reward sequence R_1, R_2, ..., R_T  (as if we rolled out an episode)
 rewards = np.array([2.0, 2.0, -3.0, 0.0, 1.0, 2.0]) # This could correspond to search -> search -> rescue ...
-r_seq = pt.vector("r_seq")
+rewards_sym = pt.vector("rewards_sym")
 
 # method 1: flat discounted sum, G_0 = sum_k gamma^k * R_{k+1}
-k = pt.arange(r_seq.shape[0])
-G0_flat = (gamma ** k * r_seq).sum()
+k = pt.arange(rewards_sym.shape[0])
+G0_flat = (gamma ** k * rewards_sym).sum()
 
 # method 2: recursive G_t = R_{t+1} + gamma G_{t+1}, via scan
 # scan from the LAST reward backwards, carrying the running return.
-def back_step(r_t, G_next, g):
-    return r_t + g * G_next
+def back_step(r_t, G_next, gamma):
+    """One step of the backward return recursion, G_t = R_{t+1} + gamma * G_{t+1}.
 
-returns_rev = pytensor.scan(
+    The scan walks the rewards from last to first, so ``G_next`` is the return already computed
+    for the following time step. The return after the last reward is 0.
+
+    Parameters
+    ----------
+    r_t : TensorVariable, scalar
+        The reward R_{t+1}, supplied by the scan sequence.
+    G_next : TensorVariable, scalar
+        The return G_{t+1} from the following time step.
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+
+    Returns
+    -------
+    TensorVariable, scalar
+        The return G_t.
+    """
+    return r_t + gamma * G_next
+
+returns_reversed = pytensor.scan(
     fn=back_step,
-    sequences=[r_seq[::-1]], # walk rewards in reverse
+    sequences=[rewards_sym[::-1]], # walk rewards in reverse
     outputs_info=pt.zeros(()), # G_{T+1} = 0
     non_sequences=[gamma],
     return_updates=False
 )
-G_all = returns_rev[::-1] # G_0, G_1, ..., G_{T-1}
-G0_rec = G_all[0] # Since it is backwards the first is the last
+G_all = returns_reversed[::-1] # G_0, G_1, ..., G_{T-1}
+G0_recursive = G_all[0] # Since it is backwards the first is the last
 
-f = pytensor.function(inputs=[r_seq, gamma], outputs=[G0_flat, G0_rec, G_all])
-g0a, g0b, gall = f(rewards, gamma_val)
-print(f"G_0 (flat sum)  = {g0a:.4f}")
-print(f"G_0 (recursive) = {g0b:.4f}")
-print("Return G_t from every step t:", gall)
+returns_fn = pytensor.function(inputs=[rewards_sym, gamma], outputs=[G0_flat, G0_recursive, G_all])
+G0_flat_val, G0_recursive_val, G_all_val = returns_fn(rewards, GAMMA_ROBOT)
+
 ```
 
-### Why discount? Because it changes *decisions*.
+```{python}
+TWO_WAYS_GROUP = "<i>G</i><sub>0</sub> computed two ways"
+EVERY_STEP_GROUP = "Return <i>G<sub>t</sub></i> from every step <i>t</i>"
+return_rows = pd.DataFrame(
+    [
+        dict(group=TWO_WAYS_GROUP, quantity="Flat sum", value=G0_flat_val),
+        dict(group=TWO_WAYS_GROUP, quantity="Recursive", value=G0_recursive_val),
+    ]
+    + [dict(group=EVERY_STEP_GROUP, quantity=f"<i>G</i><sub>{t}</sub>", value=G_t) for t, G_t in enumerate(G_all_val)]
+)
+reward_list = ", ".join(f"{r:g}".replace("-", "−") for r in rewards) # true minus signs
+
+returns_table = (
+    GT(return_rows, rowname_col="quantity", groupname_col="group")
+    .tab_header(
+        title=md("**Discounted returns for a sample reward sequence**"),
+        subtitle=html(f"Rewards <i>R</i><sub>1</sub>, …, <i>R</i><sub>{len(rewards)}</sub> = {reward_list}, with γ = {GAMMA_ROBOT}.")
+    )
+    .cols_label(value="Return")
+    .fmt_markdown(columns="quantity")
+    .fmt_number(columns="value", decimals=4)
+    .cols_align("right", columns="value")
+    .tab_options(row_group_font_weight="bold", row_group_background_color="#f2f2f2")
+)
+returns_table
+```
+
+## Why discount? Because it changes *decisions*.
 
 Discounting isn't about the rewards themselves; the robot always receives them in full when they arrive. It's about how the agent *ranks futures* when choosing what to do now. Suppose the robot is in `low` and weighs two possible futures:
 
@@ -371,44 +416,60 @@ r_impulsive = np.array([2.0, 2.0, -3.0, 2.0, 2.0, 2.0]) # search now, crash, get
 r_patient   = np.array([0.0, 2.0, 2.0, 2.0, 2.0, 2.0]) # recharge first, then search safely
 
 gammas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
-DEFAULT = gammas.index(gamma_val)
+DEFAULT_GAMMA_INDEX = gammas.index(GAMMA_ROBOT)
 k = np.arange(len(r_impulsive))
 
-def title_for(g):
-    G_i = float(f(r_impulsive, g)[0]) # reuse the compiled return function
-    G_p = float(f(r_patient, g)[0])
-    verdict = "search now wins" if G_i > G_p else "recharge first wins"
-    return (f"γ = {g:g}:   G<sub>0</sub>(search now) = {G_i:.2f}   vs   "
-            f"G<sub>0</sub>(recharge first) = {G_p:.2f}   →   <b>{verdict}</b>")
+def title_for(gamma_value):
+    """Return the figure title for one discount factor, naming the future with the larger return.
+
+    Computes ``G_0 = sum_k gamma^k R_{k+1}`` of both reward sequences, ``r_impulsive`` (search
+    now) and ``r_patient`` (recharge first), with the compiled return function ``returns_fn``. A tie goes
+    to recharge first.
+
+    Parameters
+    ----------
+    gamma_value : float
+        Discount factor gamma.
+
+    Returns
+    -------
+    str
+        The title, in Plotly HTML: both returns and the verdict.
+    """
+    G_impulsive = float(returns_fn(r_impulsive, gamma_value)[0]) # reuse the compiled return function
+    G_patient = float(returns_fn(r_patient, gamma_value)[0])
+    verdict = "search now wins" if G_impulsive > G_patient else "recharge first wins"
+    return (f"γ = {gamma_value:g}:   G<sub>0</sub>(search now) = {G_impulsive:.2f}   vs   "
+            f"G<sub>0</sub>(recharge first) = {G_patient:.2f}   →   <b>{verdict}</b>")
 
 fig = go.Figure()
 fig.add_bar(
     x=k,
-    y=gammas[DEFAULT] ** k * r_impulsive,
+    y=gammas[DEFAULT_GAMMA_INDEX] ** k * r_impulsive,
     name="search now: R = [2, 2, −3, 2, 2, 2]",
     marker_color=colors[5],
     hovertemplate="search now: γ<sup>k</sup> R<sub>k+1</sub> = %{y:.3f}<extra></extra>"
 )
 fig.add_bar(
     x=k,
-    y=gammas[DEFAULT] ** k * r_patient,
+    y=gammas[DEFAULT_GAMMA_INDEX] ** k * r_patient,
     name="recharge first: R = [0, 2, 2, 2, 2, 2]",
     marker_color=colors[0],
     hovertemplate="recharge first: γ<sup>k</sup> R<sub>k+1</sub> = %{y:.3f}<extra></extra>"
 )
 
 slider_steps = []
-for g in gammas:
+for gamma_value in gammas:
     slider_steps.append(dict(
         method="update",
-        label=f"{g:g}",
-        args=[{"y": [g ** k * r_impulsive, g ** k * r_patient]},
-              {"title.text": title_for(g)}],
+        label=f"{gamma_value:g}",
+        args=[{"y": [gamma_value ** k * r_impulsive, gamma_value ** k * r_patient]},
+              {"title.text": title_for(gamma_value)}],
     ))
 
 fig.update_layout(
     title=dict(
-        text=title_for(gamma_val),
+        text=title_for(GAMMA_ROBOT),
         font=dict(size=14, color="#0b0b0b")
     ),
     barmode="group",
@@ -432,7 +493,7 @@ fig.update_layout(
         x=0
     ),
     sliders=[dict(
-        active=DEFAULT,
+        active=DEFAULT_GAMMA_INDEX,
         steps=slider_steps,
         pad=dict(t=35),
         currentvalue=dict(
@@ -453,44 +514,60 @@ r_impulsive = np.array([2.0, 2.0, -3.0, 2.0, 2.0, 2.0]) # search now, crash, get
 r_patient   = np.array([0.0, 2.0, 2.0, 2.0, 2.0, 2.0]) # recharge first, then search safely
 
 gammas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99]
-DEFAULT = gammas.index(gamma_val)
+DEFAULT_GAMMA_INDEX = gammas.index(GAMMA_ROBOT)
 k = np.arange(len(r_impulsive))
 
-def title_for(g):
-    G_i = float(f(r_impulsive, g)[0]) # reuse the compiled return function
-    G_p = float(f(r_patient, g)[0])
-    verdict = "search now wins" if G_i > G_p else "recharge first wins"
-    return (f"γ = {g:g}:   G<sub>0</sub>(search now) = {G_i:.2f}   vs   "
-            f"G<sub>0</sub>(recharge first) = {G_p:.2f}   →   <b>{verdict}</b>")
+def title_for(gamma_value):
+    """Return the figure title for one discount factor, naming the future with the larger return.
+
+    Computes ``G_0 = sum_k gamma^k R_{k+1}`` of both reward sequences, ``r_impulsive`` (search
+    now) and ``r_patient`` (recharge first), with the compiled return function ``returns_fn``. A tie goes
+    to recharge first.
+
+    Parameters
+    ----------
+    gamma_value : float
+        Discount factor gamma.
+
+    Returns
+    -------
+    str
+        The title, in Plotly HTML: both returns and the verdict.
+    """
+    G_impulsive = float(returns_fn(r_impulsive, gamma_value)[0]) # reuse the compiled return function
+    G_patient = float(returns_fn(r_patient, gamma_value)[0])
+    verdict = "search now wins" if G_impulsive > G_patient else "recharge first wins"
+    return (f"γ = {gamma_value:g}:   G<sub>0</sub>(search now) = {G_impulsive:.2f}   vs   "
+            f"G<sub>0</sub>(recharge first) = {G_patient:.2f}   →   <b>{verdict}</b>")
 
 fig = go.Figure()
 fig.add_bar(
     x=k,
-    y=gammas[DEFAULT] ** k * r_impulsive,
+    y=gammas[DEFAULT_GAMMA_INDEX] ** k * r_impulsive,
     name="search now: R = [2, 2, −3, 2, 2, 2]",
     marker_color=colors[5],
     hovertemplate="search now: γ<sup>k</sup> R<sub>k+1</sub> = %{y:.3f}<extra></extra>"
 )
 fig.add_bar(
     x=k,
-    y=gammas[DEFAULT] ** k * r_patient,
+    y=gammas[DEFAULT_GAMMA_INDEX] ** k * r_patient,
     name="recharge first: R = [0, 2, 2, 2, 2, 2]",
     marker_color=colors[0],
     hovertemplate="recharge first: γ<sup>k</sup> R<sub>k+1</sub> = %{y:.3f}<extra></extra>"
 )
 
 slider_steps = []
-for g in gammas:
+for gamma_value in gammas:
     slider_steps.append(dict(
         method="update",
-        label=f"{g:g}",
-        args=[{"y": [g ** k * r_impulsive, g ** k * r_patient]},
-              {"title.text": title_for(g)}],
+        label=f"{gamma_value:g}",
+        args=[{"y": [gamma_value ** k * r_impulsive, gamma_value ** k * r_patient]},
+              {"title.text": title_for(gamma_value)}],
     ))
 
 fig.update_layout(
     title=dict(
-        text=title_for(gamma_val),
+        text=title_for(GAMMA_ROBOT),
         font=dict(size=14, color="#fbf8f8")
     ),
     barmode="group",
@@ -514,7 +591,7 @@ fig.update_layout(
         x=0
     ),
     sliders=[dict(
-        active=DEFAULT,
+        active=DEFAULT_GAMMA_INDEX,
         steps=slider_steps,
         pad=dict(t=35),
         currentvalue=dict(
@@ -528,7 +605,7 @@ fig.update_layout(
 fig.show(config=dict(displayModeBar=False))
 ```
 
-## Policies
+# Policies
 
 A **policy** $\pi(a\mid s)$ is a distribution over actions in each state. We store it as a matrix `pi[s, a]` whose rows sum to 1. To respect the action constraints we put zero probability on unavailable actions.
 
@@ -538,15 +615,32 @@ We start with the **uniform random policy** (pick uniformly among the available 
 ```{python}
 pi = np.where(avail, 1.0, 0.0)
 pi = pi / pi.sum(axis=1, keepdims=True) # normalize each row
-print("Uniform random policy pi[s, a]:")
-for s in range(nS):
-    probs = {action_names[a]: round(pi[s, a].item(), 3) for a in range(nA) if avail[s, a]}
-    print(f"  {state_names[s]:>4}: {probs}")
 
-pi_t = pt.as_tensor_variable(pi) # (2, 3)
+pi_sym = pt.as_tensor_variable(pi) # (2, 3)
 ```
 
-### Collapsing the MDP under a fixed policy
+```{python}
+policy_rows = pd.DataFrame(
+    [dict(state=state_names[s], **{action_names[a]: pi[s, a] if avail[s, a] else None for a in range(n_actions)}) for s in range(n_states)]
+)
+
+policy_table = (
+    GT(policy_rows, rowname_col="state")
+    .tab_header(
+        title=md("**The uniform random policy**"),
+        subtitle=html("<i>π</i>(<i>a</i> | <i>s</i>): equal probability on every action available in state <i>s</i>. "
+                      "A — marks an action that is not available.")
+    )
+    .tab_stubhead(label="State")
+    .tab_spanner(label="Action", columns=action_names)
+    .fmt_number(columns=action_names, decimals=3)
+    .sub_missing(columns=action_names, missing_text="—")
+    .cols_align("right", columns=action_names)
+)
+policy_table
+```
+
+## Collapsing the MDP under a fixed policy
 
 Once the policy is fixed, the MDP becomes a plain **Markov reward process**. Averaging the dynamics over actions gives a state-to-state transition matrix and a per-state reward:
 
@@ -557,15 +651,35 @@ $$
 
 ```{python}
 # P_pi[s, s'] = sum_a pi[s,a] P[s,a,s'] -> (2, 2)
-P_pi = (pi_t[:, :, None] * P_t).sum(axis=1) # Sum over actions
+P_pi = (pi_sym[:, :, None] * P_sym).sum(axis=1) # Sum over actions
 # r_pi[s]    = sum_a pi[s,a] r(s,a) -> (2,)
-r_pi = (pi_t * r_sa).sum(axis=1)
-
-print("P_pi (state-to-state transitions under uniform policy):\n", P_pi.eval())
-print("r_pi (expected reward per state):", r_pi.eval())
+r_pi = (pi_sym * reward_mean).sum(axis=1)
 ```
 
-## The state-value function $v_\pi$ - Bellman expectation equation
+```{python}
+P_pi_val, r_pi_val = P_pi.eval(), r_pi.eval()
+next_state_columns = [f"to_{name}" for name in state_names]
+mrp_rows = pd.DataFrame(
+    [dict(state=state_names[s], **dict(zip(next_state_columns, P_pi_val[s])), reward=r_pi_val[s]) for s in range(n_states)]
+)
+
+mrp_table = (
+    GT(mrp_rows, rowname_col="state")
+    .tab_header(
+        title=md("**The Markov reward process under the uniform random policy**"),
+        subtitle=html("Transition probabilities <i>P</i><sup>π</sup><sub><i>ss</i>′</sub> and expected reward "
+                      "<i>r</i><sup>π</sup><sub><i>s</i></sub> from each state <i>s</i>.")
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .tab_spanner(label=html("<i>P</i><sup>π</sup><sub><i>ss</i>′</sub> by next state <i>s</i>′"), columns=next_state_columns)
+    .cols_label(**dict(zip(next_state_columns, state_names)), reward=html("<i>r</i><sup>π</sup><sub><i>s</i></sub>"))
+    .fmt_number(columns=[*next_state_columns, "reward"], decimals=3)
+    .cols_align("right", columns=[*next_state_columns, "reward"])
+)
+mrp_table
+```
+
+# The state-value function $v_\pi$ - Bellman expectation equation
 
 $v_\pi(s)$ is the expected return when starting in state $s$ and following policy $\pi$:
 
@@ -585,22 +699,37 @@ $$
 \mathbf{v}_\pi = \mathbf{r}^\pi + \gamma\, P^\pi \mathbf{v}_\pi.
 $$
 
-### Method A - solve it exactly
+## Method A - solve it exactly
 
 Rearranging to, $(I - \gamma P^\pi)\,\mathbf{v}_\pi = \mathbf{r}^\pi$, gives a small linear system we can solve directly.
 
 
 ```{python}
-I = pt.eye(nS)
+I = pt.eye(n_states)
 v_closed = pt.linalg.solve(I - gamma * P_pi, r_pi)
 
-v_closed_val = v_closed.eval({gamma: gamma_val})
-print("v_pi (exact linear solve):")
-for s in range(nS):
-    print(f"  v_pi({state_names[s]}) = {v_closed_val[s]:.4f}")
+v_closed_val = v_closed.eval({gamma: GAMMA_ROBOT})
 ```
 
-### Method B - iterative policy evaluation
+```{python}
+v_closed_rows = pd.DataFrame([dict(state=state_names[s], value=v_closed_val[s]) for s in range(n_states)])
+
+v_closed_table = (
+    GT(v_closed_rows, rowname_col="state")
+    .tab_header(
+        title=md("**State values of the uniform random policy, solved exactly**"),
+        subtitle=html(f"Linear solve of (<i>I</i> − γ<i>P</i><sup>π</sup>)<b><i>v</i></b><sub>π</sub> = "
+                      f"<b><i>r</i></b><sup>π</sup>, with γ = {GAMMA_ROBOT}.")
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .cols_label(value=html("<i>v</i><sub>π</sub>(<i>s</i>)"))
+    .fmt_number(columns="value", decimals=4)
+    .cols_align("right", columns="value")
+)
+v_closed_table
+```
+
+## Method B - iterative policy evaluation
 
 Treat the Bellman equation as an update rule and iterate it.
 The map:
@@ -613,25 +742,70 @@ is a $\gamma$-contraction, so from any start it converges to the unique fixed po
 
 
 ```{python}
-def eval_step(v_prev, r_pi, P_pi, g):
-    return r_pi + g * pt.dot(P_pi, v_prev)
+def eval_step(v_prev, r_pi, P_pi, gamma):
+    """One sweep of iterative policy evaluation on the collapsed Markov reward process.
+
+    Applies the Bellman expectation backup to both states at once,
+
+        v_{k+1}(s) = sum_a pi(a|s) sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v_k(s') ],
+
+    which, with the policy folded into ``r_pi`` and ``P_pi``, is the linear map
+    ``v_{k+1} = r^pi + gamma * P^pi v_k``.
+
+    Parameters
+    ----------
+    v_prev : TensorVariable, shape (2,)
+        The values v_k from the previous sweep, for the states [high, low].
+    r_pi : TensorVariable, shape (2,)
+        Expected one-step reward under pi, ``r^pi(s) = sum_a pi(a|s) r(s, a)``.
+    P_pi : TensorVariable, shape (2, 2)
+        State-to-state transition matrix under pi, ``P^pi[s, s'] = sum_a pi(a|s) p(s'|s, a)``.
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+
+    Returns
+    -------
+    TensorVariable, shape (2,)
+        The values v_{k+1}.
+    """
+    return r_pi + gamma * pt.dot(P_pi, v_prev)
 
 v_seq = pytensor.scan(
     fn=eval_step,
-    outputs_info=pt.zeros((nS,)), # v_0 = 0
+    outputs_info=pt.zeros((n_states,)), # v_0 = 0
     non_sequences=[r_pi, P_pi, gamma],
     n_steps=200,
     return_updates=False
 )
 v_iter = v_seq[-1]
 
-v_iter_val = v_iter.eval({gamma: gamma_val})
-print("v_pi (iterative):", v_iter_val)
-print("v_pi (exact):", v_closed_val)
-print("max abs diff:", np.abs(v_iter_val - v_closed_val).max())
+v_iter_val = v_iter.eval({gamma: GAMMA_ROBOT})
 ```
 
-## The action-value function $q_\pi$
+```{python}
+max_abs_diff = np.abs(v_iter_val - v_closed_val).max()
+v_compare_rows = pd.DataFrame(
+    [dict(state=state_names[s], iterative=v_iter_val[s], exact=v_closed_val[s]) for s in range(n_states)]
+)
+
+v_compare_table = (
+    GT(v_compare_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Iterative policy evaluation against the exact solve**"),
+        subtitle=html(f"<i>v</i><sub>π</sub>(<i>s</i>) for the uniform random policy, with γ = {GAMMA_ROBOT}.")
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .tab_spanner(label=html("<i>v</i><sub>π</sub>(<i>s</i>)"), columns=["iterative", "exact"])
+    .cols_label(iterative="Iterative", exact="Exact")
+    .fmt_number(columns=["iterative", "exact"], decimals=4)
+    .cols_align("right", columns=["iterative", "exact"])
+    .tab_source_note(html(f"Largest difference over the states, max |iterative − exact|: "
+                          f"{vals.fmt_scientific(max_abs_diff, decimals=1)[0]}"))
+)
+v_compare_table
+```
+
+# The action-value function $q_\pi$
 
 $q_\pi(s,a)$ is the expected return from taking action $a$ in state $s$ and *then* following $\pi$:
 
@@ -652,22 +826,51 @@ We compute $q_\pi$ from the $v_\pi$ we just found, then verify the second relati
 ```{python}
 v = v_closed # reuse the exact v_pi
 # q_pi[s, a] = sum_s' P[s,a,s'] (R[s,a,s'] + gamma v[s'])
-q_pi = (P_t * (R_t + gamma * v[None, None, :])).sum(axis=2) # (2, 3)
+q_pi = (P_sym * (R_sym + gamma * v[None, None, :])).sum(axis=2) # (2, 3)
 
-q_val = q_pi.eval({gamma: gamma_val})
-print("q_pi(s, a):")
-print("        " + "  ".join(f"{a:>9}" for a in action_names))
-for s in range(nS):
-    cells_ = [f"{q_val[s,a]:9.4f}" if avail[s,a] else f"{'  NULL':>9}" for a in range(nA)]
-    print(f"  {state_names[s]:>4}: " + "  ".join(cells_))
+q_val = q_pi.eval({gamma: GAMMA_ROBOT})
 
 # Check v_pi(s) == sum_a pi(a|s) q_pi(s,a)
-v_from_q = (pi_t * q_pi).sum(axis=1)
-print("\nv_pi from q_pi:", v_from_q.eval({gamma: gamma_val}))
-print("v_pi (direct):", v_closed_val)
+v_from_q = (pi_sym * q_pi).sum(axis=1)
+v_from_q_val = v_from_q.eval({gamma: GAMMA_ROBOT})
 ```
 
-## Optimality - the Bellman optimality equations
+```{python}
+q_rows = pd.DataFrame(
+    [
+        dict(
+            state=state_names[s],
+            **{action_names[a]: q_val[s, a] if avail[s, a] else None for a in range(n_actions)},
+            v_from_q=v_from_q_val[s],
+            v_direct=v_closed_val[s],
+        )
+        for s in range(n_states)
+    ]
+)
+value_columns = [*action_names, "v_from_q", "v_direct"]
+
+q_table = (
+    GT(q_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Action values of the uniform random policy**"),
+        subtitle=html(f"<i>q</i><sub>π</sub> computed from the exact <i>v</i><sub>π</sub>, with γ = {GAMMA_ROBOT}. "
+                      "A — marks an action that is not available.")
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .tab_spanner(label=html("<i>q</i><sub>π</sub>(<i>s</i>, <i>a</i>) by action <i>a</i>"), columns=action_names)
+    .tab_spanner(label=html("<i>v</i><sub>π</sub>(<i>s</i>)"), columns=["v_from_q", "v_direct"])
+    .cols_label(
+        v_from_q=html("Σ<sub><i>a</i></sub> π(<i>a</i> | <i>s</i>) <i>q</i><sub>π</sub>(<i>s</i>, <i>a</i>)"),
+        v_direct="Direct solve"
+    )
+    .fmt_number(columns=value_columns, decimals=4)
+    .sub_missing(columns=action_names, missing_text="—")
+    .cols_align("right", columns=value_columns)
+)
+q_table
+```
+
+# Optimality - the Bellman optimality equations
 
 We don't just want to evaluate a policy, we want the **best** one. The optimal value function satisfies the **Bellman optimality equation**:
 
@@ -682,30 +885,72 @@ $$
 This is still a contraction, so **value iteration**, repeatedly applying the right-hand side, converges to $v_*$. The only change from policy evaluation is swapping the policy-average for a `max` over available actions (we mask the unavailable ones with $-\infty$ so they're never chosen).
 
 ```{python}
-NEG = -1e9 # stand-in for -infinity on unavailable actions
+NEG_INF = -1e30 # stand-in for -infinity on unavailable actions
 
-def vi_step(v_prev, P_t, R_t, avail_t, g):
-    # q[s,a] = sum_s' P (R + g v')
-    q = (P_t * (R_t + g * v_prev[None, None, :])).sum(axis=2) # (2, 3)
-    q = pt.where(avail_t > 0, q, NEG) # mask unavailable
+def vi_step(v_prev, P_sym, R_sym, avail_sym, gamma):
+    """One synchronous sweep of value iteration.
+
+    Applies the Bellman optimality backup to both states at once, computed from the old values
+    v_k only:
+
+        v_{k+1}(s) = max_a sum_s' p(s'|s, a) [ r(s, a, s') + gamma * v_k(s') ].
+
+    The max runs over the available actions only: unavailable ones (recharge in high) are set to
+    ``NEG_INF`` first, so they are never chosen.
+
+    Parameters
+    ----------
+    v_prev : TensorVariable, shape (2,)
+        The values v_k from the previous sweep, for the states [high, low].
+    P_sym : TensorVariable, shape (2, 3, 2)
+        Transition probabilities p(s'|s, a).
+    R_sym : TensorVariable, shape (2, 3, 2)
+        Rewards r(s, a, s').
+    avail_sym : TensorVariable, shape (2, 3)
+        1.0 where the action is available in the state, 0.0 where it is not.
+    gamma : TensorVariable, scalar
+        Discount factor gamma.
+
+    Returns
+    -------
+    TensorVariable, shape (2,)
+        The values v_{k+1}.
+    """
+    # q[s,a] = sum_s' P (R + gamma v')
+    q = (P_sym * (R_sym + gamma * v_prev[None, None, :])).sum(axis=2) # (2, 3)
+    q = pt.where(avail_sym > 0, q, NEG_INF) # mask unavailable
     return q.max(axis=1) # max over actions
 
 v_star_seq = pytensor.scan(
     fn=vi_step,
-    outputs_info=pt.zeros((nS,)),
-    non_sequences=[P_t, R_t, avail_t, gamma],
+    outputs_info=pt.zeros((n_states,)),
+    non_sequences=[P_sym, R_sym, avail_sym, gamma],
     n_steps=200,
     return_updates=False
 )
 v_star = v_star_seq[-1]
 
-v_star_val = v_star.eval({gamma: gamma_val})
-print("v_*(s):")
-for s in range(nS):
-    print(f"  v_*({state_names[s]:>4}) = {v_star_val[s]:.4f}")
+v_star_val = v_star.eval({gamma: GAMMA_ROBOT})
 ```
 
-### Extracting the optimal policy and $q_*$
+```{python}
+v_star_rows = pd.DataFrame([dict(state=state_names[s], value=v_star_val[s]) for s in range(n_states)])
+
+v_star_table = (
+    GT(v_star_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Optimal state values from value iteration**"),
+        subtitle=f"Value iteration on the Bellman optimality equation, with γ = {GAMMA_ROBOT}."
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .cols_label(value=html("<i>v</i><sub>*</sub>(<i>s</i>)"))
+    .fmt_number(columns="value", decimals=4)
+    .cols_align("right", columns="value")
+)
+v_star_table
+```
+
+## Extracting the optimal policy and $q_*$
 
 Given $v_*$, the optimal action in each state is the **greedy** one:
 
@@ -717,25 +962,44 @@ $$
 
 
 ```{python}
-q_star = (P_t * (R_t + gamma * v_star[None, None, :])).sum(axis=2) # (2, 3)
-q_star_masked = pt.where(avail_t > 0, q_star, NEG)
+q_star = (P_sym * (R_sym + gamma * v_star[None, None, :])).sum(axis=2) # (2, 3)
+q_star_masked = pt.where(avail_sym > 0, q_star, NEG_INF)
 greedy = q_star_masked.argmax(axis=1) # (2,)
 
-q_star_val = q_star.eval({gamma: gamma_val})
-greedy_val = greedy.eval({gamma: gamma_val})
-
-print("Optimal policy pi_*:")
-for s in range(nS):
-    print(f"  in {state_names[s]:>4}: {action_names[int(greedy_val[s])]}")
-
-print("\nq_*(s, a):")
-print("        " + "  ".join(f"{a:>9}" for a in action_names))
-for s in range(nS):
-    cells_ = [f"{q_star_val[s,a]:9.4f}" if avail[s,a] else f"{'  NULL':>9}" for a in range(nA)]
-    print(f"  {state_names[s]:>4}: " + "  ".join(cells_))
+q_star_val = q_star.eval({gamma: GAMMA_ROBOT})
+greedy_val = greedy.eval({gamma: GAMMA_ROBOT})
 ```
 
-## Recap
+```{python}
+q_star_rows = pd.DataFrame(
+    [
+        dict(
+            state=state_names[s],
+            **{action_names[a]: q_star_val[s, a] if avail[s, a] else None for a in range(n_actions)},
+            greedy=action_names[int(greedy_val[s])],
+        )
+        for s in range(n_states)
+    ]
+)
+
+q_star_table = (
+    GT(q_star_rows, rowname_col="state")
+    .tab_header(
+        title=md("**Optimal action values and the greedy policy**"),
+        subtitle=html(f"<i>q</i><sub>*</sub> computed from <i>v</i><sub>*</sub>, with γ = {GAMMA_ROBOT}. "
+                      "A — marks an action that is not available.")
+    )
+    .tab_stubhead(label=html("State <i>s</i>"))
+    .tab_spanner(label=html("<i>q</i><sub>*</sub>(<i>s</i>, <i>a</i>) by action <i>a</i>"), columns=action_names)
+    .cols_label(greedy=html("π<sub>*</sub>(<i>s</i>)"))
+    .fmt_number(columns=action_names, decimals=4)
+    .sub_missing(columns=action_names, missing_text="—")
+    .cols_align("right", columns=action_names)
+)
+q_star_table
+```
+
+# Summary & Recap
 
 We built a finite MDP end-to-end in PyTensor and saw how the pieces connect:
 

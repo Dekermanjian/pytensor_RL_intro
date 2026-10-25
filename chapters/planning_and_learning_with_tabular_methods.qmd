@@ -51,7 +51,6 @@ import pandas as pd
 import pytensor
 import pytensor.tensor as pt
 from dataclasses import dataclass, fields
-import time
 import warnings
 import plotly.graph_objects as go
 import plotly.express as px
@@ -169,7 +168,6 @@ def make_env(name, n_states, n_actions, step_fn, terminals, starts, shape=(), le
 
 ```{python}
 UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
-ARROWS = {UP: "^", DOWN: "v", LEFT: "<", RIGHT: ">"}
 STEP = {UP: (0, 1), DOWN: (0, -1), LEFT: (-1, 0), RIGHT: (1, 0)} # action -> (dx, dy) when drawn
 
 def _move(row, col, action, n_rows, n_cols):
@@ -202,7 +200,6 @@ class GridTheme:
     floor: str       # fill of an open cell
     wall: str        # fill of a wall, or of a cell the agent can never reach
 
-# the book has a light and a dark page theme, so every grid figure is drawn once in each
 GRID_LIGHT = GridTheme(template="plotly_white", background="white", floor="#f2f2f2", wall="#9a9a9a")
 GRID_DARK = GridTheme(template="plotly_dark", background="black", floor="#9e9d9d", wall="#4f4f4f")
 GRID_GOAL = colors[4] # goal cell fill, the same in both themes
@@ -508,8 +505,8 @@ def maze_env(name, walls, start, goal, n_rows=6, n_cols=9, goal_reward=1.0):
         Label for the environment.
     walls : set of (int, int)
         The ``(row, col)`` cells the agent cannot enter.
-    start, goal : int
-        The start state and the single terminal state, numbered ``row * n_cols + col``.
+    start, goal : (int, int)
+        The ``(row, col)`` cells of the start state and of the single terminal state.
     n_rows, n_cols : int, default 6, 9
         Size of the grid.
     goal_reward : float, default 1.0
@@ -520,6 +517,8 @@ def maze_env(name, walls, start, goal, n_rows=6, n_cols=9, goal_reward=1.0):
     Env
         The maze, with 4 actions (UP, DOWN, LEFT, RIGHT).
     """
+    start_state = start[0] * n_cols + start[1]
+    goal_state = goal[0] * n_cols + goal[1]
     def step(s, a):
         "the step_fn for make_env: (s_next, reward_mean, reward_sd) of one move"
         row, col = divmod(s, n_cols)
@@ -527,21 +526,21 @@ def maze_env(name, walls, start, goal, n_rows=6, n_cols=9, goal_reward=1.0):
         if (row_next, col_next) in walls:
             row_next, col_next = row, col
         s_next = row_next * n_cols + col_next
-        reward = goal_reward if s_next == goal else 0.0
+        reward = goal_reward if s_next == goal_state else 0.0
         return s_next, reward, 0.0 # (s_next, reward_mean, reward_sd = 0: no noise)
-    return make_env(name, n_rows * n_cols, 4, step, [goal], [start], shape=(n_rows, n_cols))
+    return make_env(name, n_rows * n_cols, 4, step, [goal_state], [start_state], shape=(n_rows, n_cols))
 
 DYNA_WALLS = {(1, 2), (2, 2), (3, 2), (4, 5), (0, 7), (1, 7), (2, 7)}
-dyna_maze = maze_env("dyna_maze", DYNA_WALLS, start=2 * 9 + 0, goal=0 * 9 + 8)
+dyna_maze = maze_env("dyna_maze", DYNA_WALLS, start=(2, 0), goal=(0, 8))
 
 def wall_across_row_3(columns):
     """Return the wall cells ``(3, col)`` for each col in `columns`, for the changing mazes."""
     return {(3, col) for col in columns}
 
-blocking_before = maze_env("blocking_before", wall_across_row_3(range(0, 8)), start=5 * 9 + 3, goal=8)
-blocking_after = maze_env("blocking_after", wall_across_row_3(range(1, 9)), start=5 * 9 + 3, goal=8)
-shortcut_before = maze_env("shortcut_before", wall_across_row_3(range(1, 9)), start=5 * 9 + 3, goal=8)
-shortcut_after = maze_env("shortcut_after", wall_across_row_3(range(1, 8)), start=5 * 9 + 3, goal=8)
+blocking_before = maze_env("blocking_before", wall_across_row_3(range(0, 8)), start=(5, 3), goal=(0, 8))
+blocking_after = maze_env("blocking_after", wall_across_row_3(range(1, 9)), start=(5, 3), goal=(0, 8))
+shortcut_before = maze_env("shortcut_before", wall_across_row_3(range(1, 9)), start=(5, 3), goal=(0, 8))
+shortcut_after = maze_env("shortcut_after", wall_across_row_3(range(1, 8)), start=(5, 3), goal=(0, 8))
 changing_mazes = (blocking_before, blocking_after, shortcut_before, shortcut_after)
 ```
 
@@ -1244,7 +1243,7 @@ def make_dyna(env, planner, n_planning, seed, keep_Q_history=False):
     planner : {'dyna_q', 'dyna_q_plus', 'prioritized'}
         - 'dyna_q' plans from random previously tried (S, A) pairs.
         - 'dyna_q_plus' plans from any legal action in a seen state and
-           adds the bonus kappa * sqrt(tau) to the modelled reward.
+           adds the bonus kappa * sqrt(tau) to the modeled reward.
         - 'prioritized' does not perform direct RL update;
           real and predecessor pairs go into a priority queue that planning pops from.
     n_planning : int
@@ -1955,7 +1954,7 @@ $$
 
 where $\kappa$ is a small constant. The longer a pair goes untested, the larger this bonus grows, until the agent's plans find the pair attractive and the agent goes and tries it in the real environment.
 
-Dyna-Q+ may plan with actions that have *never* been tried in a state it has visited. And until such an action is tried, the model assumes it leads back to the same state with reward zero. That is why `fresh_agent` initialises `model_next[s, a] = s`.
+Dyna-Q+ may plan with actions that have *never* been tried in a state it has visited. And until such an action is tried, the model assumes it leads back to the same state with reward zero. That is why `fresh_agent` initializes `model_next[s, a] = s`.
 
 Each run uses one agent, carried across the change. We call `run_dyna` once on the "before" maze and then once on the "after" maze, and the whole `DynaAgent` including its $Q$, model, and clock passes from the first call to the second. Nothing has to be recompiled between the calls, because the transition tensor $P$ is an *input* to the learner. The settings are 20 runs, $n = 10$ planning steps, $\varepsilon = 0.1$, $\kappa = 10^{-3}$, and $\alpha = 1$; the maze is deterministic, so there is no noise to average out, and the model is exactly right until the world changes.
 
@@ -2212,13 +2211,14 @@ def scaled_dyna_maze(k):
         A 6k x 9k maze.
     """
     walls = {(row * k + i, col * k + j) for row, col in DYNA_WALLS for i in range(k) for j in range(k)}
+    n_rows, n_cols = 6 * k, 9 * k
     return maze_env(
         f"dyna_maze_x{k}",
         walls,
-        start=(2 * k) * 9 * k,
-        goal=9 * k - 1,
-        n_rows=6 * k,
-        n_cols=9 * k
+        start=(2 * k, 0),
+        goal=(0, n_cols - 1),
+        n_rows=n_rows,
+        n_cols=n_cols
     )
 
 def greedy_path_length(env, Q, limit):
@@ -3595,7 +3595,7 @@ greedy_policy_value = make_greedy_policy_value(tensors_track)
 ```
 
 
-How many sweeps value iteration needs depends on the order in which it visits the states. With in-place updates, a new value is used right away by every state updated after it in the same sweep, so information travels quickly in the direction of the sweep and slowly against it. On the racetrack, value flows backward from the finish line, because a state's value depends on the states the car reaches next. Our state numbering happens to run from the top row of the track, next to the finish line, down to the start line (the most favourable order there is). So we try three orders: that one, its reverse, and a random shuffle.
+How many sweeps value iteration needs depends on the order in which it visits the states. With in-place updates, a new value is used right away by every state updated after it in the same sweep, so information travels quickly in the direction of the sweep and slowly against it. On the racetrack, value flows backward from the finish line, because a state's value depends on the states the car reaches next. Our state numbering happens to run from the top row of the track, next to the finish line, down to the start line (the most favorable order there is). So we try three orders: that one, its reverse, and a random shuffle.
 
 Each run stops when a whole sweep changes no value by more than $10^{-4}$. We also record the quantity that actually matters, which we call the **shortfall**. The shortfall measures how much worse the greedy policy is compared to the optimal policy, starting from the start line. It is the mean over the six start states of $v_*(s) - v_{\pi_V}(s)$, where $\pi_V$ is the greedy policy of the current $V$. It is measured in expected extra steps to the finish, and we compute it exactly every quarter sweep.
 
@@ -4029,7 +4029,7 @@ The heat map on the right shows where RTDP's updates went, and it has a striking
 
 - **According to the oracle, DP was actually done much earlier.** DP's greedy policy was within 0.1 steps of optimal after 32,000 updates, less than halfway to its own stopping rule, and DP is ahead of RTDP at every tolerance. The two stopping rules measure different things. DP's measures its *values*, which keep changing long after the *policy* has stopped changing; RTDP's measures its policy. Without an oracle, neither method could see the other's number.
 
-- **RTDP doesn't save more because so many states are relevant.** On our track, 48% of the reachable states are relevant. In the book's example it is 599 of 9,115, under 7%. RTDP's advantage comes from skipping the states that no optimal policy needs, and our track has comparatively few of them to skip. A track with a large region that good driving never enters would favour RTDP more.
+- **RTDP doesn't save more because so many states are relevant.** On our track, 48% of the reachable states are relevant. In the book's example it is 599 of 9,115, under 7%. RTDP's advantage comes from skipping the states that no optimal policy needs, and our track has comparatively few of them to skip. A track with a large region that good driving never enters would favor RTDP more.
 
 **The convergence theorem does hold.** After 150,000 updates, RTDP's median shortfall is $0.007$ steps, and only 0.08% of the *relevant* states were never updated, against 1.2% of the irrelevant ones. Even so, 2 of the 10 runs still hadn't reached a shortfall of 0.01. RTDP's final stretch is slow, because it has to pin down the values of rarely visited states well enough to tell nearly tied actions apart.
 
@@ -4037,7 +4037,7 @@ The heat map on the right shows where RTDP's updates went, and it has a striking
 
 Every planner so far has done **background planning**. It gradually improves a table of values (or a policy) for *all* states, and when the agent finds itself in a state, it simply looks up the action in the table. DP, Dyna, prioritized sweeping and RTDP all work this way. None of their planning is about the current state in particular.
 
-**Decision-time planning**, on the contrary, is when the agent reaches a state $S_t$, it starts planning *from that state*, produces a single action $A_t$, and then usually throws the planning away. At the next state it starts again from scratch. The values it computes are about one state, and are used **once**. This makes sense when the agent doesn't have to respond instantly (e.g.a chess program can think for several seconds per move) and it lets the agent spend far more computation on the current decision.
+**Decision-time planning**, on the contrary, is when the agent reaches a state $S_t$, it starts planning *from that state*, produces a single action $A_t$, and then usually throws the planning away. At the next state it starts again from scratch. The values it computes are about one state, and are used **once**. This makes sense when the agent doesn't have to respond instantly (e.g. a chess program can think for several seconds per move) and it lets the agent spend far more computation on the current decision.
 
 The next three sections cover three different ways to do decision time planning. To compare them fairly, they all get the same problem and **the same weak starting knowledge**.
 
@@ -4367,7 +4367,7 @@ On the cliff every step costs $-1$, which produces many tied actions. So the pol
 
 
 ```{python}
-ARROW_GLYPHS = {UP: "↑", DOWN: "↓", LEFT: "←", RIGHT: "→"}   # ARROWS, drawn as arrows for tables
+ARROW_GLYPHS = {UP: "↑", DOWN: "↓", LEFT: "←", RIGHT: "→"}   # the four actions, drawn as arrows for tables
 
 def per_action(values):
     """Format one value per action as "↑ −9.73, ↓ −10.25, ...", with a true minus sign."""
@@ -5179,7 +5179,7 @@ The figure above puts all three planners on one axis, computation per decision, 
 **The benefits of decision-time planning depends on the knowledge it starts from.** With a decent value function, a shallow search goes a long way. Without one, simulation has to pay for that knowledge, and the rollout policy decides whether the simulations even point in the right direction. On the cliff, random rollouts point the wrong way near the edge, so MCTS is only a middling planner here. Its strength is growing a tree toward promising path **when rollouts are at least roughly informative**. Its weakness, which we have just measured, is that averaged rollout
 returns can hide a good path behind a first step that looks dangerous.
 
-## Summary and Recap
+# Summary & Recap
 
 Planning needs a model. It can be a **distribution model**, which lists every outcome and its probability, as DP uses, or a **sample model**, which produces one outcome at a time, as simulation
 uses. The important idea is that planning and learning are the same computation applied to different experience, and we saw that with the Q-learning update, fed by a model, converged to $q_*$ without a single real episode, and Dyna-Q ran the identical update on real and simulated transitions inside one agent.

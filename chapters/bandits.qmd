@@ -2,7 +2,7 @@
 jupyter: pymc6
 ---
 
-# Bandit Algorithms
+# Multi-Armed Bandits
 
 A hands-on companion to **Chapter 2 of Sutton & Barto, *Reinforcement Learning: An Introduction***.
 
@@ -15,7 +15,7 @@ We implement and compare three classic strategies for the multi-armed bandit pro
 | **Thompson sampling** | Keep a *posterior* over each arm's value and act greedily on a sample from it |
 
 
-## The $k$-armed bandit problem
+# The $k$-armed bandit problem
 
 At each time step $t$ you choose one of $k$ actions $A_t \in \{0,\dots,k-1\}$ and receive a reward
 $R_t$ drawn from a fixed-but-unknown distribution that depends only on the action you picked. The
@@ -23,7 +23,7 @@ $R_t$ drawn from a fixed-but-unknown distribution that depends only on the actio
 
 $$q_*(a) \;=\; \mathbb{E}[R_t \mid A_t = a].$$
 
-If you knew $q_*$ you would always pull $\arg\max_a q_*(a)$. However, You don't, so you must **estimate** it
+If you knew $q_*$ you would always pull $\arg\max_a q_*(a)$. However, you don't, so you must **estimate** it
 from experience while you act. That is the *exploration vs. exploitation* trade-off: pull the arm that
 looks best now (exploit), or pull a less-certain arm to learn more about it (explore)?
 
@@ -42,7 +42,7 @@ Read it as **NewEstimate = OldEstimate + StepSize · (Target − OldEstimate)**
 
 This is what we encode as a PyTensor `update`. Our implementation will **vectorize across the 2000 independent runs** of the testbed. Instead of 2000 Python loops, every shared variable has shape `(n_runs, k)` and one compiled `step()` advances all runs at once.
 
-## The 10-armed testbed
+# The 10-armed testbed
 
 To compare algorithms fairly we use S&B's testbed setup:
 
@@ -81,14 +81,32 @@ print(f"pytensor {pytensor.__version__}")
 
 ```{python}
 def make_testbed(n_runs: int, k: int, seed: int):
-    # Draw the true action values q_*(a) ~ N(0, 1) for each independent run.
+    """Draw the true action values of the k-armed testbed, one independent bandit task per run.
+
+    Each true value is drawn once, q_*(a) ~ N(0, 1). Pulling arm a then pays a reward
+    R_t ~ N(q_*(a), 1).
+
+    Parameters
+    ----------
+    n_runs : int
+        Number of independent bandit tasks (runs).
+    k : int
+        Number of arms.
+    seed : int
+        Seed for the NumPy random generator.
+
+    Returns
+    -------
+    ndarray, shape (n_runs, k)
+        The true value q_*(a) of every arm in every run, as ``floatX``.
+    """
     rng = np.random.default_rng(seed)
     return rng.normal(0.0, 1.0, size=(n_runs, k)).astype(floatX)
 
 
 # the reward distribution of each arm is N(q_*(a), 1).
-demo = make_testbed(n_runs=1, k=K, seed=0)[0]
-samples = np.random.default_rng(1).normal(demo, 1.0, size=(N_RUNS, K))
+q_star_demo = make_testbed(n_runs=1, k=K, seed=0)[0]
+reward_samples = np.random.default_rng(1).normal(q_star_demo, 1.0, size=(N_RUNS, K))
 ```
 
 
@@ -99,7 +117,7 @@ fig = go.Figure()
 for i in range(K):
     fig.add_trace(
         go.Violin(
-            y = samples[:, i],
+            y = reward_samples[:, i],
             showlegend=False,
             name = f"Arm {i+1}",
             box_visible=False,
@@ -111,7 +129,7 @@ for i in range(K):
 fig.add_trace(
     go.Scatter(
         x = [f"Arm {i+1}" for i in np.arange(K)],
-        y = demo,
+        y = q_star_demo,
         mode="markers",
         marker=dict(color="black", size=8),
         name=r'$\text{true value } q_*(a)$'
@@ -119,7 +137,7 @@ fig.add_trace(
 )
 
 fig.update_layout(
-    title = r"$\text{" + f"Optimal arm for this task: Arm {demo.argmax() + 1} with " + "}" + f"q_* = {round(demo.max(), 3)}$",
+    title = r"$\text{" + f"Optimal arm for this task: Arm {q_star_demo.argmax() + 1} with " + "}" + f"q_* = {round(q_star_demo.max(), 3)}$",
     xaxis=dict(title = "Action"),
     yaxis=dict(title = "Reward distribution"),
     template="plotly_white"
@@ -135,7 +153,7 @@ fig = go.Figure()
 for i in range(K):
     fig.add_trace(
         go.Violin(
-            y = samples[:, i],
+            y = reward_samples[:, i],
             showlegend=False,
             name = f"Arm {i+1}",
             box_visible=False,
@@ -147,7 +165,7 @@ for i in range(K):
 fig.add_trace(
     go.Scatter(
         x = [f"Arm {i+1}" for i in np.arange(K)],
-        y = demo,
+        y = q_star_demo,
         mode="markers",
         marker=dict(color="white", size=8),
         name=r'$\text{true value } q_*(a)$'
@@ -155,7 +173,7 @@ fig.add_trace(
 )
 
 fig.update_layout(
-    title = r"$\text{" + f"Optimal arm for this task: Arm {demo.argmax() + 1} with " + "}" + f"q_* = {round(demo.max(), 3)}$",
+    title = r"$\text{" + f"Optimal arm for this task: Arm {q_star_demo.argmax() + 1} with " + "}" + f"q_* = {round(q_star_demo.max(), 3)}$",
     xaxis=dict(title = "Action"),
     yaxis=dict(title = "Reward distribution"),
     template="plotly_dark"
@@ -164,7 +182,7 @@ fig.update_layout(
 fig.show(config=dict(displayModeBar=False))
 ```
 
-## ε-greedy
+# ε-greedy
 
 The simplest balance of exploration and exploitation:
 
@@ -175,7 +193,7 @@ $$
 
 After acting we apply the incremental sample-average update.
 
-Two things worth explaining about **PyTensor mechanics** :
+Two things worth explaining about **PyTensor mechanics**:
 
 | Mechanic | What it does | Why it matters |
 |---|---|---|
@@ -185,6 +203,24 @@ Two things worth explaining about **PyTensor mechanics** :
 
 ```{python}
 def _shared_state(n_runs: int, k: int):
+    """Create the zero-filled shared variables that an agent's compiled `step` reads and updates.
+
+    Parameters
+    ----------
+    n_runs : int
+        Number of independent runs, played side by side.
+    k : int
+        Number of arms.
+
+    Returns
+    -------
+    Q : SharedVariable, shape (n_runs, k)
+        The value estimates Q_t(a).
+    N : SharedVariable, shape (n_runs, k)
+        How many times each arm has been pulled, N_t(a).
+    q_star : SharedVariable, shape (n_runs, k)
+        The true values q_*(a). `reset` fills them in.
+    """
     Q = pytensor.shared(np.zeros((n_runs, k), floatX), name="Q") # value estimates
     N = pytensor.shared(np.zeros((n_runs, k), floatX), name="N") # visit counts
     q_star = pytensor.shared(np.zeros((n_runs, k), floatX), name="q*") # true values
@@ -192,16 +228,49 @@ def _shared_state(n_runs: int, k: int):
 
 
 def build_epsilon_greedy(n_runs: int, k: int, epsilon: float, seed: int=0):
+    """Build a compiled ε-greedy agent that plays every run at once.
+
+    Each call to ``step()`` advances every run by one time step:
+
+    1. Choose an action. With probability ε, a uniformly random arm (explore); otherwise
+       ``argmax_a Q_t(a)`` (exploit), with ties going to the lowest-numbered arm.
+    2. Draw the reward R_t ~ N(q_*(A_t), 1).
+    3. Apply the incremental sample-average update to the chosen arm a = A_t,
+
+           N_{t+1}(a) = N_t(a) + 1,    Q_{t+1}(a) = Q_t(a) + (R_t - Q_t(a)) / N_{t+1}(a).
+
+    Parameters
+    ----------
+    n_runs : int
+        Number of independent runs, played side by side.
+    k : int
+        Number of arms.
+    epsilon : float
+        Probability of exploring, ε. With 0 the agent is purely greedy.
+    seed : int, default 0
+        Seed for the agent's random generator.
+
+    Returns
+    -------
+    SimpleNamespace
+        The agent, with attributes
+
+        - ``step``: compiled PyTensor function with no inputs. It returns ``(reward, optimal)``,
+          each of shape (n_runs,): the reward each run received, and whether each run picked its
+          truly best arm. It also updates ``Q``, ``N`` and the random generator.
+        - ``Q``, ``N``, ``q_star``: the shared variables from `_shared_state`, each of shape
+          (n_runs, k).
+    """
     rng = pt.random.shared_rng(np.random.default_rng(seed))
     Q, N, q_star = _shared_state(n_runs, k)
     rows = pt.arange(n_runs)
 
     # action selection: explore with prob epsilon
-    rng1, uni_samples = rng.uniform(size=(n_runs,))
-    explore = uni_samples < epsilon
-    rng2, rand_a = rng1.integers(0, k, size=(n_runs,))
-    greedy_a = pt.argmax(Q, axis=1)
-    a = pt.where(explore, rand_a, greedy_a)
+    rng1, uniform_draw = rng.uniform(size=(n_runs,))
+    explore = uniform_draw < epsilon
+    rng2, random_arm = rng1.integers(0, k, size=(n_runs,))
+    greedy_arm = pt.argmax(Q, axis=1)
+    a = pt.where(explore, random_arm, greedy_arm)
 
     # environment: reward ~ N(q_*(a), 1)
     rng3, noise = rng2.normal(size=(n_runs,))
@@ -211,19 +280,19 @@ def build_epsilon_greedy(n_runs: int, k: int, epsilon: float, seed: int=0):
     n_new = N[rows, a] + 1.0
     q_old = Q[rows, a]
     q_new = q_old + (reward - q_old) / n_new
-    N_upd = pt.set_subtensor(N[rows, a], n_new)
-    Q_upd = pt.set_subtensor(Q[rows, a], q_new)
+    N_updated = pt.set_subtensor(N[rows, a], n_new)
+    Q_updated = pt.set_subtensor(Q[rows, a], q_new)
 
     optimal = pt.eq(a, pt.argmax(q_star, axis=1))  # did we pick the best arm?
     step = pytensor.function(
         [],
         [reward, optimal],
-        updates={rng: rng3, N: N_upd, Q: Q_upd}
+        updates={rng: rng3, N: N_updated, Q: Q_updated}
     )
     return SimpleNamespace(step=step, Q=Q, N=N, q_star=q_star)
 ```
 
-## Upper-Confidence-Bound (UCB)
+# Upper-Confidence-Bound (UCB)
 
 ε-greedy explores indiscriminately. UCB instead explores *purposefully*, preferring arms that are
 either promising **or** under-explored. It selects
@@ -239,6 +308,46 @@ explore. Any arm with $N_t(a)=0$ is treated as having an *infinite* bonus, so UC
 
 ```{python}
 def build_ucb(n_runs: int, k: int, c: float, seed: int=0):
+    """Build a compiled upper-confidence-bound (UCB) agent that plays every run at once.
+
+    Each call to ``step()`` advances every run by one time step:
+
+    1. Choose the action
+
+           A_t = argmax_a [ Q_t(a) + c * sqrt( ln t / N_t(a) ) ],
+
+       where an arm with N_t(a) = 0 gets an infinite bonus, so every arm is tried once first.
+       Ties go to the lowest-numbered arm.
+    2. Draw the reward R_t ~ N(q_*(A_t), 1).
+    3. Apply the incremental sample-average update to the chosen arm a = A_t,
+
+           N_{t+1}(a) = N_t(a) + 1,    Q_{t+1}(a) = Q_t(a) + (R_t - Q_t(a)) / N_{t+1}(a),
+
+       and advance the time step t by 1.
+
+    Parameters
+    ----------
+    n_runs : int
+        Number of independent runs, played side by side.
+    k : int
+        Number of arms.
+    c : float
+        Exploration constant, c > 0. Larger values explore more.
+    seed : int, default 0
+        Seed for the agent's random generator.
+
+    Returns
+    -------
+    SimpleNamespace
+        The agent, with attributes
+
+        - ``step``: compiled PyTensor function with no inputs. It returns ``(reward, optimal)``,
+          each of shape (n_runs,): the reward each run received, and whether each run picked its
+          truly best arm. It also updates ``Q``, ``N``, ``t`` and the random generator.
+        - ``Q``, ``N``, ``q_star``: the shared variables from `_shared_state`, each of shape
+          (n_runs, k).
+        - ``t``: SharedVariable, scalar. The time step, starting at 1 and shared by every run.
+    """
     rng = pt.random.shared_rng(np.random.default_rng(seed))
     Q, N, q_star = _shared_state(n_runs, k)
     t = pytensor.shared(np.array(1.0, floatX), name="t")  # global time step
@@ -254,19 +363,19 @@ def build_ucb(n_runs: int, k: int, c: float, seed: int=0):
     n_new = N[rows, a] + 1.0
     q_old = Q[rows, a]
     q_new = q_old + (reward - q_old) / n_new
-    N_upd = pt.set_subtensor(N[rows, a], n_new)
-    Q_upd = pt.set_subtensor(Q[rows, a], q_new)
+    N_updated = pt.set_subtensor(N[rows, a], n_new)
+    Q_updated = pt.set_subtensor(Q[rows, a], q_new)
 
     optimal = pt.eq(a, pt.argmax(q_star, axis=1))
     step = pytensor.function(
         [],
         [reward, optimal],
-        updates={rng: rng1, N: N_upd, Q: Q_upd, t: t + 1.0}
+        updates={rng: rng1, N: N_updated, Q: Q_updated, t: t + 1.0}
     )
     return SimpleNamespace(step=step, Q=Q, N=N, q_star=q_star, t=t)
 ```
 
-## Thompson sampling
+# Thompson sampling
 
 A Bayesian strategy: maintain a **posterior distribution** over each arm's unknown value and, each step,
 **sample** one value per arm and act greedily on the samples. Arms we're uncertain about have wide
@@ -291,32 +400,66 @@ Here the sufficient statistics are the per-arm reward sum and count rather than 
 
 ```{python}
 def build_thompson(n_runs: int, k: int, seed: int=0):
+    """Build a compiled Thompson-sampling agent that plays every run at once.
+
+    Each arm's unknown mean has the prior N(0, 1), and rewards have known variance 1. After n
+    pulls of an arm with reward sum S, its posterior is
+
+        N( S / (1 + n),  1 / (1 + n) ).
+
+    Each call to ``step()`` advances every run by one time step:
+
+    1. Draw one sample theta_a from every arm's posterior, and choose ``A_t = argmax_a theta_a``.
+    2. Draw the reward R_t ~ N(q_*(A_t), 1).
+    3. Add R_t to the chosen arm's reward sum, and 1 to its count.
+
+    Parameters
+    ----------
+    n_runs : int
+        Number of independent runs, played side by side.
+    k : int
+        Number of arms.
+    seed : int, default 0
+        Seed for the agent's random generator.
+
+    Returns
+    -------
+    SimpleNamespace
+        The agent, with attributes
+
+        - ``step``: compiled PyTensor function with no inputs. It returns ``(reward, optimal)``,
+          each of shape (n_runs,): the reward each run received, and whether each run picked its
+          truly best arm. It also updates ``reward_sum``, ``N`` and the random generator.
+        - ``reward_sum``: SharedVariable, shape (n_runs, k). The sum of the rewards from each arm.
+        - ``N``: SharedVariable, shape (n_runs, k). How many times each arm has been pulled.
+        - ``q_star``: SharedVariable, shape (n_runs, k). The true values q_*(a).
+    """
     rng = pt.random.shared_rng(np.random.default_rng(seed))
-    sumR = pytensor.shared(np.zeros((n_runs, k), floatX), name="sumR") # running reward sum per arm
+    reward_sum = pytensor.shared(np.zeros((n_runs, k), floatX), name="reward_sum") # running reward sum per arm
     N = pytensor.shared(np.zeros((n_runs, k), floatX), name="N") # visit counts
     q_star = pytensor.shared(np.zeros((n_runs, k), floatX), name="q*")
     rows = pt.arange(n_runs)
 
     # Conjugate Gaussian posterior (prior N(0,1), known reward variance 1).
-    post_mean = sumR / (1.0 + N)
-    post_var = 1.0 / (1.0 + N)
-    rng1, z = rng.normal(size=(n_runs, k))
-    theta = post_mean + pt.sqrt(post_var) * z # one posterior sample per arm
+    posterior_mean = reward_sum / (1.0 + N)
+    posterior_variance = 1.0 / (1.0 + N)
+    rng1, standard_normal = rng.normal(size=(n_runs, k))
+    theta = posterior_mean + pt.sqrt(posterior_variance) * standard_normal # one posterior sample per arm
     a = pt.argmax(theta, axis=1)
 
     rng2, noise = rng1.normal(size=(n_runs,))
     reward = q_star[rows, a] + noise
 
-    sumR_upd = pt.set_subtensor(sumR[rows, a], sumR[rows, a] + reward)
-    N_upd = pt.set_subtensor(N[rows, a], N[rows, a] + 1.0)
+    reward_sum_updated = pt.set_subtensor(reward_sum[rows, a], reward_sum[rows, a] + reward)
+    N_updated = pt.set_subtensor(N[rows, a], N[rows, a] + 1.0)
 
     optimal = pt.eq(a, pt.argmax(q_star, axis=1))
     step = pytensor.function([], [reward, optimal],
-                             updates={rng: rng2, sumR: sumR_upd, N: N_upd})
-    return SimpleNamespace(step=step, sumR=sumR, N=N, q_star=q_star)
+                             updates={rng: rng2, reward_sum: reward_sum_updated, N: N_updated})
+    return SimpleNamespace(step=step, reward_sum=reward_sum, N=N, q_star=q_star)
 ```
 
-## Running the experiments
+# Running the experiments
 
 `reset` reinitializes an agent's shared state and initializes a fresh set of true values.
 
@@ -325,25 +468,58 @@ def build_thompson(n_runs: int, k: int, seed: int=0):
 
 ```{python}
 def reset(agent, q_star_values):
+    """Start an agent over on a new set of bandit tasks.
+
+    Sets the true values to ``q_star_values`` and zeroes the counts ``N``, plus whichever of these
+    the agent has: the estimates ``Q`` (ε-greedy and UCB) and the reward sums ``reward_sum``
+    (Thompson). UCB's time step ``t`` goes back to 1. The random generator is not reset, so the
+    agent keeps drawing new random numbers.
+
+    Parameters
+    ----------
+    agent : SimpleNamespace
+        An agent from `build_epsilon_greedy`, `build_ucb` or `build_thompson`. It is changed in
+        place.
+    q_star_values : ndarray, shape (n_runs, k)
+        The true values q_*(a), e.g. from `make_testbed`.
+    """
     n_runs, k = q_star_values.shape
     agent.q_star.set_value(q_star_values)
     agent.N.set_value(np.zeros((n_runs, k), floatX))
     if hasattr(agent, "Q"):
         agent.Q.set_value(np.zeros((n_runs, k), floatX))
-    if hasattr(agent, "sumR"):
-        agent.sumR.set_value(np.zeros((n_runs, k), floatX))
+    if hasattr(agent, "reward_sum"):
+        agent.reward_sum.set_value(np.zeros((n_runs, k), floatX))
     if hasattr(agent, "t"):
         agent.t.set_value(np.array(1.0, floatX))
 
 
 def run_experiment(agent, q_star_values, n_steps):
+    """Reset an agent, then play every run for ``n_steps`` steps and record the learning curves.
+
+    Parameters
+    ----------
+    agent : SimpleNamespace
+        An agent from `build_epsilon_greedy`, `build_ucb` or `build_thompson`.
+    q_star_values : ndarray, shape (n_runs, k)
+        The true values q_*(a), e.g. from `make_testbed`.
+    n_steps : int
+        Number of time steps to play.
+
+    Returns
+    -------
+    avg_reward : ndarray, shape (n_steps,)
+        The reward at each step, averaged over the runs.
+    pct_optimal : ndarray, shape (n_steps,)
+        The fraction of runs that picked their truly best arm at each step.
+    """
     reset(agent, q_star_values)
     avg_reward = np.empty(n_steps)
     pct_optimal = np.empty(n_steps)
-    for tstep in range(n_steps): # This can be a pytensor scan
-        r, opt = agent.step() # one vectorized step across all runs
-        avg_reward[tstep] = r.mean()
-        pct_optimal[tstep] = opt.mean()
+    for t in range(n_steps): # This can be a pytensor scan
+        reward, optimal = agent.step() # one vectorized step across all runs
+        avg_reward[t] = reward.mean()
+        pct_optimal[t] = optimal.mean()
     return avg_reward, pct_optimal
 ```
 
@@ -368,11 +544,11 @@ for name, agent in agents.items():
 #| classes: light-mode
 fig = make_subplots(rows=2, cols=1, vertical_spacing=0.02, shared_xaxes=True)
 
-for i, (name, (ar, po)) in enumerate(results.items()):
+for i, (name, (avg_reward, pct_optimal)) in enumerate(results.items()):
     fig.add_trace(
         go.Scatter(
             x=np.arange(N_STEPS),
-            y=ar,
+            y=avg_reward,
             name=name,
             marker_color=colors[i]
         ),
@@ -382,7 +558,7 @@ for i, (name, (ar, po)) in enumerate(results.items()):
     fig.add_trace(
         go.Scatter(
             x=np.arange(N_STEPS),
-            y=po,
+            y=pct_optimal,
             name=name,
             marker_color=colors[i],
             showlegend=False
@@ -405,11 +581,11 @@ fig.show(config=dict(displayModeBar=False))
 #| classes: dark-mode
 fig = make_subplots(rows=2, cols=1, vertical_spacing=0.02, shared_xaxes=True)
 
-for i, (name, (ar, po)) in enumerate(results.items()):
+for i, (name, (avg_reward, pct_optimal)) in enumerate(results.items()):
     fig.add_trace(
         go.Scatter(
             x=np.arange(N_STEPS),
-            y=ar,
+            y=avg_reward,
             name=name,
             marker_color=colors[i]
         ),
@@ -419,7 +595,7 @@ for i, (name, (ar, po)) in enumerate(results.items()):
     fig.add_trace(
         go.Scatter(
             x=np.arange(N_STEPS),
-            y=po,
+            y=pct_optimal,
             name=name,
             marker_color=colors[i],
             showlegend=False
@@ -437,6 +613,8 @@ fig.update_layout(
 )
 fig.show(config=dict(displayModeBar=False))
 ```
+
+# Summary & Recap
 
 The results are summarized below.
 
